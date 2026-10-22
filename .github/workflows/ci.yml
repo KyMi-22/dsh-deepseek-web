@@ -1,0 +1,81 @@
+name: CI
+
+# The plugin is developed on Windows but has no platform-specific runtime code:
+# every module is plain Node plus the harness services. Testing the matrix catches
+# accidental path or newline assumptions.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `engines.node` says >=20; 24 is what the desktop runtime ships today.
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: npm run check
+      - name: Offline test suite
+        run: npm test
+
+  manifest:
+    name: manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify the plugin manifest contract
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+
+            const fail = (message) => { console.error("FAIL:", message); process.exit(1); };
+
+            // Every path the runtime or the inventory will resolve must exist.
+            const exported = pkg.exports ?? {};
+            for (const [key, value] of Object.entries(exported)) {
+              if (key.includes("*")) continue;
+              const target = typeof value === "string" ? value : value.default;
+              if (!target) continue;
+              const resolved = path.resolve(target);
+              if (!fs.existsSync(resolved)) fail(`exports["${key}"] -> ${target} is missing`);
+            }
+
+            // The icon is read by the plugin list; a broken reference renders nothing.
+            const icon = exported["./icon"];
+            if (!icon) fail("./icon export missing");
+            const iconPath = path.resolve(typeof icon === "string" ? icon : icon.default);
+            const bytes = fs.readFileSync(iconPath);
+            if (bytes.length > 256 * 1024) fail(`icon is ${bytes.length} bytes, over the 256 KiB limit`);
+            const png = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+            const jpeg = bytes[0] === 0xff && bytes[1] === 0xd8;
+            const webp = bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP";
+            const svg = bytes.toString("utf8", 0, 200).includes("<svg");
+            if (!png && !jpeg && !webp && !svg) fail("icon is not a recognised image format");
+
+            // Localized display metadata backs the plugin row.
+            for (const locale of fs.readdirSync("locale")) {
+              const doc = JSON.parse(fs.readFileSync(path.join("locale", locale), "utf8"));
+              if (!doc.meta?.title) fail(`locale/${locale} has no meta.title`);
+              if (!doc.meta?.description) fail(`locale/${locale} has no meta.description`);
+            }
+
+            console.log("manifest ok:", pkg.name, pkg.version);
+          '

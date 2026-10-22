@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.7 — 2026-10-22
+
+工程整洁与门禁。功能无变化。
+
+- **抽出两个独立模块**：`src/http.js`（JSON 回复 + 带上限的请求体读取）与 `src/tool-guard.js`（工具白名单）。后者是安全边界，独立成文件后可以脱离 Host 单独审阅和测试。`index.js` 从 893 行降到 815 行——剩下的体量是一个编排函数本身的复杂度，拆成工厂只会把闭包变成参数样板。
+- **新增 CI**（`.github/workflows/ci.yml`）：Node 20/22/24 矩阵跑 `npm run check` 与 `npm test`，另加一个 manifest 门禁，校验 `exports` 目标存在、图标格式与 256 KiB 上限、locale 含 `meta.title`/`meta.description`、`files` 列出的路径真实存在。
+- **新增两个零依赖门禁**（`npm test` 的一部分）：
+  - `manifest.test.mjs` —— 插件清单契约，与 CI 同一套判据，本地也能跑。
+  - `hygiene.test.mjs` —— 无遗留标记、无未使用的 import、无 import 环、文件以 LF 结尾、README 覆盖每个发布模块。
+- 补 `http.test.mjs`：空 body 返回对象、跨 chunk 重组、上限在读的过程中生效、畸形 JSON 报错而不是静默吞掉。
+
+未引入 TypeScript：为一个零依赖插件加编译期依赖不划算。类型信息仍由 JSDoc 承载，上面的卫生门禁覆盖了最容易腐化的那一类问题（未使用 import、循环引用、文档漂移）。
+
+## 0.1.6 — 2026-10-22
+
+凭据提交边界。
+
+- **被拒绝的 token 不再可能落盘**。`flush()` 原来在**调用时**快照，于是 token 保存进行中排队的普通后台写入（绑定、账本行）会把尚未被接受的候选值一起写进文件；保存随后失败并回滚，磁盘上却留着插件明确拒绝过的凭证。现在快照在**写入执行时**取，并且凭据事务期间只落盘 `committedToken`（磁盘当前持有的值）。
+- 保存失败的回滚目标是 `committedToken` 而不是"内存里刚才的值"，避免与并发写入交错时恢复到更旧的状态。
+- `unknown` 来源不再计入 `archivedLocal`：界面曾把同一个会话同时描述为"你在 DSH 内新建"和"无法确认来源"。
+
+测试用可控的 `persist` 注入取代了"用目录占位逼迫 rename 失败"的技巧——后者在 Windows 上会因杀毒索引或时机差异返回 EPERM，`token-serial` 因此不稳定。凭据用例现在由显式门闩驱动：凭据写挂起 → 排入后台写 → 放行使其失败 → 观察后台写到盘的值。该用例在修复前的实现上会失败于「the candidate never reached the disk」。
+
 ## 0.1.5 — 2026-10-22
 
 第三轮复核指出 `0.1.4` 的重试标记与 token 事务仍有缺口。

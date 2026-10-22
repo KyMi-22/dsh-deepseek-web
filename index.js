@@ -32,6 +32,10 @@ import {
   stateFile,
 } from './src/store.js';
 import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
+import { readJsonBody, sendJson } from './src/http.js';
+import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
+
+export { isToolAllowedInWebSession } from './src/tool-guard.js';
 
 /** Stable Cordis plugin name. */
 export const name = 'deepseek-web';
@@ -42,90 +46,8 @@ export const inject = ['llm'];
 /** Same-origin route prefix owned by this plugin. */
 export const API_PREFIX = '/dsh-deepseek-web/api';
 
-/** Request bodies are tiny JSON documents. */
-const MAX_BODY_BYTES = 64 * 1024;
-
 /** How many per-conversation failures one sync report carries. */
 const MAX_REPORTED_ERRORS = 5;
-
-/**
- * Tools a web-backed session is allowed to use.
- *
- * This is a WHITELIST, not a blocklist. The guarantee this plugin promises is
- * "a web conversation never writes to the local disk", and a blocklist cannot
- * keep that promise: it silently stops protecting the moment a composition adds
- * a tool the list predates. A earlier blocklist here missed `pwsh` (arbitrary
- * shell) and `plugin_manager` (installs code), which is exactly the failure mode.
- *
- * A web conversation is not expected to call tools at all — the web endpoint has
- * no function-calling channel — so denying an unrecognized tool costs nothing
- * while keeping the promise closed under new tools.
- */
-const READ_ONLY_TOOLS = new Set([
-  // Filesystem reads
-  'read',
-  'glob',
-  'grep',
-  'read_image',
-  'working_directory',
-  'load_workspace_dependencies',
-  // Network reads
-  'web_search',
-  'web_fetch',
-  // Harness introspection
-  'cordis_inspect_list',
-  'cordis_inspect_query',
-  'skill',
-  'todo_write',
-  'ask_user_question',
-  // Background-job inspection (jobs are started by a tool that is itself denied)
-  'job_output',
-  'job_list',
-  'job_kill',
-  // Team visibility
-  'list_agents',
-  'send_message',
-  'wait_agent',
-  // Declares existing files as deliverables; writes nothing
-  'present',
-]);
-
-/**
- * Whether a web-backed session may run this tool.
- *
- * Unknown names are denied: the promise is about what CANNOT happen, so silence
- * about a tool has to mean "no", not "sure".
- *
- * @param {unknown} name
- * @returns {boolean}
- */
-export function isToolAllowedInWebSession(name) {
-  return typeof name === 'string' && READ_ONLY_TOOLS.has(name);
-}
-
-/** Send a JSON reply on the raw response. */
-function sendJson(res, status, value) {
-  const body = JSON.stringify(value);
-  res.statusCode = status;
-  res.setHeader('content-type', 'application/json; charset=utf-8');
-  res.setHeader('cache-control', 'no-store');
-  res.end(body);
-}
-
-/** Read and parse a small JSON body. */
-async function readJsonBody(req) {
-  const chunks = [];
-  let total = 0;
-  for await (const chunk of req) {
-    total += chunk.length;
-    if (total > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(chunk);
-  }
-  if (total === 0) return {};
-  const text = Buffer.concat(chunks).toString('utf8');
-  const parsed = JSON.parse(text);
-  return parsed !== null && typeof parsed === 'object' ? parsed : {};
-}
 
 /**
  * Ask the harness to recompose the plugin tree.
@@ -323,7 +245,7 @@ export async function apply(ctx, config = {}) {
         if (store.binding(String(sessionId)) === undefined) return undefined;
         const name = execution.name;
         if (isToolAllowedInWebSession(name)) return undefined;
-        return `deepseek-web: 「${String(name)}」可能在本地产生副作用，网页版对话只允许只读操作`;
+        return toolRejectionMessage(name);
       }),
     );
   }

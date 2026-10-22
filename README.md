@@ -109,10 +109,14 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 | 部分 | 说明 |
 |---|---|
 | `src/pow.js` | 网页端发消息需要 PoW 挑战。这里是按其 worker 逐字移植的 `DeepSeekHashV1` sponge（自定义 Keccak 变体：lane 高低字互换、23 轮，**不是**标准 SHA3-256）。 |
+| `src/pow-async.js` | 把求解放到 worker 线程，避免一秒多的紧循环卡住 Host 事件循环；worker 不可用时回退到进程内。 |
+| `src/pow-worker.js` | worker 线程入口，只做「解一个挑战」这一件事。 |
 | `src/api.js` | `/api/v0` 客户端：分页拉会话、读历史、建会话、发消息并解析 SSE 的 JSON-patch 增量。 |
 | `src/adapter.js` | `deepseek-web` provider：把 DSH 的 `messages` 转成网页端 prompt，把回复流翻译成 `StreamChunk`。 |
 | `src/sync.js` | 把网页对话变成带种子事件的 DSH 会话，落在「对话」工作区目录下。 |
 | `src/store.js` | 插件自有状态（token、会话映射），原子写入。 |
+| `src/http.js` | 设置页路由用的传输小工具：JSON 回复、带大小上限的请求体读取。 |
+| `src/tool-guard.js` | 网页版会话的工具白名单（安全边界，独立成文件便于单独审阅）。 |
 | `index.js` | Host 入口：注册 provider、同步引擎、设置页路由、写文件拦截。 |
 | `client.js` | 浏览器半边：设置页。 |
 
