@@ -442,12 +442,35 @@ function fragmentTypeOf(type) {
 /**
  * Parse an SSE byte stream into `{ type, data }` events.
  *
+ * Parsed line by line rather than by splitting on `\n\n`, because the spec allows
+ * CRLF and a chunk boundary can land anywhere. The earlier split-on-`\n\n` version
+ * silently merged two `\r\n\r\n`-separated records into one unparsable blob and
+ * emitted `data: null` — losing the whole response while looking like a clean
+ * stream.
+ *
  * @param {ReadableStream<Uint8Array>} body
  * @param {AbortSignal} [signal]
  */
 export async function* readSse(body, signal) {
   const decoder = new TextDecoder();
   let buffer = '';
+  let eventType = 'message';
+  /** @type {string[]} */
+  let dataLines = [];
+
+  /** Build the event for the block that just ended, if it carried data. */
+  const dispatch = () => {
+    if (dataLines.length === 0) {
+      eventType = 'message';
+      return undefined;
+    }
+    const text = dataLines.join('\n');
+    const event = { type: eventType, data: parseJsonOrNull(text) };
+    eventType = 'message';
+    dataLines = [];
+    return event;
+  };
+
   const reader = body.getReader();
   try {
     while (true) {
@@ -455,18 +478,31 @@ export async function* readSse(body, signal) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      let boundary;
-      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
-        const raw = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const event = parseSseBlock(raw);
-        if (event !== undefined) yield event;
+      while (true) {
+        const lf = buffer.indexOf('\n');
+        if (lf < 0) break;
+        let line = buffer.slice(0, lf);
+        buffer = buffer.slice(lf + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line === '') {
+          const event = dispatch();
+          if (event !== undefined) yield event;
+        } else if (line.startsWith('event:')) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+        // Other SSE fields (id:, retry:, comments) carry nothing we consume.
       }
     }
-    if (buffer.trim() !== '') {
-      const event = parseSseBlock(buffer);
-      if (event !== undefined) yield event;
+    // A trailing block without its blank line still counts.
+    if (buffer.endsWith('\r')) buffer = buffer.slice(0, -1);
+    if (buffer !== '') {
+      if (buffer.startsWith('event:')) eventType = buffer.slice(6).trim();
+      else if (buffer.startsWith('data:')) dataLines.push(buffer.slice(5).trimStart());
     }
+    const last = dispatch();
+    if (last !== undefined) yield last;
   } finally {
     try {
       await reader.cancel();
@@ -476,19 +512,11 @@ export async function* readSse(body, signal) {
   }
 }
 
-/** @param {string} block */
-function parseSseBlock(block) {
-  let type = 'message';
-  const dataLines = [];
-  for (const line of block.split('\n')) {
-    if (line.startsWith('event:')) type = line.slice(6).trim();
-    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
-  }
-  if (dataLines.length === 0) return undefined;
-  const text = dataLines.join('\n');
+/** @param {string} text */
+function parseJsonOrNull(text) {
   try {
-    return { type, data: JSON.parse(text) };
+    return JSON.parse(text);
   } catch {
-    return { type, data: null };
+    return null;
   }
 }

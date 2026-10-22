@@ -10,14 +10,20 @@
 
 import assert from 'node:assert';
 import { DeepSeekWebAdapter, MODELS, isHarnessInjection, newestRealUser } from '../src/adapter.js';
+import { DeepSeekWebError } from '../src/api.js';
 
 /** An API double that records what the adapter asked for. */
-function fakeApi(events) {
+function fakeApi(events, options = {}) {
   const calls = { createSession: 0, completions: [], renames: [] };
+  let failuresLeft = options.createFailures ?? 0;
   return {
     calls,
     async createSession() {
       calls.createSession += 1;
+      if (failuresLeft > 0) {
+        failuresLeft -= 1;
+        throw new DeepSeekWebError('transport broke', { code: 'TRANSPORT' });
+      }
       return { id: 'web-1', title: null, updatedAt: 0 };
     },
     async renameSession(chatSessionId, title) {
@@ -55,8 +61,8 @@ const SKILLS = '<system-reminder>\nA skill is a reusable set of task-specific in
 const CLOCK_STANZA = 'Time sampled while preparing turn 1, step 1: 2026-10-22T10:54:20+08:00[Asia/Hong_Kong]\nBrowser time zone for this request: Asia/Hong_Kong. Interpret otherwise-unqualified dates and times in this zone.\nElapsed since the preceding model-visible message: unavailable.';
 const ENV_TAIL = 'Current DSH file policy: danger-full-access.\n\nApproval policy: ask. Operations that require approval may be asked through the configured answerers.\n\nYou are the Team Lead named "lead".\n\nCurrent DeepSeek Harness implementation checkout: "D:\\\\x\\\\dsh\\\\".\n\nCurrent DeepSeek Harness Web GUI URL: "http://127.0.0.1:10140".';
 
-function makeAdapter(events) {
-  const api = fakeApi(events);
+function makeAdapter(events, options = {}) {
+  const api = fakeApi(events, options);
   const bindings = new Map();
   const sent = new Map();
   const adapter = new DeepSeekWebAdapter({
@@ -74,9 +80,12 @@ function makeAdapter(events) {
       seen.add(messageId);
       return true;
     },
+    forgetSent: (sessionId, messageId) => {
+      sent.get(sessionId)?.delete(messageId);
+    },
     warn: (message) => console.log('WARN', message),
   });
-  return { adapter, bindings, api };
+  return { adapter, bindings, api, sent };
 }
 
 const THINK = (text) => ({ kind: 'fragment', fragmentType: 'THINK', text });
@@ -226,6 +235,35 @@ assert.equal(
   assert.equal(second.length, 1, 'the repeat is a single empty stop');
   assert.equal(second[0].type, 'finish');
   assert.equal(api.calls.completions.length, 1, 'the repeat never reached the web');
+}
+
+// ── a failure before anything was submitted must allow a retry ─────────────
+{
+  // First attempt: creating the web conversation fails, so nothing reached the
+  // model. The loop retries the SAME message id; the dedup memo must have been
+  // cleared, otherwise the retry is swallowed as "already sent" and the turn ends
+  // with an empty stop.
+  const { adapter, api, sent } = makeAdapter([ANSWER('ok')], { createFailures: 1 });
+  const options = {
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m9', '重试我')],
+    sessionId: 'sess-retry',
+  };
+
+  const first = [];
+  for await (const chunk of adapter.stream(options)) first.push(chunk);
+  assert.equal(first[first.length - 1].reason.kind, 'error', 'the first attempt reports the failure');
+  assert.equal(api.calls.createSession, 1);
+  assert.equal(sent.get('sess-retry')?.has('m9') ?? false, false, 'the failed attempt is forgotten');
+
+  const second = [];
+  for await (const chunk of adapter.stream(options)) second.push(chunk);
+  assert.equal(api.calls.createSession, 2, 'the retry really tried again');
+  assert.equal(api.calls.completions.length, 1, 'and reached the model on the second try');
+  const last = second[second.length - 1];
+  assert.equal(last.type, 'finish');
+  assert.notEqual(last.reason.kind, 'error', 'the retry is not swallowed');
 }
 
 // ── auxiliary calls never touch the web ────────────────────────────────────

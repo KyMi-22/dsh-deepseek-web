@@ -208,7 +208,8 @@ export async function apply(ctx, config = {}) {
     await store.setToken(configuredToken);
   }
   const resolvedToken = envToken !== '' ? envToken : store.token;
-  const tokenSource = envToken !== '' ? 'env' : (store.token !== '' ? 'state' : 'none');
+  /** Where the active credential came from; updated when the page saves one. */
+  let tokenSource = envToken !== '' ? 'env' : (store.token !== '' ? 'state' : 'none');
 
   /**
    * The endpoint the credential may be sent to.
@@ -250,21 +251,14 @@ export async function apply(ctx, config = {}) {
     api,
     resolveBinding: (sessionId) => store.binding(sessionId),
     bindSession: (sessionId, binding) => {
+      // The binding alone is the durable record of a web conversation created for
+      // a NEW DSH session. It must NOT go into the import ledger as well: the
+      // ledger means "came from the web", and undo deletes what the ledger names.
+      // Deduplication reads the bindings (`selectImportBatch`'s excludeIds), so
+      // keeping the two records separate changes nothing about repeated passes
+      // and stops an undo from deleting a conversation the user started here.
       store.setBinding(sessionId, binding);
       webSessions.add(sessionId);
-      // A conversation this plugin minted for a NEW DSH session must also enter
-      // the ledger. Otherwise the next sync finds it on the web side with no
-      // ledger entry and imports it as a second, empty copy of the same
-      // conversation.
-      const chatSessionId = binding?.chatSessionId;
-      if (typeof chatSessionId === 'string' && chatSessionId !== '' && store.state.imported[chatSessionId] === undefined) {
-        store.recordImported({
-          chatSessionId,
-          dshSessionId: sessionId,
-          updatedAt: Math.floor(Date.now() / 1000),
-          messageCount: 0,
-        });
-      }
     },
     updateBinding: (sessionId, patch) => {
       const current = store.binding(sessionId);
@@ -281,6 +275,11 @@ export async function apply(ctx, config = {}) {
       if (seen.has(messageId)) return false;
       seen.add(messageId);
       return true;
+    },
+    forgetSent: (sessionId, messageId) => {
+      // Called back when the attempt failed before anything reached the model, so
+      // the loop may retry the same message instead of being told "already sent".
+      promptedMessages.get(sessionId)?.delete(messageId);
     },
     onExchange: (sessionId, chatSessionId, userText, assistantText, reasoning) => {
       void persistExchange(sessionId, chatSessionId, userText, assistantText, reasoning);
@@ -347,7 +346,14 @@ export async function apply(ctx, config = {}) {
    * already in flight rather than starting another.
    */
   let syncInFlight = null;
+  /** Set while an undo runs, so a background pass cannot start mid-teardown. */
+  let undoInFlight = false;
   function syncNow(options = {}) {
+    if (undoInFlight) {
+      // An undo is tearing the import down; starting a pass now would recreate
+      // the ledger it is clearing and clear the pause it just set.
+      return Promise.resolve({ skipped: 'undo-in-progress' });
+    }
     if (syncInFlight !== null) return syncInFlight;
     syncInFlight = performSync(options).finally(() => {
       syncInFlight = null;
@@ -611,7 +617,9 @@ export async function apply(ctx, config = {}) {
   // conversations the user has no interest in seeing in the sidebar.
   const syncWindow = config.syncWindow ?? 'week';
   const intervalSeconds = Number(config.syncIntervalSeconds ?? 300);
-  if (Number.isFinite(intervalSeconds) && intervalSeconds > 0 && config.autoSync !== false) {
+  /** Whether the timer is actually armed; reported so the page cannot claim otherwise. */
+  const autoSyncEnabled = Number.isFinite(intervalSeconds) && intervalSeconds > 0 && config.autoSync !== false;
+  if (autoSyncEnabled) {
     ctx.effect(() => {
       let timer = null;
       let stopped = false;
@@ -685,7 +693,7 @@ export async function apply(ctx, config = {}) {
                 tokenSource,
                 imported: Object.keys(store.state.imported).length,
                 lastSyncAt: store.state.lastSyncAt,
-                autoSyncSeconds: intervalSeconds,
+                autoSyncSeconds: autoSyncEnabled ? intervalSeconds : 0,
                 syncWindow,
                 windowStart: resolveSyncWindowStart(syncWindow),
                 capabilities: {
@@ -733,8 +741,21 @@ export async function apply(ctx, config = {}) {
                 sendJson(res, 400, { ok: false, error: 'invalid-token', detail: String(error?.message ?? error) });
                 return;
               }
-              await store.setToken(token);
+              // Persist before switching the live client. A failed write must not
+              // report success: the page would say "saved" while the next launch
+              // silently restored the previous credential.
+              try {
+                await store.setToken(token);
+              } catch (error) {
+                sendJson(res, 500, {
+                  ok: false,
+                  error: 'persist-failed',
+                  detail: String(error?.message ?? error),
+                });
+                return;
+              }
               api.configure({ token });
+              tokenSource = 'state';
               sendJson(res, 200, { ok: true, account });
               return;
             }
@@ -761,17 +782,48 @@ export async function apply(ctx, config = {}) {
               // sessions this plugin itself imported, then drop the workspace and
               // the ledger. The credential and the web account stay untouched so
               // a re-import is one click.
-              const undo = await undoImports({
-                imported: store.state.imported,
-                workspaceId: store.state.workspaceId,
-                directory,
-                registry: workspaceRegistry(),
-                query: ctx.get('sessionQuery'),
-                warn,
-              });
-              store.state.imported = {};
-              store.state.bindings = {};
-              store.state.workspaceId = null;
+              //
+              // Serialized against sync: an import pass still in flight would
+              // otherwise recreate the ledger and clear the pause right after the
+              // undo finished. Waiting is enough because `syncNow` also refuses to
+              // start while `undoInFlight` is set.
+              if (syncInFlight !== null) {
+                try {
+                  await syncInFlight;
+                } catch {
+                  /* a failed pass has nothing to protect */
+                }
+              }
+              undoInFlight = true;
+              let undo;
+              try {
+                undo = await undoImports({
+                  imported: store.state.imported,
+                  workspaceId: store.state.workspaceId,
+                  directory,
+                  registry: workspaceRegistry(),
+                  query: ctx.get('sessionQuery'),
+                  bindings: store.state.bindings,
+                  warn,
+                });
+              } finally {
+                undoInFlight = false;
+              }
+              // Only forget what actually went away. Clearing the whole ledger on a
+              // partial failure would discard exactly the rows a retry needs.
+              const stuck = new Set(undo.failedSessionIds ?? []);
+              const kept = {};
+              for (const [chatSessionId, entry] of Object.entries(store.state.imported)) {
+                if (stuck.has(String(entry?.dshSessionId))) kept[chatSessionId] = entry;
+              }
+              const stuckChatIds = new Set(Object.keys(kept));
+              const keptBindings = {};
+              for (const [sessionId, binding] of Object.entries(store.state.bindings)) {
+                if (stuckChatIds.has(String(binding?.chatSessionId))) keptBindings[sessionId] = binding;
+              }
+              store.state.imported = kept;
+              store.state.bindings = keptBindings;
+              store.state.workspaceId = undo.workspaceError === null ? null : store.state.workspaceId;
               store.state.lastSyncAt = 0;
               // Give the user time to decide before background sync rebuilds it.
               store.state.syncPausedUntil = Date.now() + 10 * 60_000;
@@ -780,7 +832,7 @@ export async function apply(ctx, config = {}) {
               store.state.lastSyncError = null;
               store.state.lastReport = null;
               await store.flush();
-              sendJson(res, 200, { ok: true, ...undo });
+              sendJson(res, 200, { ok: undo.failedSessions === 0 && undo.archiveFailed === 0, ...undo });
               return;
             }
             if (req.method === 'POST' && route === '/verify') {

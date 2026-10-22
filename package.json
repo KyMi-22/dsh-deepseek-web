@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-web",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "把 DeepSeek 网页版（chat.deepseek.com）的对话接入 DSH：独立「对话」工作区、网页端模型直连（不消耗 API 余额）、双向延续对话。",
@@ -20,6 +20,7 @@
     "icon.png",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "keywords": [
@@ -36,7 +37,7 @@
   },
   "scripts": {
     "check": "node --check index.js && node --check client.js && node --check src/pow.js && node --check src/api.js && node --check src/adapter.js && node --check src/store.js && node --check src/sync.js",
-    "test": "node test/pow.test.mjs && node test/adapter.test.mjs && node test/seed.test.mjs && node test/sync.test.mjs && node test/client-render.test.mjs && node test/security.test.mjs",
+    "test": "node test/pow.test.mjs && node test/sse.test.mjs && node test/adapter.test.mjs && node test/seed.test.mjs && node test/sync.test.mjs && node test/client-render.test.mjs && node test/security.test.mjs",
     "test:live": "node test/live-api.mjs"
   },
   "dsh": {

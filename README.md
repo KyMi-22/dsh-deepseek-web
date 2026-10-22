@@ -19,7 +19,7 @@ dsh plugin add "C:\path\to\dsh-deepseek-web"
 
 1. 设置 → **DeepSeek 网页版**。
 2. 粘贴 chat.deepseek.com 的 user token，点「保存并验证」。
-3. 点「立即同步全部对话」（之后默认每 60 秒自动同步）。
+3. 点「立即同步全部对话」（之后默认每 5 分钟自动同步一次，间隔随机浮动）。
 4. 回到侧边栏，展开 **对话** 工作区。
 5. 在输入框的模型选择器里选 **DeepSeek 网页版**（或「深度思考」版本）继续对话。
 
@@ -219,7 +219,7 @@ npm run test:live   # 联网：PoW、会话列表、历史、流式回复
 
 - **工具调用**：网页端 `chat/completion` 只接受一段 `prompt` 字符串，没有 function-calling 通道，所以模型不会发起**自定义**工具调用。这是接口限制，不是插件缺陷。网页版自带的能力（联网搜索、深度思考）通过上面的模型变体启用。
 - **内嵌网页版**：`chat.deepseek.com` 返回 `content-security-policy: frame-ancestors 'none'`，任何 iframe/webview 嵌入都会被浏览器拒绝，因此没有做页面内嵌。
-- **实时性**：网页端没有推送接口，同步靠轮询（`syncIntervalSeconds`，默认 60 秒）或手动触发。
+- **实时性**：网页端没有推送接口，同步靠轮询（`syncIntervalSeconds`，默认 300 秒且随机浮动）或手动触发。
 
 ## 配置
 

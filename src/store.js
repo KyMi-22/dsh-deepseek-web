@@ -214,6 +214,8 @@ export class StateStore {
     this.state = state;
     /** @type {Promise<void>} */
     this.queue = Promise.resolve();
+    /** Message of the most recent background write failure, if any. */
+    this.lastWriteError = null;
   }
 
   static async open() {
@@ -225,14 +227,40 @@ export class StateStore {
     return this.state.token;
   }
 
-  /** Persist the current snapshot, coalescing concurrent writes. */
+  /**
+   * Persist the current snapshot, coalescing concurrent writes.
+   *
+   * The queue must survive a failed write (a transient disk error on the first
+   * call must not wedge every later call), but the caller must still learn that
+   * THIS write failed. Swallowing the rejection made `setToken` report success
+   * while nothing reached the disk, so a restart silently restored the old
+   * credential. The internal queue therefore keeps a recovered promise, and the
+   * rejection is delivered to the caller separately.
+   *
+   * @returns {Promise<void>} rejects when this snapshot failed to persist.
+   */
   flush() {
     const snapshot = JSON.parse(JSON.stringify(this.state));
-    this.queue = this.queue.then(() => saveState(snapshot)).catch(() => undefined);
-    return this.queue;
+    const write = this.queue.then(() => saveState(snapshot));
+    // Keep the queue alive after a failure so the next flush still runs.
+    this.queue = write.catch(() => undefined);
+    return write;
   }
 
-  /** Replace the credential. */
+  /**
+   * Fire-and-forget flush for background bookkeeping.
+   *
+   * These writes (a binding, a ledger row) are not user-visible confirmations, so
+   * a failure must not reject into an event handler; it is recorded on the store
+   * instead, where the settings page can surface it.
+   */
+  flushSoon() {
+    this.flush().catch((error) => {
+      this.lastWriteError = error instanceof Error ? error.message : String(error);
+    });
+  }
+
+  /** Replace the credential. Rejects when the new value could not be persisted. */
   async setToken(token) {
     this.state.token = token;
     await this.flush();
@@ -249,7 +277,7 @@ export class StateStore {
    */
   setBinding(sessionId, binding) {
     this.state.bindings[sessionId] = binding;
-    void this.flush();
+    this.flushSoon();
   }
 
   /** @param {string} sessionId */
@@ -260,6 +288,6 @@ export class StateStore {
   /** @param {ImportedConversation} entry */
   recordImported(entry) {
     this.state.imported[entry.chatSessionId] = entry;
-    void this.flush();
+    this.flushSoon();
   }
 }

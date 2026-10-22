@@ -376,6 +376,12 @@ export class DeepSeekWebAdapter {
       return;
     }
 
+    const prompt = buildPrompt(messages);
+    if (prompt === '') {
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
+    }
+
     // One turn may re-enter the adapter; only a genuinely new user message is a
     // new request. A repeat returns an empty stop so the loop is not re-prompted.
     if (sessionId !== undefined && newest.id !== null) {
@@ -394,15 +400,13 @@ export class DeepSeekWebAdapter {
         binding = { chatSessionId: created.id, parentMessageId: null, seeded: false };
         if (sessionId !== undefined) this.deps.bindSession(sessionId, binding);
       } catch (error) {
+        // Nothing reached the model: there is no conversation yet, so a retry of
+        // this same message must be allowed to try again. Without this the turn
+        // would be swallowed forever after one transient failure.
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
         yield finishError(error);
         return;
       }
-    }
-
-    const prompt = buildPrompt(messages);
-    if (prompt === '') {
-      yield { type: 'finish', reason: { kind: 'stop' } };
-      return;
     }
 
     let reasoningIndex = -1;

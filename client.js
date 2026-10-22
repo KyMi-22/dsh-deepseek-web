@@ -92,7 +92,7 @@ window.__ModuleLoader__.load({
         'connection.howTo.note': '本地存储里它的形式是 {"value":"…","__version":"0"}，只需要 value 引号里的那一串。token 等同于你的登录凭证，不要分享给他人。',
         'sync.title': '对话同步',
         'sync.hint': '网页版的全部对话会作为一个独立的「{workspace}」工作区出现在侧边栏，每个对话是一条普通 DSH 会话：可以展开、搜索、折叠，点开就能看历史并继续聊。',
-        'sync.now': '立即同步全部对话',
+        'sync.now': '立即同步',
         'sync.running': '同步中…',
         'sync.reloadHint': '同步完成后，如果侧边栏没有立刻出现新对话，点「热重载并刷新」：热重载会重建会话索引，页面随后自动刷新。',
         'sync.reload': '热重载并刷新',
@@ -106,6 +106,7 @@ window.__ModuleLoader__.load({
         'sync.count': '{count} 个对话',
         'sync.window': '同步范围',
         'sync.windowWeek': '本周（{since} 起）',
+        'sync.windowMonth': '本月（{since} 起）',
         'sync.windowDays': '最近 {days} 天',
         'sync.windowAll': '全部对话',
         'sync.last': '上次同步',
@@ -166,7 +167,7 @@ window.__ModuleLoader__.load({
         'connection.howTo.note': 'It is stored as {"value":"…","__version":"0"} — only the string inside value is needed. The token is your login credential; never share it.',
         'sync.title': 'Conversation sync',
         'sync.hint': 'Every web conversation appears under a dedicated "{workspace}" workspace in the sidebar, one ordinary DSH session each: fold, search, open to read the history and keep chatting.',
-        'sync.now': 'Sync all conversations',
+        'sync.now': 'Sync now',
         'sync.running': 'Syncing…',
         'sync.reloadHint': 'If the new conversations do not show up in the sidebar right after syncing, press "Hot reload and refresh": the reload rebuilds the session indexes and the page then refreshes itself.',
         'sync.reload': 'Hot reload and refresh',
@@ -180,6 +181,7 @@ window.__ModuleLoader__.load({
         'sync.count': '{count} conversations',
         'sync.window': 'Scope',
         'sync.windowWeek': 'this week (from {since})',
+        'sync.windowMonth': 'this month (from {since})',
         'sync.windowDays': 'last {days} days',
         'sync.windowAll': 'all conversations',
         'sync.last': 'Last sync',
@@ -582,6 +584,9 @@ window.__ModuleLoader__.load({
         scopeLabel = t('sync.windowAll');
       } else if (typeof windowSetting === 'number' || /^\d+$/u.test(String(windowSetting))) {
         scopeLabel = t('sync.windowDays', { days: windowSetting });
+      } else if (windowSetting === 'month') {
+        // Without this branch a monthly scope was labelled as "this week".
+        scopeLabel = t('sync.windowMonth', { since: formatDay(windowStart) });
       } else {
         scopeLabel = t('sync.windowWeek', { since: formatDay(windowStart) });
       }

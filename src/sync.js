@@ -491,6 +491,25 @@ export async function createSeededSession(options) {
 }
 
 /**
+ * Whether a session was started inside DSH rather than imported from the web.
+ *
+ * The adapter records `seeded: false` when it created a web conversation for a
+ * brand-new DSH session; an import records `seeded: true` because it replayed
+ * existing web messages. A session with no binding at all is treated as imported
+ * (deleting it matches the ledger), so an old install that predates this field
+ * errs toward the documented cleanup rather than silently keeping managed files.
+ *
+ * @param {string} sessionId
+ * @param {Record<string, { seeded?: boolean }> | undefined} bindings
+ * @returns {boolean}
+ */
+function isLocallyStarted(sessionId, bindings) {
+  if (bindings === undefined || bindings === null) return false;
+  const binding = bindings[sessionId];
+  return binding !== undefined && binding.seeded === false;
+}
+
+/**
  * Undo one import: archive this plugin's sessions, remove the imported ones'
  * files and the workspace, and leave the credential alone.
  *
@@ -522,25 +541,31 @@ export async function createSeededSession(options) {
  *   directory: string,
  *   registry: any,
  *   query?: any,
+ *   bindings?: Record<string, { seeded?: boolean }>,
  *   warn: (message: string) => void,
  * }} options
  * @returns {Promise<{
  *   archivedSessions: number, archiveFailed: number, archivedLocal: number,
- *   removedSessions: number, failedSessions: number,
+ *   keptLocal: number, removedSessions: number, failedSessions: number,
  *   workspaceDeleted: boolean, workspaceError: string | null,
  * }>}
  */
 export async function undoImports(options) {
-  const { imported, workspaceId, directory, registry, query, warn } = options;
+  const { imported, workspaceId, directory, registry, query, bindings, warn } = options;
   const report = {
     archivedSessions: 0,
     archiveFailed: 0,
     archivedLocal: 0,
+    keptLocal: 0,
     removedSessions: 0,
     failedSessions: 0,
+    /** Ledger session ids that could not be archived or deleted. */
+    failedSessionIds: [],
     workspaceDeleted: false,
     workspaceError: null,
   };
+  /** @type {Set<string>} */
+  const failedIds = new Set();
 
   /** Sessions this plugin imported from the web side. */
   const ledgerSessionIds = [];
@@ -582,21 +607,37 @@ export async function undoImports(options) {
       try {
         await registry.archiveSession(sessionId, { stopActivity: true });
         report.archivedSessions += 1;
-        if (!ledgerSet.has(sessionId)) report.archivedLocal += 1;
+        // "Local" here means "not something this plugin imported": either it was
+        // never in the ledger, or the binding says it was started in DSH.
+        if (!ledgerSet.has(sessionId) || isLocallyStarted(sessionId, bindings)) report.archivedLocal += 1;
       } catch (error) {
         report.archiveFailed += 1;
+        if (ledgerSet.has(sessionId)) failedIds.add(sessionId);
         warn(`deepseek-web: could not archive ${sessionId} before removal: ${String(error)}`);
       }
     }
   }
 
-  // 2. Then drop the files of the sessions this plugin itself imported.
+  // 2. Then drop the files of the sessions this plugin IMPORTED.
+  //
+  // The ledger alone cannot answer "did this session come from the web?" — an
+  // earlier version also wrote locally started conversations into it as a
+  // deduplication measure, so every one of them looked like an import and had its
+  // log deleted on undo. The binding records the real origin: `seeded: false`
+  // means the adapter created the web conversation for a session that started
+  // here. Those are the user's own conversations, so they are archived (step 1
+  // already did that) and their logs are kept.
   for (const sessionId of ledgerSessionIds) {
+    if (isLocallyStarted(sessionId, bindings)) {
+      report.keptLocal += 1;
+      continue;
+    }
     try {
       await rm(sessionDirFor(sessionId, directory), { recursive: true, force: true });
       report.removedSessions += 1;
     } catch (error) {
       report.failedSessions += 1;
+      failedIds.add(sessionId);
       warn(`deepseek-web: could not remove session ${sessionId}: ${String(error)}`);
     }
   }
@@ -616,5 +657,6 @@ export async function undoImports(options) {
     }
   }
 
+  report.failedSessionIds = [...failedIds];
   return report;
 }
