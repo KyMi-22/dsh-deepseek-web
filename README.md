@@ -21,29 +21,7 @@
 
 装完都要**重启 DSH**。重启后「设置 → 插件」里应该能看到 `dsh-deepseek-web` 和它的图标。
 
-### 方式一：从下载的 tgz 装（最省事，不依赖 GitHub）
-
-GitHub 连不上的时候用这个——只要浏览器能打开下载页面就行。
-
-1. 打开 [Releases](https://github.com/KyMi-22/dsh-deepseek-web/releases)，下载最新的 `dsh-deepseek-web-x.y.z.tgz`
-2. 打开 DSH，侧边栏底部点 **设置 → 插件 → 添加插件**
-3. 在「包名或地址」里填 tgz 的**完整路径**，例如：
-
-   ```
-   C:\Users\你\Downloads\dsh-deepseek-web-0.1.13.tgz
-   ```
-
-4. 点 **安装**，完成后到插件列表确认它是启用状态，重启 DSH
-
-> 路径里的反斜杠直接填，不用转义。不知道完整路径的话，在文件管理器里右键 tgz →「复制文件地址」。
-
-用命令行装 tgz 也一样：
-
-```bash
-npx @deepseek-ai/dsh plugin --profile desktop add C:\Users\你\Downloads\dsh-deepseek-web-0.1.13.tgz
-```
-
-### 方式二：在 DSH 界面里装（需要能访问 GitHub）
+### 方式一：在 DSH 界面里装（推荐）
 
 1. 打开 DSH，侧边栏底部点 **设置**
 2. 左侧选 **插件**
@@ -57,7 +35,23 @@ npx @deepseek-ai/dsh plugin --profile desktop add C:\Users\你\Downloads\dsh-dee
 5. 点 **安装**，等它跑完
 6. 回到插件列表确认 `dsh-deepseek-web` 是启用状态，然后重启 DSH
 
-> 这一步会通过 git 访问 github.com。如果网络需要代理才能访问 GitHub，见下面的「安装报错」。
+> 这一步会通过 git 访问 github.com。如果连不上或者一直超时，用下面的 tgz 方式。
+
+### 方式二：从下载的 tgz 装（GitHub 连不上时用）
+
+只要浏览器能打开下载页面就行，不经过 git。
+
+1. 打开 [Releases](https://github.com/KyMi-22/dsh-deepseek-web/releases)，下载最新的 `dsh-deepseek-web-x.y.z.tgz`
+2. 设置 → 插件 → **添加插件**
+3. 在「包名或地址」里填 tgz 的**完整路径**，例如：
+
+   ```
+   C:\Users\你\Downloads\dsh-deepseek-web-0.1.13.tgz
+   ```
+
+4. 点 **安装**，之后同样重启 DSH
+
+> 路径里的反斜杠直接填，不用转义。不知道完整路径的话，在文件管理器里右键 tgz →「复制文件地址」。
 
 ### 方式三：命令行
 
@@ -76,6 +70,8 @@ npx @deepseek-ai/dsh plugin --profile web add github:KyMi-22/dsh-deepseek-web
 ```
 
 > 如果 `dsh` 已经在你的 PATH 里（比如从源码构建过），把开头的 `npx @deepseek-ai/dsh` 换成 `dsh`。
+>
+> 装本地 tgz 同理，把 `github:...` 换成 tgz 的路径即可。
 
 <details>
 <summary>从本地目录安装（改代码时用）</summary>
@@ -84,7 +80,7 @@ npx @deepseek-ai/dsh plugin --profile web add github:KyMi-22/dsh-deepseek-web
 npx @deepseek-ai/dsh plugin --profile desktop add /path/to/dsh-deepseek-web
 ```
 
-界面方式也可以：第 3 步填本地目录的完整路径。
+界面方式也可以：方式一第 4 步填本地目录的完整路径。
 
 </details>
 
@@ -97,7 +93,7 @@ npx @deepseek-ai/dsh plugin --profile desktop add /path/to/dsh-deepseek-web
 node --version
 ```
 
-**连不上 GitHub**——用「方式一」的 tgz 安装，绕开 git。如果坚持用仓库地址安装，需要让你的 `git` 能访问 github.com（`git` 不读系统代理设置，要单独配）。
+**连不上 GitHub / 一直超时**——改用「方式二」的 tgz，绕开 git。坚持用仓库地址的话，需要让你的 `git` 能访问 github.com（`git` 不读 Windows 的系统代理设置，得单独配）。
 
 **装完看不到插件**——确认已启用，然后重启 DSH。热重载不一定能覆盖 profile 的 bundle 列表变化。
 
