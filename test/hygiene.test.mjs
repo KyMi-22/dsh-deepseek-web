@@ -105,11 +105,20 @@ const tests = walk('test');
 
 // ── documentation covers every shipped module ─────────────────────────────
 {
-  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+  // The user-facing README stays short; module-level explanations live in docs/.
+  // The rule is that SOME shipped document names each module, not that README does.
+  const docs = [fs.readFileSync(path.join(root, 'README.md'), 'utf8')];
+  const docsDir = path.join(root, 'docs');
+  if (fs.existsSync(docsDir)) {
+    for (const entry of fs.readdirSync(docsDir)) {
+      if (entry.endsWith('.md')) docs.push(fs.readFileSync(path.join(docsDir, entry), 'utf8'));
+    }
+  }
+  const corpus = docs.join('\n');
   for (const file of shipped) {
     if (file === 'client.js') continue; // described as the settings page, not by name
     const base = path.basename(file);
-    assert.ok(readme.includes(base), `README does not mention ${base}`);
+    assert.ok(corpus.includes(base), `no document mentions ${base}`);
   }
 }
 
