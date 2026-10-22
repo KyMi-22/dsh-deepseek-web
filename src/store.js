@@ -216,6 +216,17 @@ export class StateStore {
     this.queue = Promise.resolve();
     /** Message of the most recent background write failure, if any. */
     this.lastWriteError = null;
+    /**
+     * Serializes credential replacement end to end.
+     *
+     * `flush` alone serializes writes, but a token change is read-modify-write on
+     * the in-memory state: two concurrent saves could interleave so that the failed
+     * one restored its snapshot over the newer value that had already reached the
+     * disk. The whole transaction — set, persist, roll back — has to be ordered.
+     *
+     * @type {Promise<void>}
+     */
+    this.tokenQueue = Promise.resolve();
   }
 
   static async open() {
@@ -269,23 +280,34 @@ export class StateStore {
   /**
    * Replace the credential.
    *
-   * The in-memory value is rolled back when persistence fails: leaving the
-   * candidate token resident would let a later, successful flush write it out, so
-   * the running client and the next launch would disagree about which credential
-   * is configured.
+   * The whole transaction is serialized. `flush` already orders writes, but a
+   * rollback mutates in-memory state: without this queue, save A failing could
+   * restore its snapshot *after* save B had written the newer value, leaving the
+   * disk on B and memory on A's predecessor — and the next launch would disagree
+   * with the running client.
    *
    * @param {string} token
    * @returns {Promise<void>} rejects when the new value could not be persisted.
    */
   async setToken(token) {
-    const previous = this.state.token;
-    this.state.token = token;
-    try {
-      await this.flush();
-    } catch (error) {
-      this.state.token = previous;
-      throw error;
-    }
+    const run = this.tokenQueue.then(async () => {
+      const previous = this.state.token;
+      this.state.token = token;
+      try {
+        await this.flush();
+      } catch (error) {
+        // Only the newest attempt may restore: if another save landed in between,
+        // restoring here would clobber it.
+        this.state.token = previous;
+        throw error;
+      }
+    });
+    // The queue must survive a rejection so the next save still runs.
+    this.tokenQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   /** @param {string} sessionId */

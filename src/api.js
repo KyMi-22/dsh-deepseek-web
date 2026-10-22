@@ -52,6 +52,41 @@ function warnOnce(message) {
 }
 
 /**
+ * Record that an error definitely happened before the prompt was sent.
+ *
+ * Applies to any thrown value, not just `DeepSeekWebError`: a plain TypeError from
+ * malformed challenge data also proves nothing reached the model.
+ *
+ * @param {unknown} error
+ */
+function markUnsubmitted(error) {
+  setSubmitted(error, false);
+}
+
+/**
+ * Record that an error's request state cannot be determined.
+ *
+ * A socket that dies mid-request looks identical whether the server saw the
+ * request or not, so a retry risks a duplicate answer. Leaving the marker unset
+ * makes the adapter treat it as "do not retry".
+ *
+ * @param {unknown} error
+ */
+function markSubmittedUnknown(error) {
+  setSubmitted(error, undefined);
+}
+
+/** @param {unknown} error @param {boolean | undefined} value */
+function setSubmitted(error, value) {
+  if (error === null || typeof error !== 'object') return;
+  try {
+    error.submitted = value;
+  } catch {
+    // A frozen error keeps its own (unset) state, which already means "unknown".
+  }
+}
+
+/**
  * Combine a caller signal with a deadline.
  *
  * A caller may pass nothing, a signal, or an already-deadline-bound signal; the
@@ -359,15 +394,16 @@ export class DeepSeekWebApi {
     }
     const { chatSessionId, prompt, parentMessageId = null, thinking = false, search = false, signal } = request;
 
-    // Everything up to the POST can fail without the model ever seeing the prompt.
-    // Every error raised there is marked `submitted: false` so the adapter knows a
-    // retry is safe; past the POST the answer is unknown and a retry could produce
-    // two replies to one message.
+    // Everything up to the POST can fail without the model ever seeing the prompt,
+    // so those errors are marked `submitted: false` and the adapter may retry.
+    // The marker is applied to ANY error, not just `DeepSeekWebError`: a plain
+    // TypeError from malformed challenge data also means nothing was sent, and
+    // leaving it unmarked made the adapter refuse a perfectly safe retry.
     let powHeader;
     try {
       powHeader = await this.solveChallenge(COMPLETION_PATH, { signal });
     } catch (error) {
-      if (error instanceof DeepSeekWebError) error.submitted = false;
+      markUnsubmitted(error);
       throw error;
     }
 
@@ -399,9 +435,12 @@ export class DeepSeekWebApi {
         signal,
       });
     } catch (error) {
-      // The request never completed a round trip: safe to retry.
-      if (error instanceof DeepSeekWebError) error.submitted = false;
-      else if (error !== null && typeof error === 'object') error.submitted = false;
+      // A fetch rejection cannot tell "never left this machine" from "the server
+      // received it and the response was lost" — the socket closes the same way in
+      // both cases. Marking it unsubmitted would let the loop post the same prompt
+      // twice, producing two answers to one message, so the outcome is reported as
+      // unknown (`submitted` stays unset) and the adapter declines to retry.
+      markSubmittedUnknown(error);
       throw error;
     }
 

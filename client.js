@@ -140,6 +140,8 @@ window.__ModuleLoader__.load({
         'ok.syncedFailed': '，失败 {failed} 个',
         'ok.undone': '已撤销：归档 {archived} 个会话，清理 {removed} 个会话文件。',
         'ok.undoneLocal': ' 其中 {local} 个是你在 DSH 内新建的对话，已归档并保留文件。',
+        'ok.undoneUnknown': ' 另有 {unknown} 个无法确认来源（早期版本写入的记录），按保守策略保留了文件。',
+        'ok.undoneArchiveFailed': ' 还有 {failed} 个归档失败，文件同样保留，可稍后重试撤销。',
         'time.justNow': '刚刚',
         'time.minutes': '{n} 分钟前',
         'time.hours': '{n} 小时前',
@@ -216,6 +218,8 @@ window.__ModuleLoader__.load({
         'ok.syncedFailed': ', {failed} failed',
         'ok.undone': 'Undone: archived {archived} sessions and cleaned {removed} session files.',
         'ok.undoneLocal': ' {local} of them were started in DSH; they are archived with their files kept.',
+        'ok.undoneUnknown': ' {unknown} more predate provenance tracking and were kept on the safe side.',
+        'ok.undoneArchiveFailed': ' {failed} could not be archived; their files were kept so a retry is possible.',
         'time.justNow': 'just now',
         'time.minutes': '{n} min ago',
         'time.hours': '{n} h ago',
@@ -518,12 +522,20 @@ window.__ModuleLoader__.load({
           if (body.ok === false) {
             setNotice({ kind: 'bad', text: t('error.undo', { message: body.error || body.workspaceError || '?' }) });
           } else {
+            // Files can legitimately remain: local conversations keep their log, and
+            // so do ledger rows whose provenance predates the origin field, or whose
+            // archive failed. Say so — "cleaned N" alone would look like a leak.
+            const details = [
+              (body.archivedLocal || 0) > 0 ? t('ok.undoneLocal', { local: body.archivedLocal }) : '',
+              (body.keptUnknown || 0) > 0 ? t('ok.undoneUnknown', { unknown: body.keptUnknown }) : '',
+              (body.keptArchiveFailed || 0) > 0 ? t('ok.undoneArchiveFailed', { failed: body.keptArchiveFailed }) : '',
+            ].join('');
             setNotice({
               kind: 'ok',
               text: t('ok.undone', {
                 archived: body.archivedSessions || 0,
                 removed: body.removedSessions || 0,
-              }) + ((body.archivedLocal || 0) > 0 ? t('ok.undoneLocal', { local: body.archivedLocal }) : ''),
+              }) + details,
             });
           }
           await refresh();
