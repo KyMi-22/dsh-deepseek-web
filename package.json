@@ -1,0 +1,66 @@
+{
+  "name": "dsh-deepseek-web",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "把 DeepSeek 网页版（chat.deepseek.com）的对话接入 DSH：独立「对话」工作区、网页端模型直连（不消耗 API 余额）、双向延续对话。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.png"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "locale",
+    "icon.png",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-web",
+    "llm-provider",
+    "chat-sync"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0-rc.1 <0.3.0-0"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check src/pow.js && node --check src/api.js && node --check src/adapter.js && node --check src/store.js && node --check src/sync.js",
+    "test": "node test/pow.test.mjs && node test/adapter.test.mjs && node test/seed.test.mjs && node test/sync.test.mjs && node test/client-render.test.mjs && node test/security.test.mjs",
+    "test:live": "node test/live-api.mjs"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "license": "MIT"
+}

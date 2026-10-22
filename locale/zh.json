@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DeepSeek 网页版 (dsh-deepseek-web)",
+    "description": "把 chat.deepseek.com 的对话接入 DSH：在侧边栏生成独立的「对话」工作区，用网页端模型续聊且不消耗 API 余额。"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DeepSeek Web (dsh-deepseek-web)",
+    "description": "Brings chat.deepseek.com conversations into DSH: a dedicated 对话 workspace in the sidebar, and a model route that continues them on the web product without spending API credit."
+  }
+}

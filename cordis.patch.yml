@@ -1,0 +1,8 @@
+# dsh-deepseek-web bundle patch.
+#
+# One `insert` row mounts the Host half; the browser half is discovered through
+# this package's `dsh.client` declaration, exactly like the shipped ui-* packages.
+- insert:
+    - id: deepseek-web
+      name: 'dsh-deepseek-web'
+      config: {}

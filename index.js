@@ -1,0 +1,813 @@
+/**
+ * dsh-deepseek-web — Host half.
+ *
+ * Three jobs live here:
+ *
+ * 1. **A model route.** The adapter in `src/adapter.js` is registered as
+ *    `deepseek-web` with two model ids, so the picker offers the web product
+ *    beside the metered API. Turns run against chat.deepseek.com and therefore
+ *    cost nothing on the API account.
+ *
+ * 2. **A conversations workspace.** `src/sync.js` imports every web
+ *    conversation as a seeded DSH session whose `cwd` is this plugin's
+ *    conversation directory, which makes the sidebar render them as the 对话
+ *    workspace with no shipped UI shadowed.
+ *
+ * 3. **The settings surface.** One same-origin JSON route feeds the browser
+ *    half: credential status, sync state, and the manual sync trigger.
+ *
+ * Everything degrades: with no credential the route still answers (so the page
+ * can ask for one), and a composition without a workspace registry or an agent
+ * loop imports nothing instead of failing to mount.
+ *
+ * @module dsh-deepseek-web
+ */
+
+import { DeepSeekWebApi } from './src/api.js';
+import { DeepSeekWebAdapter, MODELS, PROVIDER } from './src/adapter.js';
+import {
+  conversationDir,
+  ensureConversationDir,
+  StateStore,
+  stateFile,
+} from './src/store.js';
+import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
+
+/** Stable Cordis plugin name. */
+export const name = 'deepseek-web';
+
+/** The one service this plugin cannot exist without. */
+export const inject = ['llm'];
+
+/** Same-origin route prefix owned by this plugin. */
+export const API_PREFIX = '/dsh-deepseek-web/api';
+
+/** Request bodies are tiny JSON documents. */
+const MAX_BODY_BYTES = 64 * 1024;
+
+/** How many per-conversation failures one sync report carries. */
+const MAX_REPORTED_ERRORS = 5;
+
+/**
+ * Tools a web-backed session is allowed to use.
+ *
+ * This is a WHITELIST, not a blocklist. The guarantee this plugin promises is
+ * "a web conversation never writes to the local disk", and a blocklist cannot
+ * keep that promise: it silently stops protecting the moment a composition adds
+ * a tool the list predates. A earlier blocklist here missed `pwsh` (arbitrary
+ * shell) and `plugin_manager` (installs code), which is exactly the failure mode.
+ *
+ * A web conversation is not expected to call tools at all — the web endpoint has
+ * no function-calling channel — so denying an unrecognized tool costs nothing
+ * while keeping the promise closed under new tools.
+ */
+const READ_ONLY_TOOLS = new Set([
+  // Filesystem reads
+  'read',
+  'glob',
+  'grep',
+  'read_image',
+  'working_directory',
+  'load_workspace_dependencies',
+  // Network reads
+  'web_search',
+  'web_fetch',
+  // Harness introspection
+  'cordis_inspect_list',
+  'cordis_inspect_query',
+  'skill',
+  'todo_write',
+  'ask_user_question',
+  // Background-job inspection (jobs are started by a tool that is itself denied)
+  'job_output',
+  'job_list',
+  'job_kill',
+  // Team visibility
+  'list_agents',
+  'send_message',
+  'wait_agent',
+  // Declares existing files as deliverables; writes nothing
+  'present',
+]);
+
+/**
+ * Whether a web-backed session may run this tool.
+ *
+ * Unknown names are denied: the promise is about what CANNOT happen, so silence
+ * about a tool has to mean "no", not "sure".
+ *
+ * @param {unknown} name
+ * @returns {boolean}
+ */
+export function isToolAllowedInWebSession(name) {
+  return typeof name === 'string' && READ_ONLY_TOOLS.has(name);
+}
+
+/** Send a JSON reply on the raw response. */
+function sendJson(res, status, value) {
+  const body = JSON.stringify(value);
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('cache-control', 'no-store');
+  res.end(body);
+}
+
+/** Read and parse a small JSON body. */
+async function readJsonBody(req) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > MAX_BODY_BYTES) throw new Error('request body too large');
+    chunks.push(chunk);
+  }
+  if (total === 0) return {};
+  const text = Buffer.concat(chunks).toString('utf8');
+  const parsed = JSON.parse(text);
+  return parsed !== null && typeof parsed === 'object' ? parsed : {};
+}
+
+/**
+ * Ask the harness to recompose the plugin tree.
+ *
+ * Session rows created by an import reach the sidebar through indexes the HMR
+ * pass rebuilds, so this is the supported way to make them appear without
+ * restarting the application. A composition without the HMR service (headless,
+ * for instance) reports that instead of pretending to have reloaded.
+ *
+ * @param {any} ctx
+ * @param {(message: string) => void} warn
+ * @returns {Promise<{ ok: boolean, warnings?: string[], pending?: number, restartReason?: string | null, error?: string }>}
+ */
+async function triggerHotReload(ctx, warn) {
+  let hmr;
+  try {
+    hmr = ctx.get('hmr');
+  } catch {
+    hmr = undefined;
+  }
+  if (hmr === undefined || hmr === null
+    || typeof hmr.runExclusive !== 'function'
+    || typeof hmr.reconcileProfile !== 'function') {
+    return { ok: false, error: 'hmr-unavailable' };
+  }
+  try {
+    const outcome = await hmr.runExclusive(() => hmr.reconcileProfile());
+    return {
+      ok: true,
+      warnings: Array.isArray(outcome?.warnings) ? outcome.warnings.map(String) : [],
+      pending: Array.isArray(outcome?.pending) ? outcome.pending.length : 0,
+      restartReason: typeof outcome?.restartReason === 'string' ? outcome.restartReason : null,
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    warn(`deepseek-web: hot reload failed: ${detail}`);
+    return { ok: false, error: detail };
+  }
+}
+
+/**
+ * Mount the plugin.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {Record<string, unknown>} [config]
+ */
+export async function apply(ctx, config = {}) {
+  /** Plugin-owned diagnostics. */
+  const warn = (message) => {
+    try {
+      ctx.logger?.warn?.(message);
+    } catch {
+      /* a missing logger must not break the plugin */
+    }
+  };
+  const info = (message) => {
+    try {
+      ctx.logger?.info?.(message);
+    } catch {
+      /* same */
+    }
+  };
+
+  const store = await StateStore.open();
+  /**
+   * Credential resolution, highest priority first:
+   *
+   *   1. the `DEEPSEEK_WEB_TOKEN` environment variable — never written to disk
+   *   2. the bundle `token` config field
+   *   3. `state.json`, written by the settings page
+   *
+   * The environment route exists so a user who does not want a long-lived web
+   * token sitting in a JSON file can supply it per launch instead.
+   */
+  const envToken = (process.env.DEEPSEEK_WEB_TOKEN ?? '').trim();
+  const configuredToken = typeof config.token === 'string' ? config.token.trim() : '';
+  if (envToken !== '') {
+    info('deepseek-web: using DEEPSEEK_WEB_TOKEN from the environment; any stored token is ignored');
+  } else if (configuredToken !== '' && configuredToken !== store.token) {
+    await store.setToken(configuredToken);
+  }
+  const resolvedToken = envToken !== '' ? envToken : store.token;
+  const tokenSource = envToken !== '' ? 'env' : (store.token !== '' ? 'state' : 'none');
+
+  /**
+   * The endpoint the credential may be sent to.
+   *
+   * Only `https:` is accepted: a bearer token over plain http is sent in clear
+   * text, so a misconfigured or mistyped `baseUrl` must fall back to the default
+   * rather than quietly leak the credential to a plaintext endpoint.
+   */
+  const baseUrl = (() => {
+    const raw = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
+    if (raw === '') return undefined;
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      warn(`deepseek-web: ignoring an unparsable baseUrl (${raw}); using the default`);
+      return undefined;
+    }
+    if (parsed.protocol !== 'https:' && parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      warn(`deepseek-web: refusing a non-https baseUrl (${raw}) because it would send the token in clear text; using the default`);
+      return undefined;
+    }
+    return raw;
+  })();
+
+  const api = new DeepSeekWebApi({
+    token: resolvedToken,
+    deviceId: store.state.deviceId,
+    baseUrl,
+  });
+
+  // ── adapter ───────────────────────────────────────────────────────────────
+  /** Sessions already prompted, so one turn cannot re-ask the model. */
+  const promptedMessages = new Map();
+  /** Sessions using this provider, used by the file-write guard. */
+  const webSessions = new Set();
+
+  const adapter = new DeepSeekWebAdapter({
+    api,
+    resolveBinding: (sessionId) => store.binding(sessionId),
+    bindSession: (sessionId, binding) => {
+      store.setBinding(sessionId, binding);
+      webSessions.add(sessionId);
+      // A conversation this plugin minted for a NEW DSH session must also enter
+      // the ledger. Otherwise the next sync finds it on the web side with no
+      // ledger entry and imports it as a second, empty copy of the same
+      // conversation.
+      const chatSessionId = binding?.chatSessionId;
+      if (typeof chatSessionId === 'string' && chatSessionId !== '' && store.state.imported[chatSessionId] === undefined) {
+        store.recordImported({
+          chatSessionId,
+          dshSessionId: sessionId,
+          updatedAt: Math.floor(Date.now() / 1000),
+          messageCount: 0,
+        });
+      }
+    },
+    updateBinding: (sessionId, patch) => {
+      const current = store.binding(sessionId);
+      if (current === undefined) return;
+      store.setBinding(sessionId, { ...current, ...patch });
+    },
+    noteSent: (sessionId, messageId) => {
+      webSessions.add(sessionId);
+      let seen = promptedMessages.get(sessionId);
+      if (seen === undefined) {
+        seen = new Set();
+        promptedMessages.set(sessionId, seen);
+      }
+      if (seen.has(messageId)) return false;
+      seen.add(messageId);
+      return true;
+    },
+    onExchange: (sessionId, chatSessionId, userText, assistantText, reasoning) => {
+      void persistExchange(sessionId, chatSessionId, userText, assistantText, reasoning);
+    },
+    warn,
+  });
+
+  // Both registrations are fiber-owned: their handles unwind with this plugin.
+  ctx.llm.registerAdapter([PROVIDER], adapter);
+  ctx.llm.registerConfigurableProviders([
+    {
+      provider: PROVIDER,
+      displayName: 'DeepSeek 网页版',
+      settingsNs: ctx.fiber?.entry?.options?.id ?? name,
+      settingsPath: [],
+    },
+  ]);
+
+  // ── tool guard ────────────────────────────────────────────────────────────
+  // The web endpoint has no function-calling channel, so tools are never
+  // invoked against it. This guard is the second line of defence: if a tool does
+  // reach execution inside a web-backed session, anything not explicitly known to
+  // be read-only is refused. Fail closed — an unknown tool is denied.
+  //
+  // Membership is read from the DURABLE binding ledger, not from an in-memory set
+  // of sessions seen this process. An in-memory set would be empty right after a
+  // plugin reload, which would silently lift the guard for every web conversation
+  // already running.
+  const tools = ctx.get('tools');
+  if (tools?.guard !== undefined) {
+    ctx.effect(() =>
+      tools.guard((execution) => {
+        const sessionId = execution?.agent?.id;
+        if (sessionId === undefined || sessionId === null) return undefined;
+        if (store.binding(String(sessionId)) === undefined) return undefined;
+        const name = execution.name;
+        if (isToolAllowedInWebSession(name)) return undefined;
+        return `deepseek-web: 「${String(name)}」可能在本地产生副作用，网页版对话只允许只读操作`;
+      }),
+    );
+  }
+
+  // ── import / sync ─────────────────────────────────────────────────────────
+  // These services are resolved on use rather than captured here: a composition
+  // may mount the workspace registry or the agent loop after this plugin, and a
+  // captured `undefined` would silently disable importing for the whole session.
+  const workspaceRegistry = () => ctx.get('workspaceRegistry');
+  const agentLoop = () => ctx.get('agentLoop');
+
+  let directory = conversationDir();
+  try {
+    directory = await ensureConversationDir();
+  } catch (error) {
+    warn(`deepseek-web: could not create the conversation directory: ${String(error)}`);
+  }
+
+  /**
+   * One import pass. Returns a compact report the settings page renders.
+   *
+   * Passes are serialized. Two concurrent passes (a manual click racing the
+   * background timer) would both read the ledger before either wrote it, decide
+   * the same conversation is new, and create two DSH sessions for it — the exact
+   * duplicate the import is supposed to avoid. A second caller joins the pass
+   * already in flight rather than starting another.
+   */
+  let syncInFlight = null;
+  function syncNow(options = {}) {
+    if (syncInFlight !== null) return syncInFlight;
+    syncInFlight = performSync(options).finally(() => {
+      syncInFlight = null;
+    });
+    return syncInFlight;
+  }
+
+  async function performSync(options = {}) {
+    const { limit = Infinity, reason = 'manual' } = options;
+    const report = {
+      reason,
+      at: Date.now(),
+      listed: 0,
+      imported: 0,
+      skipped: 0,
+      failed: 0,
+      attached: 0,
+      attachFailed: 0,
+      errors: [],
+      windowStart: 0,
+      inWindow: 0,
+      alreadyBound: 0,
+      workspaceId: store.state.workspaceId,
+      workspaceError: null,
+      error: null,
+    };
+
+    /** Persist the report so a crash or throw still leaves evidence behind. */
+    const checkpoint = async () => {
+      store.state.lastReport = JSON.parse(JSON.stringify(report));
+      try {
+        await store.flush();
+      } catch {
+        /* a diagnostic write must never mask the real failure */
+      }
+    };
+
+    if (!api.ready) {
+      report.error = 'no-token';
+      await checkpoint();
+      return report;
+    }
+    try {
+      const sessions = await api.listSessions();
+      report.listed = sessions.length;
+      // Narrow the pass to a recent window, oldest first. `attachSession`
+      // prepends, so importing oldest-first leaves the newest conversation at
+      // the top of the sidebar.
+      const since = resolveSyncWindowStart(syncWindow);
+      // A conversation this plugin CREATED for a new DSH session already has a
+      // bound DSH session. Importing it again would produce a second, empty copy
+      // of the same conversation, so those ids are excluded before selection.
+      const boundChatIds = new Set(
+        Object.values(store.state.bindings)
+          .map((binding) => binding?.chatSessionId)
+          .filter((id) => typeof id === 'string' && id !== ''),
+      );
+      const inWindow = selectImportBatch(sessions, since);
+      const batch = selectImportBatch(sessions, since, boundChatIds);
+      report.windowStart = since;
+      report.inWindow = batch.length;
+      report.alreadyBound = inWindow.length - batch.length;
+      // Services are resolved per pass, not at mount time: the workspace
+      // registry and the agent loop may be loaded after this plugin.
+      const provisioned = await ensureWorkspace(
+        { workspaceRegistry: workspaceRegistry() },
+        directory,
+        warn,
+      );
+      report.workspaceError = provisioned.error;
+      store.state.lastWorkspaceError = provisioned.error;
+      if (provisioned.workspaceId !== null) {
+        report.workspaceId = provisioned.workspaceId;
+        if (store.state.workspaceId !== provisioned.workspaceId) {
+          store.state.workspaceId = provisioned.workspaceId;
+          void store.flush();
+        }
+      }
+      // A session joins a workspace only when its stored `cwd` equals the
+      // workspace's canonical path character for character — `attachSession`
+      // rejects any difference and silently leaves the session ungrouped. The
+      // workspace entity owns that canonical string, so it is the authority for
+      // everything this pass creates.
+      const sessionCwd = provisioned.workspace?.path ?? directory;
+      report.sessionCwd = sessionCwd;
+      await checkpoint();
+      let importedNow = 0;
+      for (const summary of batch) {
+        const known = store.state.imported[summary.id];
+        if (known !== undefined) {
+          report.skipped++;
+          if (summary.updatedAt > known.updatedAt) {
+            known.updatedAt = summary.updatedAt;
+            void store.flush();
+          }
+          continue;
+        }
+        if (importedNow >= limit) {
+          report.skipped++;
+          continue;
+        }
+        importedNow++;
+        try {
+          const history = await api.getHistory(summary.id);
+          if (history === null) {
+            report.failed++;
+            continue;
+          }
+          const seed = buildSeedEvents(history.messages, {
+            title: summary.title,
+            provider: PROVIDER,
+            model: MODELS[0].id,
+          });
+          if (seed.length === 0) {
+            report.skipped++;
+            continue;
+          }
+          const dshSessionId = mintSessionId();
+          const created = await createSeededSession({
+            ctx,
+            agentLoop: agentLoop(),
+            sessionId: dshSessionId,
+            cwd: sessionCwd,
+            seed,
+            provider: PROVIDER,
+            model: MODELS[0].id,
+            warn,
+          });
+          if (!created.ok) {
+            report.failed++;
+            if (report.errors.length < MAX_REPORTED_ERRORS) {
+              // Deliberately no conversation title: the report is persisted to
+              // state.json, and the title is private text from the user's chats.
+              report.errors.push({ chatSessionId: summary.id, error: created.error });
+            }
+            // Persisted, not just remembered: a failed import must stay
+            // diagnosable after a restart.
+            store.state.lastSyncError = created.error;
+            await checkpoint();
+            continue;
+          }
+          store.recordImported({
+            chatSessionId: summary.id,
+            dshSessionId,
+            updatedAt: summary.updatedAt,
+            messageCount: history.messages.length,
+          });
+          store.setBinding(dshSessionId, {
+            chatSessionId: summary.id,
+            parentMessageId: lastMessageId(history.messages),
+            seeded: true,
+          });
+          webSessions.add(dshSessionId);
+          report.imported++;
+        } catch (error) {
+          report.failed++;
+          warn(`deepseek-web: importing ${summary.id} failed: ${String(error)}`);
+        }
+      }
+
+      // Creating a workspace does not adopt the sessions already in its
+      // directory: membership is an explicit record, so the pass attaches every
+      // imported session (new and previously imported alike). Re-running this is
+      // harmless — an attached session is a no-op.
+      if (provisioned.workspace !== null && provisioned.workspace !== undefined) {
+        const ids = Object.values(store.state.imported)
+          .map((entry) => entry?.dshSessionId)
+          .filter((id) => typeof id === 'string' && id !== '');
+        const attached = await attachSessions(provisioned.workspace, ids, warn);
+        report.attached = attached.attached;
+        report.attachFailed = attached.failed;
+        if (attached.failed > 0) {
+          store.state.lastWorkspaceError = `${attached.failed} 个会话未能加入工作区`;
+          const firstAttachError = attached.errors[0];
+          if (firstAttachError !== undefined) store.state.lastSyncError = `join workspace: ${firstAttachError}`;
+        }
+      } else {
+        report.attachFailed = Object.keys(store.state.imported).length;
+      }
+
+      store.state.lastSyncAt = Date.now();
+      if (report.failed === 0) store.state.lastSyncError = null;
+      // A manual or automatic pass proves the user wants the import, so it lifts
+      // any pause an undo left behind.
+      store.state.syncPausedUntil = 0;
+      await checkpoint();
+    } catch (error) {
+      report.error = String(error?.message ?? error);
+      store.state.lastSyncError = report.error;
+      warn(`deepseek-web: sync failed: ${String(error)}`);
+      await checkpoint();
+    }
+    return report;
+  }
+
+  /** Record one completed exchange in the plugin's own ledger. */
+  async function persistExchange(sessionId, chatSessionId, userText, assistantText, reasoning) {
+    const imported = store.state.imported[chatSessionId];
+    if (imported !== undefined) {
+      imported.updatedAt = Math.floor(Date.now() / 1000);
+      imported.messageCount += 2;
+      await store.flush();
+    }
+    void sessionId;
+    void userText;
+    void assistantText;
+    void reasoning;
+  }
+
+  /**
+   * Mirror a DSH rename onto the bound web conversation.
+   *
+   * The session log is the source of truth for the title: a rename inside DSH
+   * commits a `session/title` event, and that carries the same label the sidebar
+   * shows. Pushing it here keeps both sides reading the same, instead of the web
+   * product keeping whatever paraphrased title it generated on the first turn.
+   *
+   * Seeded title events never reach this feed (seed events are not published), so
+   * importing a conversation cannot trigger a spurious rename.
+   */
+  const pushedTitles = new Map();
+  async function pushTitleToWeb(sessionId, event) {
+    if (!api.ready) return;
+    const planned = planTitlePush(event, sessionId, (id) => store.binding(id));
+    if (planned === null) return;
+    const { chatSessionId, title } = planned;
+    const key = `${chatSessionId}\u0000${title}`;
+    if (pushedTitles.get(chatSessionId) === key) return;
+    pushedTitles.set(chatSessionId, key);
+    try {
+      await api.renameSession(chatSessionId, title);
+    } catch (error) {
+      // A conversation with no messages yet refuses a rename; that is not worth
+      // even a warning, and clearing the memo lets a later rename retry.
+      pushedTitles.delete(chatSessionId);
+      warn(`deepseek-web: could not sync the title to the web conversation: ${String(error)}`);
+    }
+  }
+
+  ctx.effect(() => {
+    const off = ctx.on('session/event', (session, event) => {
+      const sessionId = session?.id;
+      if (sessionId === undefined || sessionId === null) return;
+      void pushTitleToWeb(String(sessionId), event);
+    });
+    return () => {
+      if (typeof off === 'function') off();
+    };
+  });
+
+  // Background sync. It is deliberately slow and serial: the settings page can
+  // always force a pass, and a list request on a metronome is the one pattern
+  // that says "this is a script". The default mean is five minutes, and each
+  // delay is jittered around it — a person refreshes a conversation list when
+  // they feel like it, not on an exact beat. Set `syncIntervalSeconds: 0` to
+  // make syncing manual-only.
+  //
+  // `syncWindow` bounds which conversations a pass looks at: 'week' (default,
+  // the current calendar week from Monday 00:00 local), 'month', 'all', or a
+  // number of days. A long account would otherwise import hundreds of
+  // conversations the user has no interest in seeing in the sidebar.
+  const syncWindow = config.syncWindow ?? 'week';
+  const intervalSeconds = Number(config.syncIntervalSeconds ?? 300);
+  if (Number.isFinite(intervalSeconds) && intervalSeconds > 0 && config.autoSync !== false) {
+    ctx.effect(() => {
+      let timer = null;
+      let stopped = false;
+      const scheduleNext = () => {
+        if (stopped) return;
+        timer = setTimeout(() => {
+          if (stopped) return;
+          // Honor an undo: re-importing seconds after the user cleared
+          // everything would make the button look broken.
+          const paused = Date.now() < store.state.syncPausedUntil;
+          // Awaited so a slow pass can never overlap the next one; `syncNow`
+          // also guards against a manual pass arriving mid-flight.
+          const run = paused ? Promise.resolve() : syncNow({ limit: 5, reason: 'auto' });
+          void run.finally(scheduleNext);
+        }, nextSyncDelayMs(intervalSeconds));
+        if (typeof timer.unref === 'function') timer.unref();
+      };
+      scheduleNext();
+      return () => {
+        stopped = true;
+        if (timer !== null) clearTimeout(timer);
+      };
+    });
+  }
+
+  // ── settings route ────────────────────────────────────────────────────────
+  const webServer = ctx.get('webServer');
+  if (webServer?.register !== undefined) {
+    ctx.effect(() =>
+      webServer.register({
+        kind: 'prefix',
+        path: API_PREFIX,
+        handler: async (req, res) => {
+          // Fail closed. Without the connection trust fence this route answers
+          // any local process, and it exposes the credential tail and mutates the
+          // stored credential and the imported sessions. A composition that
+          // cannot admit the request must not be treated as admitting it.
+          let rejection;
+          try {
+            const connection = ctx.get('connection');
+            if (typeof connection?.requestRejection !== 'function') {
+              res.statusCode = 503;
+              res.end();
+              return;
+            }
+            rejection = connection.requestRejection(req);
+          } catch {
+            res.statusCode = 403;
+            res.end();
+            return;
+          }
+          if (typeof rejection === 'number') {
+            res.statusCode = rejection;
+            res.end();
+            return;
+          }
+          const url = new URL(String(req.url ?? '/'), 'http://localhost');
+          const route = url.pathname.slice(API_PREFIX.length) || '/';
+          try {
+            if (req.method === 'GET' && (route === '/status' || route === '/')) {
+              sendJson(res, 200, {
+                plugin: name,
+                provider: PROVIDER,
+                models: MODELS.map((entry) => ({ id: entry.id, name: entry.name, description: entry.description })),
+                workspaceTitle: WORKSPACE_TITLE,
+                workspaceId: store.state.workspaceId,
+                conversationDir: directory,
+                stateFile: stateFile(),
+                hasToken: api.ready,
+                tokenTail: api.ready ? maskToken(api.token) : '',
+                tokenSource,
+                imported: Object.keys(store.state.imported).length,
+                lastSyncAt: store.state.lastSyncAt,
+                autoSyncSeconds: intervalSeconds,
+                syncWindow,
+                windowStart: resolveSyncWindowStart(syncWindow),
+                capabilities: {
+                  workspace: workspaceRegistry() !== undefined,
+                  agentLoop: agentLoop() !== undefined,
+                  webServer: true,
+                },
+                lastWorkspaceError: store.state.lastWorkspaceError,
+                lastReport: store.state.lastReport,
+                lastSyncError: store.state.lastSyncError,
+              });
+              return;
+            }
+            if (req.method === 'POST' && route === '/token') {
+              if (envToken !== '') {
+                // The environment wins by design; storing a token here would be
+                // silently ignored, which reads as a broken save.
+                sendJson(res, 409, {
+                  ok: false,
+                  error: 'token-from-environment',
+                  detail: 'DEEPSEEK_WEB_TOKEN is set; unset it to manage the token from this page',
+                });
+                return;
+              }
+              const body = await readJsonBody(req);
+              const token = typeof body.token === 'string' ? body.token.trim() : '';
+              if (token === '') {
+                sendJson(res, 400, { ok: false, error: 'empty-token' });
+                return;
+              }
+              // Verify with a throwaway client first: persisting an unverified
+              // credential would leave the page reporting "configured" while every
+              // later request fails, and would overwrite a working token with a
+              // broken one.
+              const probe = new DeepSeekWebApi({
+                token,
+                deviceId: store.state.deviceId,
+                baseUrl,
+              });
+              let account = null;
+              try {
+                const me = await probe.currentUser();
+                account = { id: me.id, name: me.id_profile?.name ?? '', email: me.email ?? '' };
+              } catch (error) {
+                sendJson(res, 400, { ok: false, error: 'invalid-token', detail: String(error?.message ?? error) });
+                return;
+              }
+              await store.setToken(token);
+              api.configure({ token });
+              sendJson(res, 200, { ok: true, account });
+              return;
+            }
+            if (req.method === 'POST' && route === '/sync') {
+              const body = await readJsonBody(req);
+              const limit = Number.isFinite(Number(body.limit)) && Number(body.limit) > 0 ? Number(body.limit) : Infinity;
+              const report = await syncNow({ limit, reason: 'manual' });
+              sendJson(res, 200, report);
+              return;
+            }
+            if (req.method === 'POST' && route === '/reload') {
+              // Recompose the plugin tree through the official HMR service. The
+              // session rows the import just created only reach the sidebar after
+              // the workspace/session indexes are rebuilt, and this is the
+              // supported way to force that without restarting the application.
+              const reloaded = await triggerHotReload(ctx, warn);
+              sendJson(res, 200, reloaded);
+              return;
+            }
+            if (req.method === 'POST' && route === '/undo') {
+              // Remove every artifact of the import: archive everything living
+              // in the conversation directory (including conversations started
+              // inside DSH, which have no import record), delete the files of the
+              // sessions this plugin itself imported, then drop the workspace and
+              // the ledger. The credential and the web account stay untouched so
+              // a re-import is one click.
+              const undo = await undoImports({
+                imported: store.state.imported,
+                workspaceId: store.state.workspaceId,
+                directory,
+                registry: workspaceRegistry(),
+                query: ctx.get('sessionQuery'),
+                warn,
+              });
+              store.state.imported = {};
+              store.state.bindings = {};
+              store.state.workspaceId = null;
+              store.state.lastSyncAt = 0;
+              // Give the user time to decide before background sync rebuilds it.
+              store.state.syncPausedUntil = Date.now() + 10 * 60_000;
+              promptedMessages.clear();
+              store.state.lastWorkspaceError = undo.workspaceError;
+              store.state.lastSyncError = null;
+              store.state.lastReport = null;
+              await store.flush();
+              sendJson(res, 200, { ok: true, ...undo });
+              return;
+            }
+            if (req.method === 'POST' && route === '/verify') {
+              try {
+                const me = await api.currentUser();
+                sendJson(res, 200, { ok: true, account: { id: me.id, name: me.id_profile?.name ?? '', email: me.email ?? '' } });
+              } catch (error) {
+                sendJson(res, 200, { ok: false, detail: String(error?.message ?? error) });
+              }
+              return;
+            }
+            sendJson(res, 404, { ok: false, error: 'not-found' });
+          } catch (error) {
+            warn(`deepseek-web: route ${route} failed: ${String(error)}`);
+            sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+          }
+        },
+      }),
+    );
+  }
+
+  info(`deepseek-web: provider "${PROVIDER}" ready; conversations directory ${directory}`);
+}
+
+/** Show only the tail of a credential in the settings page. */
+function maskToken(token) {
+  if (typeof token !== 'string' || token.length === 0) return '';
+  if (token.length <= 8) return '****';
+  return `${'*'.repeat(Math.min(token.length - 4, 12))}${token.slice(-4)}`;
+}

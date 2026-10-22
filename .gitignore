@@ -1,0 +1,18 @@
+# Runtime state the plugin writes outside the package, and transient build/test noise.
+node_modules/
+*.tmp
+*.log
+
+# Local credential/state must never be committed. The plugin keeps its state in
+# $DSH_HOME/deepseek-web (outside this package), but guard against a stray copy.
+state.json
+.credentials.yaml
+.env
+.env.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+DS_Store
