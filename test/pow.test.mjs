@@ -10,6 +10,7 @@
 //   node test/pow.test.mjs
 
 import assert from 'node:assert';
+import { solvePowOffThread } from '../src/pow-async.js';
 import { DeepSeekHash, powResponseHeader, solvePow } from '../src/pow.js';
 
 // ── a real challenge/answer pair from chat.deepseek.com ────────────────────
@@ -37,6 +38,39 @@ const VECTOR_ANSWER = 121636;
   const elapsed = Date.now() - started;
   assert.equal(answer, VECTOR_ANSWER, 'the solver must reproduce the answer the live service accepted');
   console.log(`  live vector solved: answer=${answer} in ${elapsed}ms`);
+}
+
+// ── the off-thread path really runs on a worker ───────────────────────────
+{
+  // The whole point is that the Host's event loop stays free; if the worker
+  // silently degrades to the in-process loop every turn stalls for a second and
+  // nothing says so. `offThread` is the observable proof it did not degrade.
+  const started = Date.now();
+  const { answer, offThread } = await solvePowOffThread(VECTOR);
+  const elapsed = Date.now() - started;
+
+  assert.equal(answer, VECTOR_ANSWER, 'the worker reproduces the same answer');
+  assert.equal(offThread, true, 'the solve ran on a worker thread, not the main one');
+  console.log(`  off-thread vector solved: answer=${answer} in ${elapsed}ms (worker)`);
+
+  // The event loop must remain responsive while the worker computes. A timer
+  // scheduled before the await fires before the solve resolves.
+  let ticked = false;
+  const tick = setTimeout(() => { ticked = true; }, 0);
+  await solvePowOffThread(VECTOR);
+  clearTimeout(tick);
+  assert.equal(ticked, true, 'the event loop kept running during the solve');
+}
+
+// ── aborting an off-thread solve stops it ─────────────────────────────────
+{
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    () => solvePowOffThread(VECTOR, { signal: controller.signal }),
+    /aborted/u,
+    'an already-aborted signal is honoured before starting',
+  );
 }
 
 // ── self-consistency on a synthetic challenge ─────────────────────────────

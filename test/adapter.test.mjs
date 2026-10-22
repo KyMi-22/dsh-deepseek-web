@@ -14,7 +14,7 @@ import { DeepSeekWebError } from '../src/api.js';
 
 /** An API double that records what the adapter asked for. */
 function fakeApi(events, options = {}) {
-  const calls = { createSession: 0, completions: [], renames: [] };
+  const calls = { createSession: 0, completions: [], renames: [], histories: 0 };
   let failuresLeft = options.createFailures ?? 0;
   return {
     calls,
@@ -26,6 +26,12 @@ function fakeApi(events, options = {}) {
       }
       return { id: 'web-1', title: null, updatedAt: 0 };
     },
+    async getHistory(chatSessionId) {
+      calls.histories += 1;
+      calls.lastHistoryId = chatSessionId;
+      if (options.historyMessages === undefined) return null;
+      return { session: { id: chatSessionId }, messages: options.historyMessages };
+    },
     async renameSession(chatSessionId, title) {
       calls.renames.push({ chatSessionId, title });
     },
@@ -35,6 +41,7 @@ function fakeApi(events, options = {}) {
         thinking: request.thinking,
         search: request.search,
         chatSessionId: request.chatSessionId,
+        parentMessageId: request.parentMessageId,
       });
       yield { kind: 'message', messageId: 2, parentId: 1 };
       for (const event of events) yield event;
@@ -208,7 +215,11 @@ assert.equal(
   assert.equal(sent.thinking, true, 'the reasoner model enables thinking');
   assert.equal(sent.search, false, 'the reasoner model leaves search off');
 
-  assert.deepEqual(bindings.get('sess-1'), { chatSessionId: 'web-1', parentMessageId: 2, seeded: true });
+  const bound = bindings.get('sess-1');
+  assert.equal(bound.chatSessionId, 'web-1', 'the web conversation is pinned');
+  assert.equal(bound.parentMessageId, 2, 'the reply advances the parent message');
+  assert.equal(bound.seeded, true, 'the conversation is no longer empty-seeded');
+  assert.ok(Number.isFinite(bound.parentSyncedAt), 'the parent freshness is recorded');
 
   // The first turn pins the web title to the same text DSH shows, because the
   // web product would otherwise paraphrase a Chinese question into English.
@@ -264,6 +275,66 @@ assert.equal(
   const last = second[second.length - 1];
   assert.equal(last.type, 'finish');
   assert.notEqual(last.reason.kind, 'error', 'the retry is not swallowed');
+}
+
+// ── a stale parent message is refreshed before continuing ─────────────────
+{
+  // The user kept chatting on chat.deepseek.com between DSH turns. Continuing from
+  // the recorded parent would answer a branch that no longer has those turns.
+  const api = fakeApi([ANSWER('ok')], { historyMessages: [{ message_id: 41 }, { message_id: 99 }] });
+  const bindings = new Map([
+    ['sess-stale', { chatSessionId: 'web-9', parentMessageId: 41, seeded: true, parentSyncedAt: 0 }],
+  ]);
+  const adapter = new DeepSeekWebAdapter({
+    api,
+    resolveBinding: (id) => bindings.get(id),
+    bindSession: (id, binding) => bindings.set(id, binding),
+    updateBinding: (id, patch) => bindings.set(id, { ...bindings.get(id), ...patch }),
+    noteSent: () => true,
+    warn: () => {},
+  });
+
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m1', '继续')],
+    sessionId: 'sess-stale',
+  })) {
+    /* drain */
+  }
+
+  assert.equal(api.calls.histories, 1, 'the web history was re-read once');
+  assert.equal(api.calls.completions[0].parentMessageId, 99, 'the prompt continues from the real tail');
+}
+
+// ── a fresh parent is not re-read ─────────────────────────────────────────
+{
+  // Inside a continuous exchange our own reply advanced the id moments ago; paying
+  // a history request on every turn would double the request rate for nothing.
+  const api = fakeApi([ANSWER('ok')], { historyMessages: [{ message_id: 99 }] });
+  const bindings = new Map([
+    ['sess-fresh', { chatSessionId: 'web-9', parentMessageId: 41, seeded: true, parentSyncedAt: Date.now() }],
+  ]);
+  const adapter = new DeepSeekWebAdapter({
+    api,
+    resolveBinding: (id) => bindings.get(id),
+    bindSession: (id, binding) => bindings.set(id, binding),
+    updateBinding: (id, patch) => bindings.set(id, { ...bindings.get(id), ...patch }),
+    noteSent: () => true,
+    warn: () => {},
+  });
+
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m1', '继续')],
+    sessionId: 'sess-fresh',
+  })) {
+    /* drain */
+  }
+
+  assert.equal(api.calls.histories, 0, 'a fresh parent costs no extra request');
+  assert.equal(api.calls.completions[0].parentMessageId, 41, 'the recorded parent is used as-is');
 }
 
 // ── auxiliary calls never touch the web ────────────────────────────────────

@@ -72,4 +72,13 @@ async function collect(chunks) {
   assert.deepEqual(await collect(['\n\n']), [], 'blank blocks produce no events');
 }
 
+// ── a stalled stream trips the idle guard instead of hanging ──────────────
+{
+  // A server that accepts the request and then says nothing would otherwise hold
+  // the caller (and, through it, the serialized sync pass) indefinitely.
+  const stalled = new ReadableStream({ start() { /* never enqueues */ } });
+  const iterator = readSse(stalled, undefined, 50);
+  await assert.rejects(() => iterator.next(), /idle/u, 'an idle stream is abandoned rather than awaited forever');
+}
+
 console.log('sse.test.mjs: all assertions passed');

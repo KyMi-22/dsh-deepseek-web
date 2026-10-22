@@ -33,6 +33,18 @@
 'use strict';
 
 import { DeepSeekWebError } from './api.js';
+import { lastMessageId } from './sync.js';
+
+/**
+ * How long a recorded parent message stays trusted before it is re-read.
+ *
+ * The web conversation can move on without this plugin: the user may keep
+ * chatting on chat.deepseek.com. Continuing from a stale parent would ask the
+ * model to answer a branch that no longer has the latest turns in it, so the
+ * parent is refreshed when the last turn was a while ago. Inside a continuous
+ * exchange our own replies keep the recorded id fresh and cost no extra request.
+ */
+const PARENT_STALE_MS = 60_000;
 
 /** Provider route this adapter serves. */
 export const PROVIDER = 'deepseek-web';
@@ -355,6 +367,40 @@ export class DeepSeekWebAdapter {
    * }} options
    * @returns {AsyncIterable<object>} harness `StreamChunk` values.
    */
+  /**
+   * Re-read the web conversation's latest message id when the binding may be stale.
+   *
+   * The web side moves independently: the user can keep talking on
+   * chat.deepseek.com between DSH turns. Sending the next prompt with an old
+   * `parent_message_id` asks the model to answer a branch that no longer contains
+   * those turns. Refreshing costs one small GET, so it is throttled: within a
+   * continuous exchange our own replies already advance the recorded id.
+   *
+   * A failure here must not block the turn — a stale parent still produces a
+   * usable answer, just one that may be missing the web-side turns.
+   *
+   * @param {{ chatSessionId?: string, parentMessageId?: number | null, parentSyncedAt?: number }} binding
+   */
+  async refreshParent(binding) {
+    const chatSessionId = binding?.chatSessionId;
+    if (typeof chatSessionId !== 'string' || chatSessionId === '') return binding;
+    const last = Number(binding.parentSyncedAt) || 0;
+    if (Date.now() - last < PARENT_STALE_MS) return binding;
+    try {
+      const history = await this.deps.api.getHistory(chatSessionId);
+      if (history === null) return binding;
+      const latest = lastMessageId(history.messages);
+      const syncedAt = Date.now();
+      if (latest !== null && latest !== binding.parentMessageId) {
+        // Branch moved on without us; continue from the real tail.
+        return { ...binding, parentMessageId: latest, parentSyncedAt: syncedAt };
+      }
+      return { ...binding, parentSyncedAt: syncedAt };
+    } catch {
+      return binding;
+    }
+  }
+
   async *stream(options) {
     // The loop also drives auxiliary calls — title generation and compaction —
     // through this same adapter. Forwarding them to the web product would mint a
@@ -397,7 +443,7 @@ export class DeepSeekWebAdapter {
     if (binding === undefined) {
       try {
         const created = await this.deps.api.createSession();
-        binding = { chatSessionId: created.id, parentMessageId: null, seeded: false };
+        binding = { chatSessionId: created.id, parentMessageId: null, seeded: false, parentSyncedAt: Date.now() };
         if (sessionId !== undefined) this.deps.bindSession(sessionId, binding);
       } catch (error) {
         // Nothing reached the model: there is no conversation yet, so a retry of
@@ -407,6 +453,8 @@ export class DeepSeekWebAdapter {
         yield finishError(error);
         return;
       }
+    } else {
+      binding = await this.refreshParent(binding);
     }
 
     let reasoningIndex = -1;
@@ -486,8 +534,9 @@ export class DeepSeekWebAdapter {
 
     if (sessionId !== undefined) {
       const wasSeeded = binding.seeded === true;
-      this.deps.updateBinding(sessionId, { parentMessageId: messageId });
-      const next = { ...binding, seeded: true, parentMessageId: messageId ?? binding.parentMessageId };
+      // Our own reply is now the tail of the web thread, so the parent is fresh.
+      this.deps.updateBinding(sessionId, { parentMessageId: messageId, parentSyncedAt: Date.now() });
+      const next = { ...binding, seeded: true, parentMessageId: messageId ?? binding.parentMessageId, parentSyncedAt: Date.now() };
       this.deps.bindSession(sessionId, next);
       // The web product titles a conversation from its first exchange, which for
       // a Chinese conversation comes back as an English paraphrase. Renaming it to

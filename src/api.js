@@ -19,12 +19,64 @@
  */
 'use strict';
 
-import { powResponseHeader, solvePow } from './pow.js';
+import { solvePowOffThread } from './pow-async.js';
+import { powResponseHeader } from './pow.js';
 
 /** Public web origin. */
 export const DEFAULT_BASE_URL = 'https://chat.deepseek.com';
 /** Endpoint the PoW challenge is minted for. */
 const COMPLETION_PATH = '/api/v0/chat/completion';
+
+/**
+ * Request deadlines.
+ *
+ * Without them a stalled connection holds its caller forever — and since sync
+ * passes are serialized, one hung list request disables synchronization until the
+ * process restarts. The completion stream gets a longer budget because the server
+ * itself caps a single generation near 60 s, and an idle gap that long means the
+ * stream is abandoned.
+ */
+const REQUEST_TIMEOUT_MS = 30_000;
+const STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+/** Emit a diagnostic once per process for a condition that repeats every call. */
+const emitted = new Set();
+function warnOnce(message) {
+  if (emitted.has(message)) return;
+  emitted.add(message);
+  try {
+    console.warn(message);
+  } catch {
+    /* a missing console must not break the request */
+  }
+}
+
+/**
+ * Combine a caller signal with a deadline.
+ *
+ * A caller may pass nothing, a signal, or an already-deadline-bound signal; the
+ * result always aborts when either the caller asks or the budget expires.
+ *
+ * @param {AbortSignal | undefined} signal
+ * @param {number} ms
+ * @returns {AbortSignal | undefined}
+ */
+function withDeadline(signal, ms) {
+  let timeout;
+  try {
+    timeout = AbortSignal.timeout(ms);
+  } catch {
+    return signal;
+  }
+  if (signal === undefined || signal === null) return timeout;
+  try {
+    return AbortSignal.any([signal, timeout]);
+  } catch {
+    // Older runtime without AbortSignal.any: the deadline alone still prevents
+    // an unbounded hang, which is the failure this guard exists for.
+    return timeout;
+  }
+}
 
 /** Fragment types that carry model output. */
 const FRAGMENT_THINK = 'THINK';
@@ -131,7 +183,11 @@ export class DeepSeekWebApi {
       }
     }
     /** @type {RequestInit} */
-    const init = { method, headers: this.headers(body === undefined ? {} : { 'Content-Type': 'application/json' }), signal };
+    const init = {
+      method,
+      headers: this.headers(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      signal: withDeadline(signal, REQUEST_TIMEOUT_MS),
+    };
     if (body !== undefined) init.body = JSON.stringify(body);
     const response = await this.fetchImpl(url.toString(), init);
     const text = await response.text();
@@ -242,6 +298,10 @@ export class DeepSeekWebApi {
 
   /**
    * Request and solve the proof-of-work challenge for one target path.
+   *
+   * The solve runs on a worker thread: it is a ~1 s CPU loop, and blocking the
+   * Host's event loop for that long stalls every other session and any sync.
+   *
    * @param {string} [targetPath]
    * @param {{ signal?: AbortSignal }} [options]
    */
@@ -253,7 +313,10 @@ export class DeepSeekWebApi {
     });
     const challenge = data?.challenge;
     if (!challenge) throw new DeepSeekWebError('deepseek-web: challenge response carried no challenge', 'MALFORMED');
-    const answer = solvePow(challenge, { signal: options.signal });
+    const { answer, offThread } = await solvePowOffThread(challenge, { signal: options.signal });
+    if (!offThread) {
+      warnOnce('deepseek-web: solving proof-of-work on the main thread (no worker available)');
+    }
     if (answer === undefined) {
       throw new DeepSeekWebError('deepseek-web: proof-of-work was not solved within the budget', 'POW_UNSOLVED');
     }
@@ -307,6 +370,8 @@ export class DeepSeekWebApi {
         'X-DS-PoW-Response': powHeader,
       }),
       body: JSON.stringify(body),
+      // A generation may legitimately run for a minute; the idle guard below is
+      // what catches a stream that stops producing without closing.
       signal,
     });
 
@@ -335,7 +400,7 @@ export class DeepSeekWebApi {
      */
     let currentFragmentType = FRAGMENT_RESPONSE;
 
-    for await (const event of readSse(response.body, signal)) {
+    for await (const event of readSse(response.body, signal, STREAM_IDLE_TIMEOUT_MS)) {
       if (event.type === 'update_session') continue;
       if (event.type === 'ready') continue;
       const payload = event.data;
@@ -450,8 +515,9 @@ function fragmentTypeOf(type) {
  *
  * @param {ReadableStream<Uint8Array>} body
  * @param {AbortSignal} [signal]
+ * @param {number} [idleMs] - abort when no chunk arrives for this long; 0 disables.
  */
-export async function* readSse(body, signal) {
+export async function* readSse(body, signal, idleMs = 0) {
   const decoder = new TextDecoder();
   let buffer = '';
   let eventType = 'message';
@@ -475,7 +541,10 @@ export async function* readSse(body, signal) {
   try {
     while (true) {
       if (signal?.aborted) return;
-      const { value, done } = await reader.read();
+      // `reader.read()` blocks until the server sends something. A stream that
+      // stops producing without closing would otherwise hang its caller — and a
+      // hung stream also holds the serialized sync pass forever.
+      const { value, done } = await readWithIdle(reader, idleMs);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       while (true) {
@@ -509,6 +578,36 @@ export async function* readSse(body, signal) {
     } catch {
       /* an already-closed stream is not an error */
     }
+  }
+}
+
+/**
+ * `reader.read()` bounded by an idle deadline.
+ *
+ * @param {ReadableStreamDefaultReader<Uint8Array>} reader
+ * @param {number} idleMs - 0 disables the guard.
+ */
+async function readWithIdle(reader, idleMs) {
+  if (!(idleMs > 0)) return reader.read();
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_resolve, reject) => {
+        // Deliberately NOT unref'd: this timer is the only thing that can settle
+        // the race when the server goes silent, and an unref'd timer lets the
+        // process exit before it fires.
+        timer = setTimeout(() => {
+          reject(new DeepSeekWebError(
+            `deepseek-web: the response stream went idle for ${idleMs} ms`,
+            'TIMEOUT',
+          ));
+        }, idleMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
