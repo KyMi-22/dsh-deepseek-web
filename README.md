@@ -19,40 +19,63 @@
 
 ## 安装
 
-需要先有 Node（`^22.19.0` 或 `>=24`）。下面按你用的 DSH 形态选一条：
+装完都要**重启 DSH**。重启后「设置 → 插件」里应该能看到 `dsh-deepseek-web` 和它的图标。
 
-**桌面版（Windows / macOS 应用）**
+### 方式一：在 DSH 界面里装（推荐）
+
+1. 打开 DSH，侧边栏底部点 **设置**
+2. 左侧选 **插件**
+3. 点 **添加插件**
+4. 在「包名或地址」里填：
+
+   ```
+   https://github.com/KyMi-22/dsh-deepseek-web
+   ```
+
+5. 点 **安装**，等它跑完
+6. 回到插件列表确认 `dsh-deepseek-web` 是启用状态，然后重启 DSH
+
+> 下载慢或连不上 GitHub 时，安装界面里有「**安装源**」选项，可以切到国内镜像源。
+
+### 方式二：命令行
+
+需要先有 Node（`^22.19.0` 或 `>=24`）。按你用的 DSH 形态选一条：
+
+**桌面版**
 
 ```bash
 npx @deepseek-ai/dsh plugin --profile desktop add github:KyMi-22/dsh-deepseek-web
 ```
 
-**Web 版（浏览器）**
+**Web 版**
 
 ```bash
 npx @deepseek-ai/dsh plugin --profile web add github:KyMi-22/dsh-deepseek-web
 ```
 
-装完**重启 DSH**。重启后「设置 → 插件」里应该能看到 `dsh-deepseek-web` 和它的图标。
-
-> 如果 `dsh` 已经在你的 PATH 里（比如从源码构建过），把命令开头的 `npx @deepseek-ai/dsh` 换成 `dsh` 即可。
+> 如果 `dsh` 已经在你的 PATH 里（比如从源码构建过），把开头的 `npx @deepseek-ai/dsh` 换成 `dsh`。
 
 <details>
-<summary>其他安装方式</summary>
-
-从本地目录安装（改代码时用）：
+<summary>从本地目录安装（改代码时用）</summary>
 
 ```bash
 npx @deepseek-ai/dsh plugin --profile desktop add /path/to/dsh-deepseek-web
 ```
 
-安装报错时先确认 Node 版本：
+界面方式也可以：第 4 步填本地目录的完整路径。
+
+</details>
+
+<details>
+<summary>安装报错</summary>
+
+先确认 Node 版本，低于 `22.19.0` 会过不了 engine 检查：
 
 ```bash
 node --version
 ```
 
-版本低于 `22.19.0` 会过不了 engine 检查。
+如果是 GitHub 连不上，用界面方式并切换安装源，或给命令行配置代理。
 
 </details>
 
