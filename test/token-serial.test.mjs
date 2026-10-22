@@ -92,22 +92,64 @@ function makeStore(options = {}) {
 
 // ── 3. a background write queued DURING the save cannot carry the candidate ─
 {
-  const { store, written } = makeStore({
-    failWhen: (snapshot) => (snapshot.token === 'CANDIDATE' ? DISK_FULL : undefined),
+  // The reported case. Timing matters and is easy to get wrong, so it is driven
+  // explicitly:
+  //   - the credential write blocks on a gate, so the save cannot finish early;
+  //   - a bookkeeping write is queued behind it while the candidate is still live;
+  //   - releasing the gate fails the credential write, then lets the bookkeeping
+  //     write run for real.
+  // The bookkeeping write is therefore the one that decides whether the rejected
+  // candidate reaches the disk.
+  let releaseGate;
+  const gate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+  let gated = false;
+
+  const state = {
+    token: 'OLD',
+    deviceId: 'd',
+    bindings: {},
+    imported: {},
+    workspaceId: null,
+    lastSyncAt: 0,
+    syncPausedUntil: 0,
+    lastSyncError: null,
+    lastWorkspaceError: null,
+    lastReport: null,
+  };
+  const written = [];
+  const store = new StateStore(state, {
+    persist: async (snapshot) => {
+      if (!gated && snapshot.token === 'CANDIDATE') {
+        gated = true;
+        await gate;
+        throw DISK_FULL;
+      }
+      written.push(snapshot.token);
+    },
   });
 
   const save = store.setToken('CANDIDATE').then(
     () => 'ok',
     () => 'rejected',
   );
-  // The reported case: ordinary bookkeeping writes land mid-save.
+
+  // Let the credential write reach the gate and occupy the queue.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(gated, true, 'the credential write is suspended mid-flight');
+
+  // Queue the bookkeeping write while the candidate is still in `state.token`.
   store.setBinding('s2', { chatSessionId: 'w2', seeded: true, origin: 'imported' });
   store.recordImported({ chatSessionId: 'w2', dshSessionId: 's2', updatedAt: 0, messageCount: 0 });
 
+  releaseGate();
   assert.equal(await save, 'rejected', 'the credential save was rejected');
   await store.queue;
 
   assert.equal(written.includes('CANDIDATE'), false, 'the candidate never reached the disk');
+  assert.ok(written.length > 0, 'the bookkeeping writes did run');
+  assert.deepEqual([...new Set(written)], ['OLD'], 'every bookkeeping write persisted the committed token');
   assert.equal(store.token, 'OLD', 'memory was rolled back');
   assert.equal(store.token, written[written.length - 1], 'memory and disk agree');
 }
