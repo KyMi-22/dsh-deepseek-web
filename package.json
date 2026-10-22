@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-web",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "private": true,
   "type": "module",
   "description": "把 DeepSeek 网页版（chat.deepseek.com）的对话接入 DSH：独立「对话」工作区、网页端模型直连（不消耗 API 余额）、双向延续对话。",

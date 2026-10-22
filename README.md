@@ -135,6 +135,35 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 
 ## 常见问题
 
+**Q：安装一直超时，换安装源也没用？**
+
+需要代理才能访问 GitHub 的网络环境里，这是最常见的原因：**`git` 和 `pnpm` 默认都不读系统代理**（系统代理只对浏览器生效）。
+
+在 DSH 的安装界面里，「安装源」只改 npm registry；而 GitHub 仓库形式最后要连 github.com，那一步走的是 `git`——所以换源不会好。
+
+先确认代理端口（Windows：设置 → 网络和 Internet → 代理），然后：
+
+```bash
+# git 走代理——GitHub 仓库安装要用它
+git config --global http.proxy http://127.0.0.1:7890
+git config --global https.proxy http://127.0.0.1:7890
+
+# npm/pnpm 走代理——拉 npm 包要用它
+npm config set proxy http://127.0.0.1:7890
+npm config set https-proxy http://127.0.0.1:7890
+```
+
+把 `7890` 换成你自己的端口。配完回 DSH 界面重试，不用重启。
+
+不用代理时还原：
+
+```bash
+git config --global --unset http.proxy
+git config --global --unset https.proxy
+npm config delete proxy
+npm config delete https-proxy
+```
+
 **Q：输入框里的模型选择器找不到「DeepSeek 网页版」？**
 
 先确认插件已启用（设置 → 插件），然后重启 DSH。provider 是在插件加载时注册的。
