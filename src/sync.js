@@ -621,9 +621,10 @@ export async function undoImports(options) {
       try {
         await registry.archiveSession(sessionId, { stopActivity: true });
         report.archivedSessions += 1;
-        // "Local" here means "not something this plugin imported": either it was
-        // never in the ledger, or its provenance says it started in DSH.
-        if (!ledgerSet.has(sessionId) || originOf(sessionId, bindings) !== 'imported') report.archivedLocal += 1;
+        // "Started here" and "provenance unknown" are counted separately: the page
+        // explains each of them in its own sentence, and counting an unknown one as
+        // local would have the same session described twice, in two different ways.
+        if (!ledgerSet.has(sessionId) || originOf(sessionId, bindings) === 'local') report.archivedLocal += 1;
       } catch (error) {
         report.archiveFailed += 1;
         if (ledgerSet.has(sessionId)) failedIds.add(sessionId);

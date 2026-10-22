@@ -209,20 +209,40 @@ export async function ensureConversationDir() {
  * in memory and only the persistence is asynchronous.
  */
 export class StateStore {
-  /** @param {PluginState} state */
-  constructor(state) {
+  /**
+   * @param {PluginState} state
+   * @param {{ persist?: (state: PluginState) => Promise<void> }} [options]
+   *   `persist` is injectable so tests can control write success and ordering
+   *   deterministically instead of provoking filesystem errors.
+   */
+  constructor(state, options = {}) {
     this.state = state;
+    /** The write function; real filesystem unless a test supplied its own. */
+    this.persist = typeof options.persist === 'function' ? options.persist : saveState;
     /** @type {Promise<void>} */
     this.queue = Promise.resolve();
     /** Message of the most recent background write failure, if any. */
     this.lastWriteError = null;
     /**
-     * Serializes credential replacement end to end.
+     * The credential the disk currently holds. On construction that is whatever
+     * was loaded, so it always starts in agreement with storage.
      *
-     * `flush` alone serializes writes, but a token change is read-modify-write on
-     * the in-memory state: two concurrent saves could interleave so that the failed
-     * one restored its snapshot over the newer value that had already reached the
-     * disk. The whole transaction — set, persist, roll back — has to be ordered.
+     * @type {string}
+     */
+    this.committedToken = state.token ?? '';
+    /**
+     * Set while a credential replacement owns the store.
+     *
+     * A token save is read-modify-write on shared state: it sets a candidate,
+     * persists, and rolls back on failure. A background write queued in that
+     * window would otherwise snapshot the candidate and commit it later — even
+     * after the save was rejected and rolled back.
+     *
+     * @type {boolean}
+     */
+    this.tokenCommitInFlight = false;
+    /**
+     * Serializes credential replacement end to end (see `tokenCommitInFlight`).
      *
      * @type {Promise<void>}
      */
@@ -239,20 +259,43 @@ export class StateStore {
   }
 
   /**
-   * Persist the current snapshot, coalescing concurrent writes.
+   * Persist the current state.
    *
-   * The queue must survive a failed write (a transient disk error on the first
-   * call must not wedge every later call), but the caller must still learn that
-   * THIS write failed. Swallowing the rejection made `setToken` report success
-   * while nothing reached the disk, so a restart silently restored the old
-   * credential. The internal queue therefore keeps a recovered promise, and the
-   * rejection is delivered to the caller separately.
+   * Two rules that are easy to get wrong:
    *
-   * @returns {Promise<void>} rejects when this snapshot failed to persist.
+   * 1. The snapshot is taken when the write RUNS, not when it is queued. A queued
+   *    write that snapshotted eagerly would capture whatever the state looked like
+   *    at call time — including a credential candidate that is rolled back later.
+   *
+   * 2. While a credential save is in flight, `state.token` holds a candidate that
+   *    has not been accepted. Such a write persists `committedToken` instead, so a
+   *    background write (a binding, a ledger row) can never smuggle a rejected
+   *    token onto disk.
+   *
+   * The queue must survive a failed write (a transient error must not wedge every
+   * later call), but the caller must still learn that THIS write failed: swallowing
+   * it once made `setToken` report success while nothing reached the disk.
+   *
+   * @returns {Promise<void>} rejects when this write failed to persist.
    */
   flush() {
-    const snapshot = JSON.parse(JSON.stringify(this.state));
-    const write = this.queue.then(() => saveState(snapshot));
+    return this.enqueue(false);
+  }
+
+  /**
+   * Queue one write. `includeCandidate` is only true for the credential save
+   * itself, which is the one write allowed to commit an uncommitted token.
+   *
+   * @param {boolean} includeCandidate
+   * @returns {Promise<void>}
+   */
+  enqueue(includeCandidate) {
+    const write = this.queue.then(async () => {
+      const snapshot = JSON.parse(JSON.stringify(this.state));
+      if (this.tokenCommitInFlight && !includeCandidate) snapshot.token = this.committedToken;
+      await this.persist(snapshot);
+      if (includeCandidate) this.committedToken = snapshot.token;
+    });
     // Keep the queue alive after a failure so the next flush still runs.
     this.queue = write.catch(() => undefined);
     return write;
@@ -291,14 +334,18 @@ export class StateStore {
    */
   async setToken(token) {
     const run = this.tokenQueue.then(async () => {
-      const previous = this.state.token;
+      const previous = this.committedToken;
+      this.tokenCommitInFlight = true;
       this.state.token = token;
       try {
-        await this.flush();
+        // The credential save is the one write allowed to commit the candidate.
+        await this.enqueue(true);
+        this.tokenCommitInFlight = false;
       } catch (error) {
-        // Only the newest attempt may restore: if another save landed in between,
-        // restoring here would clobber it.
-        this.state.token = previous;
+        // Restore what the disk actually holds, not what memory held a moment ago:
+        // another writer may have moved `committedToken` in between.
+        this.state.token = this.committedToken;
+        this.tokenCommitInFlight = false;
         throw error;
       }
     });

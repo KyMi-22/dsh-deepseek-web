@@ -277,6 +277,11 @@ const DAY = 86_400_000;
   // The caller keeps the ledger rows it could not clean up, so a retry is possible.
   assert.deepEqual(report.failedSessionIds, ['sess-missing'], 'the unarchivable ledger entry is reported back');
 
+  // "Started here" and "provenance unknown" are separate counts: the page explains
+  // each in its own sentence, so an unknown entry must not also be called local.
+  assert.equal(report.archivedLocal, 2, 'the DSH-started session and the local ledger row are the local ones');
+  assert.equal(report.keptUnknown, 1, 'the pre-origin row is counted as unknown, not as local');
+
   // Only the two genuinely imported sessions lose their logs.
   assert.equal(report.removedSessions, 2, 'only origin=imported sessions are deleted');
   assert.equal(fs.existsSync(path.join(sessionsRoot, 'sess-one')), false, 'an imported session is gone');

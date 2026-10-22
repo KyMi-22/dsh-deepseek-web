@@ -1,24 +1,34 @@
-// Token save serialization.
+// Credential persistence: serialization, and the commit boundary.
 //
-// `setToken` is read-modify-write on in-memory state, and a failed save rolls the
-// value back. With only per-write ordering, save A failing after save B succeeded
-// would restore A's snapshot over B's newer value: disk on B, memory on A's
-// predecessor, and the next launch disagreeing with the running client.
+// Two distinct hazards, both about the same thing — `state.token` is candidate
+// state during a save, while the file on disk holds the committed state:
+//
+//   1. Serialization. Two concurrent saves are read-modify-write on shared state.
+//      A failing save that restores its snapshot after a newer save already
+//      persisted would leave disk and memory disagreeing.
+//
+//   2. Commit boundary. A background write (a binding, a ledger row) queued during
+//      a save must never persist the candidate. Otherwise a rejected credential
+//      still lands on disk, and the next launch starts with a token the plugin
+//      explicitly refused.
+//
+// Writes are injected rather than provoked with filesystem errors: renaming against
+// an occupied path succeeds or fails depending on platform and the antivirus
+// indexer, which made this suite flaky with EPERM.
 //
 //   node test/token-serial.test.mjs
 
 import assert from 'node:assert';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
-import { StateStore, stateFile } from '../src/store.js';
+import { StateStore } from '../src/store.js';
 
-/** A store over a throwaway HOME. */
-function freshStore(home) {
-  return new StateStore({
-    token: '',
-    deviceId: 'device',
+const DISK_FULL = new Error('disk full');
+
+/** A store over an in-memory disk, with a controllable writer. */
+function makeStore(options = {}) {
+  const state = {
+    token: 'OLD',
+    deviceId: 'd',
     bindings: {},
     imported: {},
     workspaceId: null,
@@ -27,44 +37,117 @@ function freshStore(home) {
     lastSyncError: null,
     lastWorkspaceError: null,
     lastReport: null,
+  };
+  /** Every token value that reached the fake disk, in order. */
+  const written = [];
+  const store = new StateStore(state, {
+    persist: async (snapshot) => {
+      const failure = options.failWhen?.(snapshot, written.length);
+      if (failure !== undefined) throw failure;
+      written.push(snapshot.token);
+    },
   });
+  return { store, written };
 }
 
-const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsw-token-'));
-const previousHome = process.env.DSH_HOME;
-process.env.DSH_HOME = home;
-
-try {
-  const store = freshStore(home);
-  const target = stateFile();
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-
-  // Make the FIRST save fail: the rename target is occupied by a directory, so
-  // replacing it with the temp file cannot succeed.
-  fs.mkdirSync(target, { recursive: true });
+// ── 1. a failed save rolls back and a later save wins ─────────────────────
+{
+  const { store, written } = makeStore({
+    failWhen: (snapshot) => (snapshot.token === 'AAA' ? DISK_FULL : undefined),
+  });
 
   const first = store.setToken('AAA').then(
-    () => ({ ok: true }),
-    (error) => ({ ok: false, error }),
+    () => 'ok',
+    () => 'rejected',
   );
-  // Queued behind the first; it must not run until the first has settled.
   const second = store.setToken('BBB');
 
-  const firstResult = await first;
-  assert.equal(firstResult.ok, false, 'the first save failed against the blocked path');
-
-  // Clear the obstacle so the queued save can succeed.
-  fs.rmSync(target, { recursive: true, force: true });
+  assert.equal(await first, 'rejected', 'the first save failed');
   await second;
 
-  assert.equal(store.token, 'BBB', 'memory holds the value that actually reached the disk');
-  const onDisk = JSON.parse(fs.readFileSync(target, 'utf8'));
-  assert.equal(onDisk.token, 'BBB', 'and the disk agrees');
-  assert.equal(store.token, onDisk.token, 'memory and disk are consistent');
-} finally {
-  if (previousHome === undefined) delete process.env.DSH_HOME;
-  else process.env.DSH_HOME = previousHome;
-  fs.rmSync(home, { recursive: true, force: true });
+  assert.equal(store.token, 'BBB', 'memory holds the value that reached the disk');
+  assert.deepEqual(written, ['BBB'], 'only the accepted value was written');
+  assert.equal(written[written.length - 1], store.token, 'memory and disk agree');
+}
+
+// ── 2. a background write queued BEFORE the save cannot carry the candidate ─
+{
+  const { store, written } = makeStore({
+    failWhen: (snapshot) => (snapshot.token === 'CANDIDATE' ? DISK_FULL : undefined),
+  });
+
+  store.setBinding('s1', { chatSessionId: 'w1', seeded: true, origin: 'imported' });
+  const save = store.setToken('CANDIDATE').then(
+    () => 'ok',
+    () => 'rejected',
+  );
+
+  assert.equal(await save, 'rejected', 'the credential save was rejected');
+  await store.queue;
+
+  assert.equal(written.includes('CANDIDATE'), false, 'the rejected candidate never reached the disk');
+  assert.equal(store.token, 'OLD', 'memory was rolled back');
+  assert.equal(store.token, written[written.length - 1], 'memory and disk agree');
+}
+
+// ── 3. a background write queued DURING the save cannot carry the candidate ─
+{
+  const { store, written } = makeStore({
+    failWhen: (snapshot) => (snapshot.token === 'CANDIDATE' ? DISK_FULL : undefined),
+  });
+
+  const save = store.setToken('CANDIDATE').then(
+    () => 'ok',
+    () => 'rejected',
+  );
+  // The reported case: ordinary bookkeeping writes land mid-save.
+  store.setBinding('s2', { chatSessionId: 'w2', seeded: true, origin: 'imported' });
+  store.recordImported({ chatSessionId: 'w2', dshSessionId: 's2', updatedAt: 0, messageCount: 0 });
+
+  assert.equal(await save, 'rejected', 'the credential save was rejected');
+  await store.queue;
+
+  assert.equal(written.includes('CANDIDATE'), false, 'the candidate never reached the disk');
+  assert.equal(store.token, 'OLD', 'memory was rolled back');
+  assert.equal(store.token, written[written.length - 1], 'memory and disk agree');
+}
+
+// ── 4. a successful save commits, and later writes keep writing it ─────────
+{
+  const { store, written } = makeStore({});
+
+  await store.setToken('NEW');
+  assert.equal(store.token, 'NEW');
+  assert.equal(store.committedToken, 'NEW', 'the committed value advanced');
+
+  store.setBinding('s3', { chatSessionId: 'w3', seeded: true, origin: 'imported' });
+  await store.queue;
+  assert.equal(written[written.length - 1], 'NEW', 'background writes keep the accepted token');
+}
+
+// ── 5. a rejected save does not disturb a later accepted one ──────────────
+{
+  let attempts = 0;
+  const { store, written } = makeStore({
+    failWhen: () => {
+      attempts += 1;
+      return attempts === 1 ? DISK_FULL : undefined;
+    },
+  });
+
+  const rejected = store.setToken('FIRST').then(
+    () => 'ok',
+    () => 'rejected',
+  );
+  const accepted = store.setToken('SECOND');
+
+  assert.equal(await rejected, 'rejected');
+  await accepted;
+
+  assert.equal(store.token, 'SECOND');
+  assert.equal(store.committedToken, 'SECOND');
+  assert.equal(written[written.length - 1], 'SECOND');
+  assert.equal(written.includes('FIRST'), false, 'the rejected value never reached the disk');
 }
 
 console.log('token-serial.test.mjs: all assertions passed');
