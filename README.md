@@ -164,16 +164,28 @@ DSH 里打开 **设置 → DeepSeek 网页版**，把 token 粘进输入框，�
 | 导入的对话 + DSH 模型 | 定格，看不到后续 | 是 |
 | 任意会话 + 网页版模型 | 创建或写入对应对话 | 否 |
 
-## 常用操作
+## 按钮与操作说明
+
+设置页「DeepSeek 网页版」里的几个按钮：
+
+| 按钮 | 作用 |
+|---|---|
+| **保存并验证** | 先校验 token 是否有效，通过才写入磁盘。无效的 token 不会被保存 |
+| **检测当前凭证** | 用已保存的 token 查一次账号信息，确认它还没过期 |
+| **立即同步** | 手动拉取一次网页端对话，不用等后台定时 |
+| **撤销导入** | 归档分组下的会话、删掉导入的那些文件、删除工作区和导入记录（见下） |
+| **热重载并刷新** | 重新组合插件树并刷新页面，让新导入的会话立刻出现 |
+
+常见操作：
 
 | 想做什么 | 怎么做 |
 |---|---|
-| 马上拉取新对话 | 设置页点「立即同步」 |
+| 马上拉取新对话 | 点「立即同步」 |
 | 同步了但侧边栏没变化 | 点「热重载并刷新」 |
-| 清空导入的对话 | 设置页点「撤销导入」 |
-| 调整同步范围 | 设置里的 `syncWindow`（默认只同步本周） |
+| 清空导入的对话 | 点「撤销导入」 |
+| 调整同步范围 | 插件配置里的 `syncWindow`（默认只同步本周） |
 
-**关于撤销**：撤销会把「对话」分组下的会话归档、删掉插件导入的那些，然后删除分组。你在 DSH 里自己新建、用网页版模型聊过的对话**只会被归档，文件保留**，不会丢。
+**关于撤销**：会把「对话」分组下的会话**归档**，删掉插件导入的那些文件，然后删除分组。你在 DSH 里自己新建、用网页版模型聊过的对话**只归档、文件保留**，不会丢。
 
 ## 可选设置
 
@@ -186,11 +198,86 @@ DSH 里打开 **设置 → DeepSeek 网页版**，把 token 粘进输入框，�
 | `autoSync` | `true` | 关掉后台自动同步 |
 | `baseUrl` | `https://chat.deepseek.com` | 站点地址 |
 
-不想让 token 落盘的话，用环境变量启动 DSH：
+## 安全
+
+**token 存在哪**：`$DSH_HOME/deepseek-web/state.json`。目录权限 `0700`、文件 `0600`（POSIX），设置页只显示末四位，不回显完整值。
+
+不想让它落盘，用环境变量启动 DSH：
 
 ```powershell
 $env:DEEPSEEK_WEB_TOKEN = '<token>'
 ```
+
+环境变量优先级最高，这时 `state.json` 里的旧值会被忽略。
+
+**实际风险**，按可能性排序：
+
+1. **云同步**——`~/.dsh` 如果落在 OneDrive / Dropbox / iCloud 的同步目录里，token 会跟着上云。**这是唯一值得主动检查的一条。**
+2. 同机其他用户——靠文件权限隔离。
+3. 本机恶意软件——任何本地凭证都挡不住，DPAPI 也一样。
+
+保护级别与浏览器保存的登录 cookie 相当。
+
+**数据发到哪**：只发往 `chat.deepseek.com`，也就是你本来就在用的那个网站。不向任何第三方发送。
+
+**网页版会话不会写你的本地文件**：网页接口没有工具调用通道，适配器只输出文本；另有一道白名单拦截兜底，只放行只读工具。
+
+**为什么不用 DSH 的登录态**：DSH 登录的是 API 平台（`platform.deepseek.com`），和网页版（`chat.deepseek.com`）是两套独立的凭证体系——同一个账号不代表同一个 token。想拿网页版 token 只能从浏览器存储里取。详见 [DESIGN.md](docs/DESIGN.md#token)。
+
+## 目录结构
+
+**插件本身**：
+
+```
+index.js           Host 入口：provider 注册、同步引擎、设置页路由、工具拦截
+client.js          设置页
+src/api.js         网页端接口客户端：分页、历史、SSE、错误分类
+src/adapter.js     provider 适配：messages → prompt，SSE → StreamChunk
+src/sync.js        网页对话 → 种子会话；工作区；撤销
+src/store.js       插件状态（token、会话绑定、导入账本）
+src/pow.js         DeepSeekHashV1 求解器
+src/pow-async.js   求解放到 worker 线程，带进程内回退
+src/pow-worker.js  worker 入口
+src/http.js        设置页路由的 JSON / 请求体工具
+src/tool-guard.js  网页版会话的工具白名单
+```
+
+**安装后在本地产出的文件**：
+
+```
+$DSH_HOME/
+├─ deepseek-web/
+│  ├─ state.json          token、会话绑定、导入账本
+│  └─ conversations/      导入会话的 cwd（空目录，是「对话」工作区的锚点）
+└─ sessions/
+   └─ --<cwd-slug>--/     按会话的工作目录分桶
+      └─ <session-id>/
+         └─ session.v4.jsonl.zstd   会话日志（消息、标题、usage）
+```
+
+两个容易疑惑的点：
+
+- **`conversations/` 本身是空的**。DSH 按会话的 `cwd` 把会话分桶存储，真正的对话数据在 `sessions/` 下对应 slug 的目录里。`conversations` 只是那个 `cwd` 的物理锚点——工作区必须指向一个真实存在的目录。
+- **导入的对话拿到新 UUID**，不是网页端的 id，所以两边身份独立。
+
+详见 [DESIGN.md](docs/DESIGN.md#模块)。
+
+## 实现原理
+
+两个方向是分开的：
+
+**导入**：拉网页对话的历史 → 转成 DSH 的标准种子事件（`turn/start`、`step/start`、`user/message`、`request/header`、`session/title`、`assistant/message`…）→ 用 `agentLoop.createAgent` 落成一条**普通会话**，`cwd` 指向 `conversations`。
+
+**续聊**：选「DeepSeek 网页版」模型 → 适配器只把**最新一句用户消息**发给绑定的网页对话（靠 `parent_message_id` 接上历史），把 SSE 增量翻译成 `StreamChunk` 回传。
+
+几个值得知道的点：
+
+- 每轮**只发一句话**：不带 system prompt、不带历史轮次、不带 DSH 注入的记账消息（靠 `source.kind` 过滤）
+- 发消息要过 **PoW 挑战**，求解器是网页端 `DeepSeekHashV1` 的移植（跑在 worker 线程，避免卡住 Host）
+- **标题生成、历史压缩**这两类辅助调用在本地作答，不碰网页端
+- 发消息前会检查父消息是否过期（超过 60 秒就重读网页历史），避免从旧分支续接
+
+完整的协议细节、种子事件格式、撤销为什么必须先归档、凭据提交边界、重试标记、SSE 解析，都在 **[docs/DESIGN.md](docs/DESIGN.md)**。
 
 ## 常见问题
 
@@ -209,10 +296,6 @@ token 会过期。重新执行上面「拿 token」的三步，用新的替换�
 **Q：会话里的模型为什么不会调用工具？**
 
 DeepSeek 网页版的接口只收一段文本，没有函数调用通道。这是接口本身的限制。需要工具时，在 DSH 里新建一个会话，选官方 API 的模型即可。
-
-**Q：我的对话内容会被发到哪里？**
-
-只发往 `chat.deepseek.com`，就是你本来就在用的那个网站。插件不向任何第三方发送数据。
 
 ## 限制
 
@@ -247,8 +330,6 @@ DeepSeek 网页版的接口只收一段文本，没有函数调用通道。这�
 npm test        # 12 套离线测试
 npm run check   # 语法检查
 ```
-
-技术细节（数据流、种子事件格式、撤销为什么先归档、同步节奏为什么随机）见 **[docs/DESIGN.md](docs/DESIGN.md)**。
 
 ## 许可
 
