@@ -130,6 +130,7 @@ window.__ModuleLoader__.load({
         'error.invalidToken': '验证失败：{message}',
         'error.sync': '同步请求失败：{message}',
         'error.syncReport': '同步失败：{message}',
+        'error.persist': '状态写入失败：{message}',
         'error.undo': '撤销失败：{message}',
         'error.verify': '验证请求失败：{message}',
         'error.verifyBad': '凭证无效：{message}',
@@ -205,6 +206,7 @@ window.__ModuleLoader__.load({
         'error.invalidToken': 'Verification failed: {message}',
         'error.sync': 'Sync request failed: {message}',
         'error.syncReport': 'Sync failed: {message}',
+        'error.persist': 'Could not write state: {message}',
         'error.undo': 'Undo failed: {message}',
         'error.verify': 'Check request failed: {message}',
         'error.verifyBad': 'Token is not valid: {message}',
@@ -686,6 +688,10 @@ window.__ModuleLoader__.load({
           status.lastSyncError
             ? h('div', { key: 'syncerr', style: { ...styles.notice, ...styles.bad } },
                 t('error.syncItem', { message: status.lastSyncError }))
+            : null,
+          status.lastWriteError
+            ? h('div', { key: 'writeerr', style: { ...styles.notice, ...styles.bad } },
+                t('error.persist', { message: status.lastWriteError }))
             : null,
         ]),
 

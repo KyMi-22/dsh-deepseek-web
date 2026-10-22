@@ -255,15 +255,37 @@ export class StateStore {
    * instead, where the settings page can surface it.
    */
   flushSoon() {
-    this.flush().catch((error) => {
-      this.lastWriteError = error instanceof Error ? error.message : String(error);
-    });
+    this.flush()
+      .then(() => {
+        // A later success means the disk is reachable again; a stale error would
+        // keep telling the user their state is not being saved.
+        this.lastWriteError = null;
+      })
+      .catch((error) => {
+        this.lastWriteError = error instanceof Error ? error.message : String(error);
+      });
   }
 
-  /** Replace the credential. Rejects when the new value could not be persisted. */
+  /**
+   * Replace the credential.
+   *
+   * The in-memory value is rolled back when persistence fails: leaving the
+   * candidate token resident would let a later, successful flush write it out, so
+   * the running client and the next launch would disagree about which credential
+   * is configured.
+   *
+   * @param {string} token
+   * @returns {Promise<void>} rejects when the new value could not be persisted.
+   */
   async setToken(token) {
+    const previous = this.state.token;
     this.state.token = token;
-    await this.flush();
+    try {
+      await this.flush();
+    } catch (error) {
+      this.state.token = previous;
+      throw error;
+    }
   }
 
   /** @param {string} sessionId */

@@ -282,7 +282,13 @@ export async function apply(ctx, config = {}) {
       promptedMessages.get(sessionId)?.delete(messageId);
     },
     onExchange: (sessionId, chatSessionId, userText, assistantText, reasoning) => {
-      void persistExchange(sessionId, chatSessionId, userText, assistantText, reasoning);
+      // Must not be a bare `void`: persistExchange awaits store.flush(), which now
+      // rejects when disk persistence fails. Dropping that rejection produces an
+      // unhandled-rejection that terminates a plain Node process, and the adapter
+      // only wraps the synchronous call so it cannot catch it either.
+      persistExchange(sessionId, chatSessionId, userText, assistantText, reasoning).catch((error) => {
+        warn(`deepseek-web: could not record the exchange: ${String(error)}`);
+      });
     },
     warn,
   });
@@ -346,10 +352,28 @@ export async function apply(ctx, config = {}) {
    * already in flight rather than starting another.
    */
   let syncInFlight = null;
-  /** Set while an undo runs, so a background pass cannot start mid-teardown. */
-  let undoInFlight = false;
+  /**
+   * Undos waiting or running. A boolean was not enough: two overlapping undos both
+   * cleared it, so the first to finish reopened synchronization while the second
+   * was still tearing down — and a pass could then rebuild the ledger the second
+   * undo was clearing.
+   */
+  let pendingUndos = 0;
+  /** Serializes undos so their teardown steps never interleave. */
+  let undoQueue = Promise.resolve();
+  function enqueueUndo(task) {
+    pendingUndos += 1;
+    const run = undoQueue.then(task, task).finally(() => {
+      pendingUndos -= 1;
+    });
+    undoQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
   function syncNow(options = {}) {
-    if (undoInFlight) {
+    if (pendingUndos > 0) {
       // An undo is tearing the import down; starting a pass now would recreate
       // the ledger it is clearing and clear the pause it just set.
       return Promise.resolve({ skipped: 'undo-in-progress' });
@@ -505,6 +529,8 @@ export async function apply(ctx, config = {}) {
             chatSessionId: summary.id,
             parentMessageId: lastMessageId(history.messages),
             seeded: true,
+            // Provenance: this one was pulled FROM the web, so undo may delete it.
+            origin: 'imported',
           });
           webSessions.add(dshSessionId);
           report.imported++;
@@ -691,6 +717,10 @@ export async function apply(ctx, config = {}) {
                 hasToken: api.ready,
                 tokenTail: api.ready ? maskToken(api.token) : '',
                 tokenSource,
+                // Background bookkeeping writes (bindings, ledger rows) are
+                // best-effort; surfacing the last failure is the only way the user
+                // learns that state stopped reaching the disk.
+                lastWriteError: store.lastWriteError,
                 imported: Object.keys(store.state.imported).length,
                 lastSyncAt: store.state.lastSyncAt,
                 autoSyncSeconds: autoSyncEnabled ? intervalSeconds : 0,
@@ -786,7 +816,7 @@ export async function apply(ctx, config = {}) {
               // Serialized against sync: an import pass still in flight would
               // otherwise recreate the ledger and clear the pause right after the
               // undo finished. Waiting is enough because `syncNow` also refuses to
-              // start while `undoInFlight` is set.
+              // start while `pendingUndos` is above zero.
               if (syncInFlight !== null) {
                 try {
                   await syncInFlight;
@@ -794,10 +824,10 @@ export async function apply(ctx, config = {}) {
                   /* a failed pass has nothing to protect */
                 }
               }
-              undoInFlight = true;
-              let undo;
-              try {
-                undo = await undoImports({
+              // Undos are serialized too: two overlapping teardowns interleave
+              // their archive/delete steps and each clears the other's ledger.
+              const undo = await enqueueUndo(() =>
+                undoImports({
                   imported: store.state.imported,
                   workspaceId: store.state.workspaceId,
                   directory,
@@ -805,10 +835,8 @@ export async function apply(ctx, config = {}) {
                   query: ctx.get('sessionQuery'),
                   bindings: store.state.bindings,
                   warn,
-                });
-              } finally {
-                undoInFlight = false;
-              }
+                }),
+              );
               // Only forget what actually went away. Clearing the whole ledger on a
               // partial failure would discard exactly the rows a retry needs.
               const stuck = new Set(undo.failedSessionIds ?? []);

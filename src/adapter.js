@@ -443,7 +443,17 @@ export class DeepSeekWebAdapter {
     if (binding === undefined) {
       try {
         const created = await this.deps.api.createSession();
-        binding = { chatSessionId: created.id, parentMessageId: null, seeded: false, parentSyncedAt: Date.now() };
+        binding = {
+          chatSessionId: created.id,
+          parentMessageId: null,
+          seeded: false,
+          // Immutable provenance. `seeded` flips to true after the first completed
+          // reply, so it records "has conversed here", not "where this came from".
+          // Undo needs the latter: a conversation the user started in DSH must
+          // keep its log, and that fact cannot change just because it was used.
+          origin: 'local',
+          parentSyncedAt: Date.now(),
+        };
         if (sessionId !== undefined) this.deps.bindSession(sessionId, binding);
       } catch (error) {
         // Nothing reached the model: there is no conversation yet, so a retry of
@@ -513,6 +523,14 @@ export class DeepSeekWebAdapter {
         if (event.kind === 'done') break;
       }
     } catch (error) {
+      // A failure before the completion POST reached the server (no challenge,
+      // unsolved PoW, connection refused, request timeout) leaves nothing to
+      // duplicate, so this message may be retried. Once it is submitted the answer
+      // is unknown and a retry could make the model reply twice, so the marker is
+      // kept in that case.
+      if (error?.submitted === false) {
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+      }
       yield finishError(error);
       return;
     }

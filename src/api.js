@@ -87,7 +87,7 @@ export class DeepSeekWebError extends Error {
   /**
    * @param {string} message - human-readable failure.
    * @param {string} code - stable machine code.
-   * @param {{ status?: number, bizCode?: number, cause?: unknown }} [meta]
+   * @param {{ status?: number, bizCode?: number, cause?: unknown, submitted?: boolean }} [meta]
    */
   constructor(message, code, meta = {}) {
     super(message, meta.cause === undefined ? undefined : { cause: meta.cause });
@@ -95,6 +95,17 @@ export class DeepSeekWebError extends Error {
     this.code = code;
     this.status = meta.status;
     this.bizCode = meta.bizCode;
+    /**
+     * Whether the completion request had been sent when this failed.
+     *
+     * Failures before the POST (no challenge, unsolved PoW, connection refused)
+     * can be retried safely: the model never saw anything. Failures after it may
+     * still produce a reply server-side, so a retry risks two answers to the same
+     * message. The adapter uses this to decide whether to release its dedup memo.
+     *
+     * @type {boolean | undefined}
+     */
+    this.submitted = meta.submitted;
   }
 }
 
@@ -344,10 +355,21 @@ export class DeepSeekWebApi {
    */
   async *streamCompletion(request) {
     if (!this.ready) {
-      throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL');
+      throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL', { submitted: false });
     }
     const { chatSessionId, prompt, parentMessageId = null, thinking = false, search = false, signal } = request;
-    const powHeader = await this.solveChallenge(COMPLETION_PATH, { signal });
+
+    // Everything up to the POST can fail without the model ever seeing the prompt.
+    // Every error raised there is marked `submitted: false` so the adapter knows a
+    // retry is safe; past the POST the answer is unknown and a retry could produce
+    // two replies to one message.
+    let powHeader;
+    try {
+      powHeader = await this.solveChallenge(COMPLETION_PATH, { signal });
+    } catch (error) {
+      if (error instanceof DeepSeekWebError) error.submitted = false;
+      throw error;
+    }
 
     const body = {
       chat_session_id: chatSessionId,
@@ -362,31 +384,42 @@ export class DeepSeekWebApi {
       preempt: false,
     };
 
-    const response = await this.fetchImpl(`${this.baseUrl}${COMPLETION_PATH}`, {
-      method: 'POST',
-      headers: this.headers({
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-        'X-DS-PoW-Response': powHeader,
-      }),
-      body: JSON.stringify(body),
-      // A generation may legitimately run for a minute; the idle guard below is
-      // what catches a stream that stops producing without closing.
-      signal,
-    });
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${COMPLETION_PATH}`, {
+        method: 'POST',
+        headers: this.headers({
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          'X-DS-PoW-Response': powHeader,
+        }),
+        body: JSON.stringify(body),
+        // A generation may legitimately run for a minute; the idle guard below is
+        // what catches a stream that stops producing without closing.
+        signal,
+      });
+    } catch (error) {
+      // The request never completed a round trip: safe to retry.
+      if (error instanceof DeepSeekWebError) error.submitted = false;
+      else if (error !== null && typeof error === 'object') error.submitted = false;
+      throw error;
+    }
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
       let code = 'TRANSPORT';
       if (text.includes('MISSING_HEADER')) code = 'POW_REQUIRED';
       else if (response.status === 401 || response.status === 403) code = 'UNAUTHORIZED';
+      // The server answered, so it may already have started a generation.
       throw new DeepSeekWebError(
         `deepseek-web: completion failed (HTTP ${response.status}) ${text.slice(0, 200)}`,
         code,
-        { status: response.status },
+        { status: response.status, submitted: true },
       );
     }
-    if (response.body === null) throw new DeepSeekWebError('deepseek-web: completion returned no body', 'EMPTY_RESPONSE');
+    if (response.body === null) {
+      throw new DeepSeekWebError('deepseek-web: completion returned no body', 'EMPTY_RESPONSE', { submitted: true });
+    }
 
     let currentPath = '';
     /**

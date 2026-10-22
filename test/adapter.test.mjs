@@ -43,6 +43,12 @@ function fakeApi(events, options = {}) {
         chatSessionId: request.chatSessionId,
         parentMessageId: request.parentMessageId,
       });
+      if (options.completionError !== undefined) {
+        const failure = options.completionError;
+        // Throw once so a retry can succeed.
+        options.completionError = undefined;
+        throw new DeepSeekWebError(failure.message, failure.code, { submitted: failure.submitted });
+      }
       yield { kind: 'message', messageId: 2, parentId: 1 };
       for (const event of events) yield event;
       yield { kind: 'tokens', total: 42 };
@@ -275,6 +281,99 @@ assert.equal(
   const last = second[second.length - 1];
   assert.equal(last.type, 'finish');
   assert.notEqual(last.reason.kind, 'error', 'the retry is not swallowed');
+}
+
+// ── a pre-submit failure (unsolved PoW) also allows a retry ────────────────
+{
+  // The challenge/PoW step runs before the completion POST, so a failure there
+  // also means the model never saw the prompt. Only `createSession` failures used
+  // to release the dedup memo, which left this path swallowed forever.
+  const api = fakeApi([ANSWER('ok')], {
+    completionError: { message: 'pow unsolved', code: 'POW_UNSOLVED', submitted: false },
+  });
+  const bindings = new Map();
+  const sent = new Map();
+  const adapter = new DeepSeekWebAdapter({
+    api,
+    resolveBinding: (id) => bindings.get(id),
+    bindSession: (id, binding) => bindings.set(id, binding),
+    updateBinding: (id, patch) => bindings.set(id, { ...bindings.get(id), ...patch }),
+    noteSent: (sessionId, messageId) => {
+      let seen = sent.get(sessionId);
+      if (seen === undefined) {
+        seen = new Set();
+        sent.set(sessionId, seen);
+      }
+      if (seen.has(messageId)) return false;
+      seen.add(messageId);
+      return true;
+    },
+    forgetSent: (sessionId, messageId) => sent.get(sessionId)?.delete(messageId),
+    warn: () => {},
+  });
+  const options = {
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m7', '再试一次')],
+    sessionId: 'sess-pow',
+  };
+
+  const first = [];
+  for await (const chunk of adapter.stream(options)) first.push(chunk);
+  assert.equal(first[first.length - 1].reason.kind, 'error', 'the first attempt reports the PoW failure');
+  assert.equal(sent.get('sess-pow')?.has('m7') ?? false, false, 'a pre-submit failure releases the dedup memo');
+
+  const second = [];
+  for await (const chunk of adapter.stream(options)) second.push(chunk);
+  assert.equal(api.calls.completions.length, 2, 'the retry reached the completion request again');
+  assert.notEqual(second[second.length - 1].reason.kind, 'error', 'the retry succeeds');
+}
+
+// ── a submitted failure keeps the memo (no double reply) ───────────────────
+{
+  // Once the POST is out the model may already be generating. Releasing the memo
+  // here would let the loop ask twice for the same user message.
+  const api = fakeApi([ANSWER('ok')], {
+    completionError: { message: 'stream broke', code: 'TRANSPORT', submitted: true },
+  });
+  const sent = new Map();
+  const adapter = new DeepSeekWebAdapter({
+    api,
+    resolveBinding: () => undefined,
+    bindSession: () => {},
+    updateBinding: () => {},
+    noteSent: (sessionId, messageId) => {
+      let seen = sent.get(sessionId);
+      if (seen === undefined) {
+        seen = new Set();
+        sent.set(sessionId, seen);
+      }
+      if (seen.has(messageId)) return false;
+      seen.add(messageId);
+      return true;
+    },
+    forgetSent: (sessionId, messageId) => sent.get(sessionId)?.delete(messageId),
+    warn: () => {},
+  });
+  const options = {
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m8', '不要重复')],
+    sessionId: 'sess-submitted',
+  };
+
+  for await (const _chunk of adapter.stream(options)) {
+    /* drain */
+  }
+  assert.equal(sent.get('sess-submitted')?.has('m8') ?? false, true, 'a submitted failure keeps the memo');
+
+  // The loop's retry is therefore answered with an empty stop instead of a second
+  // generation.
+  const retry = [];
+  for await (const chunk of adapter.stream(options)) retry.push(chunk);
+  assert.equal(retry.length, 1, 'the repeat is a single empty stop');
+  assert.equal(retry[0].reason.kind, 'stop');
+  assert.equal(api.calls.completions.length, 1, 'no second completion was posted');
 }
 
 // ── a stale parent message is refreshed before continuing ─────────────────

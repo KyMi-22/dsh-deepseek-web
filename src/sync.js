@@ -491,22 +491,27 @@ export async function createSeededSession(options) {
 }
 
 /**
- * Whether a session was started inside DSH rather than imported from the web.
+ * Where a bound session came from.
  *
- * The adapter records `seeded: false` when it created a web conversation for a
- * brand-new DSH session; an import records `seeded: true` because it replayed
- * existing web messages. A session with no binding at all is treated as imported
- * (deleting it matches the ledger), so an old install that predates this field
- * errs toward the documented cleanup rather than silently keeping managed files.
+ * `origin` is written once and never changed. `seeded` cannot answer this: the
+ * adapter flips it to `true` after the first completed reply, so a conversation
+ * started in DSH and then used becomes indistinguishable from an import.
+ *
+ * Bindings written before `origin` existed carry no provenance. They are treated
+ * as undeletable: deleting a conversation the user wrote is irreversible, while
+ * leaving a file behind is merely untidy and can be cleaned up by hand.
  *
  * @param {string} sessionId
- * @param {Record<string, { seeded?: boolean }> | undefined} bindings
- * @returns {boolean}
+ * @param {Record<string, { origin?: string }> | undefined} bindings
+ * @returns {'imported' | 'local' | 'unknown'}
  */
-function isLocallyStarted(sessionId, bindings) {
-  if (bindings === undefined || bindings === null) return false;
+function originOf(sessionId, bindings) {
+  if (bindings === undefined || bindings === null) return 'unknown';
   const binding = bindings[sessionId];
-  return binding !== undefined && binding.seeded === false;
+  if (binding === undefined) return 'unknown';
+  if (binding.origin === 'imported') return 'imported';
+  if (binding.origin === 'local') return 'local';
+  return 'unknown';
 }
 
 /**
@@ -546,7 +551,8 @@ function isLocallyStarted(sessionId, bindings) {
  * }} options
  * @returns {Promise<{
  *   archivedSessions: number, archiveFailed: number, archivedLocal: number,
- *   keptLocal: number, removedSessions: number, failedSessions: number,
+ *   keptLocal: number, keptUnknown: number, keptArchiveFailed: number,
+ *   removedSessions: number, failedSessions: number, failedSessionIds: string[],
  *   workspaceDeleted: boolean, workspaceError: string | null,
  * }>}
  */
@@ -557,6 +563,10 @@ export async function undoImports(options) {
     archiveFailed: 0,
     archivedLocal: 0,
     keptLocal: 0,
+    /** Ledger entries whose provenance predates `origin`; logs deliberately kept. */
+    keptUnknown: 0,
+    /** Ledger entries whose log survived because archiving failed. */
+    keptArchiveFailed: 0,
     removedSessions: 0,
     failedSessions: 0,
     /** Ledger session ids that could not be archived or deleted. */
@@ -599,8 +609,12 @@ export async function undoImports(options) {
   // 1. Archive while the logs still exist.
   if (registry?.archiveSession === undefined) {
     report.archiveFailed = allSessionIds.size;
+    // Nothing can be stopped, so nothing may be deleted: the log is the only
+    // remaining copy of a conversation the user wrote, and an unarchived session
+    // might still be live. Report it instead of quietly destroying data.
+    for (const sessionId of allSessionIds) failedIds.add(sessionId);
     if (allSessionIds.size > 0) {
-      warn('deepseek-web: no workspaceRegistry.archiveSession; undo can only delete files, so the sessions will show as ungrouped');
+      warn('deepseek-web: no workspaceRegistry.archiveSession; undo can only report, so the sessions and their logs are kept');
     }
   } else {
     for (const sessionId of allSessionIds) {
@@ -608,8 +622,8 @@ export async function undoImports(options) {
         await registry.archiveSession(sessionId, { stopActivity: true });
         report.archivedSessions += 1;
         // "Local" here means "not something this plugin imported": either it was
-        // never in the ledger, or the binding says it was started in DSH.
-        if (!ledgerSet.has(sessionId) || isLocallyStarted(sessionId, bindings)) report.archivedLocal += 1;
+        // never in the ledger, or its provenance says it started in DSH.
+        if (!ledgerSet.has(sessionId) || originOf(sessionId, bindings) !== 'imported') report.archivedLocal += 1;
       } catch (error) {
         report.archiveFailed += 1;
         if (ledgerSet.has(sessionId)) failedIds.add(sessionId);
@@ -620,16 +634,23 @@ export async function undoImports(options) {
 
   // 2. Then drop the files of the sessions this plugin IMPORTED.
   //
-  // The ledger alone cannot answer "did this session come from the web?" — an
-  // earlier version also wrote locally started conversations into it as a
-  // deduplication measure, so every one of them looked like an import and had its
-  // log deleted on undo. The binding records the real origin: `seeded: false`
-  // means the adapter created the web conversation for a session that started
-  // here. Those are the user's own conversations, so they are archived (step 1
-  // already did that) and their logs are kept.
+  // Three reasons a ledger entry keeps its log:
+  //
+  //   - its provenance says the conversation started here;
+  //   - provenance is unknown (written before `origin` existed) — deleting what
+  //     the user wrote cannot be undone, while a leftover file can;
+  //   - archiving failed, which means the session may still be live. Removing the
+  //     file would pull it out from under a running session and destroy the only
+  //     copy an archive retry would need.
   for (const sessionId of ledgerSessionIds) {
-    if (isLocallyStarted(sessionId, bindings)) {
+    const origin = originOf(sessionId, bindings);
+    if (origin !== 'imported') {
       report.keptLocal += 1;
+      if (origin === 'unknown') report.keptUnknown += 1;
+      continue;
+    }
+    if (failedIds.has(sessionId)) {
+      report.keptArchiveFailed += 1;
       continue;
     }
     try {

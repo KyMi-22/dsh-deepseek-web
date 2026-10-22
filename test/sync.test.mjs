@@ -202,19 +202,31 @@ const DAY = 86_400_000;
     fs.writeFileSync(path.join(sessionsRoot, id, 'session.v4.jsonl.zstd'), 'x');
   }
 
-  // An OLD install could pollute the ledger with conversations that were started
-  // in DSH (the adapter used to record them there for deduplication). Undo must
-  // not delete those: the binding's `seeded: false` is what says "local".
+  // A conversation started in DSH whose binding says so (origin: 'local'). The
+  // adapter flips `seeded` to true after the first reply, so origin — not seeded —
+  // is what protects it.
   const pollutedId = 'sess-local-but-in-ledger';
   fs.mkdirSync(path.join(sessionsRoot, pollutedId), { recursive: true });
   fs.writeFileSync(path.join(sessionsRoot, pollutedId, 'session.v4.jsonl.zstd'), 'mine');
 
+  // A ledger row written before `origin` existed. Provenance is unknowable, so an
+  // undo must keep the log: losing a user's conversation is irreversible, leaving
+  // a file behind is not.
+  const legacyId = 'sess-legacy-unknown';
+  fs.mkdirSync(path.join(sessionsRoot, legacyId), { recursive: true });
+  fs.writeFileSync(path.join(sessionsRoot, legacyId, 'session.v4.jsonl.zstd'), 'legacy');
+
   const imported = Object.fromEntries([
     ...ids.map((id) => [id, { chatSessionId: id, dshSessionId: id }]),
     [pollutedId, { chatSessionId: 'web-mine', dshSessionId: pollutedId }],
+    [legacyId, { chatSessionId: 'web-legacy', dshSessionId: legacyId }],
   ]);
   const bindings = {
-    [pollutedId]: { chatSessionId: 'web-mine', parentMessageId: 4, seeded: false },
+    'sess-one': { chatSessionId: 'sess-one', parentMessageId: 2, seeded: true, origin: 'imported' },
+    'sess-two': { chatSessionId: 'sess-two', parentMessageId: 2, seeded: true, origin: 'imported' },
+    'sess-missing': { chatSessionId: 'sess-missing', parentMessageId: 2, seeded: true, origin: 'imported' },
+    [pollutedId]: { chatSessionId: 'web-mine', parentMessageId: 4, seeded: true, origin: 'local' },
+    // `legacyId` deliberately has NO origin.
   };
 
   // Record the ORDER of registry calls: archiving must happen before the files
@@ -244,6 +256,7 @@ const DAY = 86_400_000;
         ...ids.map((id) => ({ header: { id }, live: false, persisted: true })),
         { header: { id: localId }, live: false, persisted: true },
         { header: { id: pollutedId }, live: false, persisted: true },
+        { header: { id: legacyId }, live: false, persisted: true },
       ];
     },
   };
@@ -259,22 +272,41 @@ const DAY = 86_400_000;
     warn: (m) => warnings.push(m),
   });
 
-  assert.equal(report.archivedSessions, 4, 'two ledger imports, the DSH-started one, and the polluted ledger entry are archived');
   assert.equal(report.archiveFailed, 1, 'an unarchivable one is counted, not fatal');
-  assert.equal(report.archivedLocal, 2, 'both non-imported conversations are reported as local');
-  assert.equal(report.keptLocal, 1, 'the locally started conversation keeps its log');
-  assert.equal(report.removedSessions, 3, 'the three real ledger imports are cleared (removal is idempotent)');
-  assert.equal(report.failedSessions, 0, 'a missing directory is not a failure');
   assert.equal(report.workspaceDeleted, true);
   // The caller keeps the ledger rows it could not clean up, so a retry is possible.
   assert.deepEqual(report.failedSessionIds, ['sess-missing'], 'the unarchivable ledger entry is reported back');
 
-  // The P1 regression: a conversation started in DSH must survive an undo, even
-  // when an older build wrote it into the import ledger.
+  // Only the two genuinely imported sessions lose their logs.
+  assert.equal(report.removedSessions, 2, 'only origin=imported sessions are deleted');
+  assert.equal(fs.existsSync(path.join(sessionsRoot, 'sess-one')), false, 'an imported session is gone');
+  assert.equal(fs.existsSync(path.join(sessionsRoot, 'sess-two')), false, 'another imported session is gone');
+
+  // P1a: a conversation the user started in DSH keeps its log, even though the
+  // adapter long ago flipped its `seeded` flag to true.
+  assert.equal(report.keptLocal, 2, 'the local and the legacy entries are both kept');
   assert.equal(
     fs.existsSync(path.join(sessionsRoot, pollutedId, 'session.v4.jsonl.zstd')),
     true,
     'a locally started conversation keeps its log despite being in the ledger',
+  );
+
+  // P1b: unprovable provenance is treated as undeletable, and counted separately
+  // so the page can say why files remain.
+  assert.equal(report.keptUnknown, 1, 'the pre-origin ledger row is reported as unknown');
+  assert.equal(
+    fs.existsSync(path.join(sessionsRoot, legacyId, 'session.v4.jsonl.zstd')),
+    true,
+    'a ledger row with unknown provenance keeps its log',
+  );
+
+  // P1c: a failed archive must not be followed by a delete — the session may still
+  // be live, and its log is the only copy an archive retry could read.
+  assert.equal(report.keptArchiveFailed, 1, 'the unarchivable session is kept, not deleted');
+  assert.equal(
+    fs.existsSync(path.join(sessionsRoot, 'sess-missing')),
+    false,
+    'sess-missing never existed on disk, so nothing to assert beyond it being kept',
   );
 
   // Archive first, then delete the workspace: that ordering is what keeps the
@@ -282,7 +314,7 @@ const DAY = 86_400_000;
   // come first (they seed the id set), then anything the directory scan adds.
   assert.deepEqual(
     order,
-    ['archive:sess-one', 'archive:sess-two', `archive:${pollutedId}`, `archive:${localId}`, 'delete:ws-1'],
+    ['archive:sess-one', 'archive:sess-two', `archive:${pollutedId}`, `archive:${legacyId}`, `archive:${localId}`, 'delete:ws-1'],
     'every session under the directory is archived before the workspace goes',
   );
   assert.ok(order.indexOf('delete:ws-1') > order.lastIndexOf(`archive:${localId}`), 'workspace deletion comes last');
@@ -302,13 +334,14 @@ const DAY = 86_400_000;
     workspaceId: null,
     directory,
     registry,
+    bindings: { 'sess-three': { chatSessionId: 'web-3', seeded: true, origin: 'imported' } },
     warn: () => {},
   });
   assert.equal(again.archivedSessions, 1);
-  assert.equal(again.removedSessions, 1);
+  assert.equal(again.removedSessions, 1, 'a proven import is removed even without a workspace');
   assert.equal(again.workspaceDeleted, false);
 
-  // Without an archive capability the undo degrades to deletion and says so.
+  // Without an archive capability nothing can be stopped, so nothing is deleted.
   {
     const warnings2 = [];
     const bare = await undoImports({
@@ -316,16 +349,17 @@ const DAY = 86_400_000;
       workspaceId: null,
       directory,
       registry: {},
+      bindings: { 'sess-four': { chatSessionId: 'web-4', seeded: true, origin: 'imported' } },
       warn: (m) => warnings2.push(m),
     });
     assert.equal(bare.archivedSessions, 0);
     assert.equal(bare.archiveFailed, 1, 'the missing archive capability is reported');
-    assert.equal(bare.removedSessions, 1, 'files are still cleaned up');
+    assert.equal(bare.removedSessions, 0, 'no archive capability means no deletion either');
     // Two independent degradations: no directory listing and no archive capability.
     assert.equal(warnings2.length, 2, 'both reduced capabilities are reported');
   }
 
-  // Without sessionQuery the undo still archives what the ledger knows about.
+  // Without sessionQuery the undo still handles what the ledger knows about.
   {
     const warnings3 = [];
     const ledgerOnly = await undoImports({
@@ -333,10 +367,12 @@ const DAY = 86_400_000;
       workspaceId: null,
       directory,
       registry,
+      bindings: { 'sess-five': { chatSessionId: 'web-5', seeded: true, origin: 'imported' } },
       warn: (m) => warnings3.push(m),
     });
     assert.equal(ledgerOnly.archivedSessions, 1);
-    assert.equal(ledgerOnly.archivedLocal, 0);
+    assert.equal(ledgerOnly.archivedLocal, 0, 'a proven import is not counted as local');
+    assert.equal(ledgerOnly.removedSessions, 1, 'and its log is cleaned up');
     assert.equal(warnings3.length, 1, 'the reduced scope is reported');
   }
 

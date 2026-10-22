@@ -45,8 +45,12 @@ dsh plugin add "C:\path\to\dsh-deepseek-web"
 
 所以同步只挑选**尚未与 DSH 会话绑定**的网页对话：
 
-- 插件为新建的 DSH 会话创建网页对话时，会立刻把这条映射写进导入记录（`imported`），下一次同步自然跳过；
-- 选择导入批次时还会再排除一遍 `bindings` 里已绑定的网页对话 id 作为兜底。
+- 插件为新建的 DSH 会话创建网页对话时，只写 `bindings`（**不写** `imported`），下一次同步按绑定关系跳过；
+- 选择导入批次时再排除一遍 `bindings` 里已绑定的网页对话 id。
+
+两条记录刻意分开，因为它们的含义不同：`bindings` 说"这个网页对话属于哪个 DSH 会话"，`imported` 说"这个网页对话是被导入进来的"。撤销按后者决定删不删文件——把本地新建的会话写进 `imported`，撤销时就会删掉用户自己的对话。
+
+`bindings` 里另有一个不可变的 `origin` 字段（`imported` / `local`）。不能用 `seeded` 判断来源：它在首轮回答完成后会被改成 `true`，含义是"已经聊过了"，不是"从哪来的"。
 
 ### 会话 id 与双身份
 
@@ -227,7 +231,7 @@ npm run test:live   # 联网：PoW、会话列表、历史、流式回复
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `token` | 空 | 首次配置也可以写在这里；设置页会写入 `state.json` 并优先沿用。 |
+| `token` | 空 | 首次配置也可以写在这里。注意每次挂载时，**非空的 `config.token` 会覆盖** `state.json` 里保存的值（除非设置了 `DEEPSEEK_WEB_TOKEN`，它优先级最高）。 |
 | `baseUrl` | `https://chat.deepseek.com` | 站点地址。 |
 | `autoSync` | `true` | 是否后台同步。 |
 | `syncIntervalSeconds` | `300` | 后台同步的**均值**间隔（秒）。实际间隔在 ±30% 内随机浮动，见下。设为 `0` 则只在手动触发时同步。 |
