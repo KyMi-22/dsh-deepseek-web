@@ -21,7 +21,29 @@
 
 装完都要**重启 DSH**。重启后「设置 → 插件」里应该能看到 `dsh-deepseek-web` 和它的图标。
 
-### 方式一：在 DSH 界面里装（推荐）
+### 方式一：从下载的 tgz 装（最省事，不依赖 GitHub）
+
+GitHub 连不上的时候用这个——只要浏览器能打开下载页面就行。
+
+1. 打开 [Releases](https://github.com/KyMi-22/dsh-deepseek-web/releases)，下载最新的 `dsh-deepseek-web-x.y.z.tgz`
+2. 打开 DSH，侧边栏底部点 **设置 → 插件 → 添加插件**
+3. 在「包名或地址」里填 tgz 的**完整路径**，例如：
+
+   ```
+   C:\Users\你\Downloads\dsh-deepseek-web-0.1.13.tgz
+   ```
+
+4. 点 **安装**，完成后到插件列表确认它是启用状态，重启 DSH
+
+> 路径里的反斜杠直接填，不用转义。不知道完整路径的话，在文件管理器里右键 tgz →「复制文件地址」。
+
+用命令行装 tgz 也一样：
+
+```bash
+npx @deepseek-ai/dsh plugin --profile desktop add C:\Users\你\Downloads\dsh-deepseek-web-0.1.13.tgz
+```
+
+### 方式二：在 DSH 界面里装（需要能访问 GitHub）
 
 1. 打开 DSH，侧边栏底部点 **设置**
 2. 左侧选 **插件**
@@ -35,9 +57,9 @@
 5. 点 **安装**，等它跑完
 6. 回到插件列表确认 `dsh-deepseek-web` 是启用状态，然后重启 DSH
 
-> 下载慢或连不上 GitHub 时，安装界面里有「**安装源**」选项，可以切到国内镜像源。
+> 这一步会通过 git 访问 github.com。如果网络需要代理才能访问 GitHub，见下面的「安装报错」。
 
-### 方式二：命令行
+### 方式三：命令行
 
 需要先有 Node（`^22.19.0` 或 `>=24`）。按你用的 DSH 形态选一条：
 
@@ -62,20 +84,22 @@ npx @deepseek-ai/dsh plugin --profile web add github:KyMi-22/dsh-deepseek-web
 npx @deepseek-ai/dsh plugin --profile desktop add /path/to/dsh-deepseek-web
 ```
 
-界面方式也可以：第 4 步填本地目录的完整路径。
+界面方式也可以：第 3 步填本地目录的完整路径。
 
 </details>
 
 <details>
 <summary>安装报错</summary>
 
-先确认 Node 版本，低于 `22.19.0` 会过不了 engine 检查：
+**Node 版本太低**——低于 `22.19.0` 会过不了 engine 检查：
 
 ```bash
 node --version
 ```
 
-如果是 GitHub 连不上，用界面方式并切换安装源，或给命令行配置代理。
+**连不上 GitHub**——用「方式一」的 tgz 安装，绕开 git。如果坚持用仓库地址安装，需要让你的 `git` 能访问 github.com（`git` 不读系统代理设置，要单独配）。
+
+**装完看不到插件**——确认已启用，然后重启 DSH。热重载不一定能覆盖 profile 的 bundle 列表变化。
 
 </details>
 
@@ -134,35 +158,6 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 ```
 
 ## 常见问题
-
-**Q：安装一直超时，换安装源也没用？**
-
-需要代理才能访问 GitHub 的网络环境里，这是最常见的原因：**`git` 和 `pnpm` 默认都不读系统代理**（系统代理只对浏览器生效）。
-
-在 DSH 的安装界面里，「安装源」只改 npm registry；而 GitHub 仓库形式最后要连 github.com，那一步走的是 `git`——所以换源不会好。
-
-先确认代理端口（Windows：设置 → 网络和 Internet → 代理），然后：
-
-```bash
-# git 走代理——GitHub 仓库安装要用它
-git config --global http.proxy http://127.0.0.1:7890
-git config --global https.proxy http://127.0.0.1:7890
-
-# npm/pnpm 走代理——拉 npm 包要用它
-npm config set proxy http://127.0.0.1:7890
-npm config set https-proxy http://127.0.0.1:7890
-```
-
-把 `7890` 换成你自己的端口。配完回 DSH 界面重试，不用重启。
-
-不用代理时还原：
-
-```bash
-git config --global --unset http.proxy
-git config --global --unset https.proxy
-npm config delete proxy
-npm config delete https-proxy
-```
 
 **Q：输入框里的模型选择器找不到「DeepSeek 网页版」？**
 
