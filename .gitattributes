@@ -1,0 +1,14 @@
+# Normalize line endings to LF everywhere: in the repository and in the working
+# tree on every platform. Without this, `core.autocrlf=true` (the Windows default)
+# rewrites checked-out files to CRLF, which the hygiene gate rejects and which puts
+# CRLF into anything packed from the working tree.
+* text=auto eol=lf
+
+# Binary assets must never be normalised.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.tgz binary
+*.zstd binary
