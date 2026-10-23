@@ -87,14 +87,17 @@ const DAY = 86_400_000;
 }
 
 // ── the import window ──────────────────────────────────────────────────────
+// Dates are built with the numeric constructor, which uses LOCAL time, so these
+// assertions hold in any timezone. (An earlier version hard-coded +08:00 and only
+// passed on a machine set to China Standard Time — CI runs in UTC.)
 {
-  const now = new Date('2026-10-23T09:56:00+08:00').getTime(); // a Friday
+  const now = new Date(2026, 9, 23, 9, 56, 0).getTime(); // 2026-10-23 09:56 local, a Friday
 
   // "Last 7 days" counts today: on the 23rd it starts at midnight on the 17th.
   // Anchoring to midnight (not now-minus-7x24h) is what keeps whole days in scope;
   // a `now - 7 days` cut would begin at 09:56 seven days earlier and drop that
   // morning's conversations.
-  const expected = new Date('2026-10-17T00:00:00+08:00').getTime();
+  const expected = new Date(2026, 9, 17, 0, 0, 0).getTime();
   assert.equal(resolveSyncWindowStart(7, now), expected, 'seven days includes today and starts at midnight');
   assert.equal(
     resolveSyncWindowStart('week', now),
@@ -103,15 +106,15 @@ const DAY = 86_400_000;
   );
 
   // Whatever the time of day, the start is always local midnight.
-  for (const moment of ['2026-10-23T00:00:01+08:00', '2026-10-23T09:56:00+08:00', '2026-10-23T23:59:00+08:00']) {
-    const at = new Date(moment).getTime();
-    assert.equal(resolveSyncWindowStart(7, at), expected, `anchored to midnight at ${moment}`);
+  for (const moment of [new Date(2026, 9, 23, 0, 0, 1), new Date(2026, 9, 23, 9, 56, 0), new Date(2026, 9, 23, 23, 59, 0)]) {
+    const at = moment.getTime();
+    assert.equal(resolveSyncWindowStart(7, at), expected, `anchored to midnight at ${moment.toISOString()}`);
   }
 
   // A different day shifts the window with it, always seven whole days.
   assert.equal(
-    resolveSyncWindowStart(7, new Date('2026-10-20T15:00:00+08:00').getTime()),
-    new Date('2026-10-14T00:00:00+08:00').getTime(),
+    resolveSyncWindowStart(7, new Date(2026, 9, 20, 15, 0, 0).getTime()),
+    new Date(2026, 9, 14, 0, 0, 0).getTime(),
     'the window moves with the date',
   );
 
@@ -128,7 +131,7 @@ const DAY = 86_400_000;
   assert.equal(resolveSyncWindowStart(undefined, now), 0, 'an absent window keeps everything');
   assert.equal(
     resolveSyncWindowStart(3, now),
-    new Date('2026-10-21T00:00:00+08:00').getTime(),
+    new Date(2026, 9, 21, 0, 0, 0).getTime(),
     'three days includes today (21st, 22nd, 23rd)',
   );
 
