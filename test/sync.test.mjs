@@ -88,20 +88,49 @@ const DAY = 86_400_000;
 
 // ── the import window ──────────────────────────────────────────────────────
 {
-  const now = new Date('2026-10-22T10:54:20+08:00').getTime(); // a Thursday
+  const now = new Date('2026-10-23T09:56:00+08:00').getTime(); // a Friday
 
-  const weekStart = resolveSyncWindowStart('week', now);
-  const week = new Date(weekStart);
-  assert.equal(week.getDay(), 1, 'the week starts on Monday (local time)');
-  assert.equal(week.getHours(), 0, 'at local midnight');
-  assert.equal(week.getMinutes(), 0);
-  assert.equal(week.getSeconds(), 0);
-  assert.ok(weekStart <= now, 'the window starts in the past');
-  assert.ok(weekStart > now - 7 * DAY, 'and no further back than a week');
+  // "Last 7 days" counts today: on the 23rd it starts at midnight on the 17th.
+  // Anchoring to midnight (not now-minus-7x24h) is what keeps whole days in scope;
+  // a `now - 7 days` cut would begin at 09:56 seven days earlier and drop that
+  // morning's conversations.
+  const expected = new Date('2026-10-17T00:00:00+08:00').getTime();
+  assert.equal(resolveSyncWindowStart(7, now), expected, 'seven days includes today and starts at midnight');
+  assert.equal(
+    resolveSyncWindowStart('week', now),
+    expected,
+    "'week' is the deprecated alias for the same seven-day window",
+  );
+
+  // Whatever the time of day, the start is always local midnight.
+  for (const moment of ['2026-10-23T00:00:01+08:00', '2026-10-23T09:56:00+08:00', '2026-10-23T23:59:00+08:00']) {
+    const at = new Date(moment).getTime();
+    assert.equal(resolveSyncWindowStart(7, at), expected, `anchored to midnight at ${moment}`);
+  }
+
+  // A different day shifts the window with it, always seven whole days.
+  assert.equal(
+    resolveSyncWindowStart(7, new Date('2026-10-20T15:00:00+08:00').getTime()),
+    new Date('2026-10-14T00:00:00+08:00').getTime(),
+    'the window moves with the date',
+  );
+
+  // The window is rolling: every new day the start advances by exactly one day,
+  // so the same seven-day span is never pinned to the day it was first computed.
+  for (let offset = 0; offset < 4; offset += 1) {
+    const day = new Date(2026, 9, 23 + offset, 12, 0, 0).getTime(); // Oct 23..26
+    const start = new Date(resolveSyncWindowStart(7, day));
+    assert.equal(start.getDate(), 17 + offset, `on Oct ${23 + offset} the window starts Oct ${17 + offset}`);
+    assert.equal(start.getHours(), 0, 'and always at local midnight');
+  }
 
   assert.equal(resolveSyncWindowStart('all', now), 0, "'all' keeps everything");
   assert.equal(resolveSyncWindowStart(undefined, now), 0, 'an absent window keeps everything');
-  assert.equal(resolveSyncWindowStart(3, now), now - 3 * DAY, 'a number means trailing days');
+  assert.equal(
+    resolveSyncWindowStart(3, now),
+    new Date('2026-10-21T00:00:00+08:00').getTime(),
+    'three days includes today (21st, 22nd, 23rd)',
+  );
 
   const monthStart = new Date(resolveSyncWindowStart('month', now));
   assert.equal(monthStart.getDate(), 1, 'the month starts on the 1st');

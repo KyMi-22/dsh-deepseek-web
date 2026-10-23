@@ -559,11 +559,11 @@ export async function apply(ctx, config = {}) {
   // they feel like it, not on an exact beat. Set `syncIntervalSeconds: 0` to
   // make syncing manual-only.
   //
-  // `syncWindow` bounds which conversations a pass looks at: 'week' (default,
-  // the current calendar week from Monday 00:00 local), 'month', 'all', or a
-  // number of days. A long account would otherwise import hundreds of
-  // conversations the user has no interest in seeing in the sidebar.
-  const syncWindow = config.syncWindow ?? 'week';
+  // `syncWindow` bounds which conversations a pass looks at: a number of trailing
+  // days (default 7), 'month', 'all', or the deprecated alias 'week' which now
+  // means the same trailing seven days. A long account would otherwise import
+  // hundreds of conversations the user has no interest in seeing in the sidebar.
+  const syncWindow = config.syncWindow ?? 7;
   const intervalSeconds = Number(config.syncIntervalSeconds ?? 300);
   /** Whether the timer is actually armed; reported so the page cannot claim otherwise. */
   const autoSyncEnabled = Number.isFinite(intervalSeconds) && intervalSeconds > 0 && config.autoSync !== false;

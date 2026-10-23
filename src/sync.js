@@ -84,12 +84,30 @@ export function mintSessionId() {
   return randomUUID();
 }
 
+/** Local midnight `days - 1` days before `now`, i.e. a window of `days` calendar days INCLUDING today. */
+function startOfRecentDays(now, days) {
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (days - 1));
+  return start.getTime();
+}
+
 /**
  * The earliest conversation timestamp (ms) a sync pass should consider.
  *
- * `'week'` means the current calendar week in LOCAL time, starting Monday
- * 00:00 — that is what "本周" means to the person reading the sidebar, and a
- * rolling seven-day window would silently drop a Monday conversation on Tuesday.
+ * The default is **the last seven calendar days, today included** — the same way
+ * the web product's own "last 7 days" filter reads. Two details matter:
+ *
+ *   - It is anchored to local midnight, not to "now minus N×24h". Running at
+ *     10:00 with a `now - 7 days` cut would start at 10:00 seven days ago, which
+ *     silently drops anything from that morning; midnight keeps whole days.
+ *   - N means N days *counting today*. On the 23rd, "last 7 days" is the 17th
+ *     through the 23rd, not the 16th.
+ *
+ * `'week'` is kept as a deprecated alias for the same seven-day window. It used
+ * to mean "Monday 00:00 local"; mapping it here means an old config stays bounded
+ * instead of falling through to the numeric branch, where `Number('week')` is NaN
+ * and the whole history would be imported.
  *
  * @param {'week' | 'month' | 'all' | number | string | undefined} window
  * @param {number} [now] - epoch milliseconds, injectable for tests.
@@ -97,14 +115,7 @@ export function mintSessionId() {
  */
 export function resolveSyncWindowStart(window, now = Date.now()) {
   if (window === undefined || window === null || window === 'all') return 0;
-  if (window === 'week') {
-    const date = new Date(now);
-    // getDay(): 0 = Sunday. Shift so Monday is the first day of the week.
-    const offsetFromMonday = (date.getDay() + 6) % 7;
-    date.setDate(date.getDate() - offsetFromMonday);
-    date.setHours(0, 0, 0, 0);
-    return date.getTime();
-  }
+  if (window === 'week') return startOfRecentDays(now, 7);
   if (window === 'month') {
     const date = new Date(now);
     date.setDate(1);
@@ -112,7 +123,7 @@ export function resolveSyncWindowStart(window, now = Date.now()) {
     return date.getTime();
   }
   const days = Number(window);
-  if (Number.isFinite(days) && days > 0) return now - days * 86_400_000;
+  if (Number.isFinite(days) && days > 0) return startOfRecentDays(now, Math.floor(days));
   return 0;
 }
 
