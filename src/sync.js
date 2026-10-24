@@ -269,6 +269,7 @@ export function buildSeedEvents(messages, meta) {
         id: randomUUID(),
         role: 'system',
         content: [{ type: 'text', text: `Imported from the DeepSeek web product. Original model: ${model}.` }],
+        source: { kind: 'system-prompt' },
       },
     }, 'append');
   };
