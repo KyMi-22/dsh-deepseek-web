@@ -26,6 +26,8 @@ import { powResponseHeader } from './pow.js';
 export const DEFAULT_BASE_URL = 'https://chat.deepseek.com';
 /** Endpoint the PoW challenge is minted for. */
 const COMPLETION_PATH = '/api/v0/chat/completion';
+/** Endpoint images are uploaded to; the challenge is minted for this path separately. */
+const UPLOAD_PATH = '/api/v0/file/upload_file';
 
 /**
  * Request deadlines.
@@ -38,6 +40,14 @@ const COMPLETION_PATH = '/api/v0/chat/completion';
  */
 const REQUEST_TIMEOUT_MS = 30_000;
 const STREAM_IDLE_TIMEOUT_MS = 120_000;
+/**
+ * Image parse wait: how often `fetch_files` is polled and for how long. The
+ * server parses asynchronously; small images settle in about a second, large
+ * screenshots take longer, and a completion referencing a still-parsing id is
+ * refused outright.
+ */
+const FILE_PARSE_POLL_MS = 1_200;
+const FILE_PARSE_TIMEOUT_MS = 60_000;
 
 /** Emit a diagnostic once per process for a condition that repeats every call. */
 const emitted = new Set();
@@ -343,6 +353,162 @@ export class DeepSeekWebApi {
   }
 
   /**
+   * Parse status of one uploaded file, by id.
+   *
+   * An upload lands as `PENDING` and settles server-side (`SUCCESS` or a parse
+   * failure) without further client work; the completion call only accepts ids
+   * whose parse has finished.
+   *
+   * @param {string} fileId
+   * @param {{ signal?: AbortSignal }} [options]
+   * @returns {Promise<{ id: string, status: string, auditResult: string, tokenUsage: number | null }>}
+   */
+  async fetchFileStatus(fileId, options = {}) {
+    const data = await this.request('/api/v0/file/fetch_files', {
+      query: { file_ids: fileId },
+      signal: options.signal,
+    });
+    const file = Array.isArray(data?.files) ? data.files.find((row) => String(row.id) === fileId) : undefined;
+    if (file === undefined) {
+      throw new DeepSeekWebError(`deepseek-web: file ${fileId} is no longer visible`, 'MALFORMED');
+    }
+    return {
+      id: String(file.id),
+      status: String(file.status ?? ''),
+      auditResult: String(file.audit_result ?? ''),
+      tokenUsage: Number(file.token_usage) || null,
+    };
+  }
+
+  /**
+   * Upload one image and wait for its parse to settle.
+   *
+   * The browser client uploads through `POST /api/v0/file/upload_file` with a
+   * multipart form whose only field is `file`. Three custom headers ride along:
+   * the PoW proof solved for THIS endpoint (`target_path` differs from the
+   * completion one, so the completion header cannot be reused), the model kind
+   * the file is destined for, and the byte size. The reply's `data.biz_data.id`
+   * is the value `ref_file_ids` takes on the next completion call.
+   *
+   * The upload lands as `PENDING` and the server parses it asynchronously; a
+   * completion referencing a still-parsing id is refused with HTTP 422. This
+   * call therefore polls `fetch_files` until the status leaves `PENDING` —
+   * `SUCCESS` returns the id, anything else is an error. The wait is bounded
+   * and every poll is one small GET.
+   *
+   * Every failure here happens before the completion POST, so callers may treat
+   * it as "nothing was submitted" and retry the whole turn.
+   *
+   * @param {{
+   *   bytes: Uint8Array,
+   *   mediaType: string,
+   *   fileName?: string,
+   *   thinking?: boolean,
+   *   signal?: AbortSignal,
+   * }} request
+   * @returns {Promise<string>} the uploaded file's id.
+   */
+  async uploadImage(request) {
+    if (!this.ready) {
+      throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL', { submitted: false });
+    }
+    const { bytes, mediaType, fileName = 'image.png', thinking = false, signal } = request;
+
+    const powHeader = await this.solveChallenge(UPLOAD_PATH, { signal }).catch((error) => {
+      markUnsubmitted(error);
+      throw error;
+    });
+
+    /** The browser sends exactly these three custom headers alongside the PoW proof. */
+    const form = new FormData();
+    form.append('file', new Blob([bytes], { type: mediaType }), fileName);
+
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${UPLOAD_PATH}`, {
+        method: 'POST',
+        headers: this.headers({
+          'X-DS-PoW-Response': powHeader,
+          'x-thinking-enabled': thinking ? '1' : '0',
+          'x-model-type': 'vision',
+          'x-file-size': String(bytes.length),
+        }),
+        body: form,
+        signal: withDeadline(signal, REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      markUnsubmitted(error);
+      throw error;
+    }
+
+    const text = await response.text();
+    if (!response.ok) {
+      throw new DeepSeekWebError(
+        `deepseek-web: image upload failed (HTTP ${response.status})`,
+        response.status === 401 || response.status === 403 ? 'UNAUTHORIZED' : 'TRANSPORT',
+        { status: response.status },
+      );
+    }
+    let json;
+    try {
+      json = text === '' ? {} : JSON.parse(text);
+    } catch (error) {
+      throw new DeepSeekWebError('deepseek-web: image upload returned non-JSON', 'MALFORMED', { cause: error });
+    }
+    if (json?.code !== 0 || json?.data?.biz_code !== 0) {
+      throw new DeepSeekWebError(
+        `deepseek-web: image upload rejected (${json?.data?.biz_msg || json?.msg || 'unknown'})`,
+        'BIZ',
+      );
+    }
+    const id = json.data.biz_data?.id;
+    if (typeof id !== 'string' || id === '') {
+      throw new DeepSeekWebError('deepseek-web: image upload returned no file id', 'MALFORMED');
+    }
+    await this.waitForFile(id, { signal });
+    return id;
+  }
+
+  /**
+   * Poll one uploaded file until its parse leaves `PENDING`.
+   *
+   * `SUCCESS` resolves; any other settled status (`FAIL` and friends) throws,
+   * because a completion referencing it would be refused. The budget is a fixed
+   * number of polls with a fixed gap — generous enough for large screenshots,
+   * bounded enough that a stuck parse cannot hang a turn for minutes.
+   *
+   * @param {string} fileId
+   * @param {{ signal?: AbortSignal }} [options]
+   */
+  async waitForFile(fileId, options = {}) {
+    const { signal } = options;
+    const deadline = Date.now() + FILE_PARSE_TIMEOUT_MS;
+    let last = '';
+    while (Date.now() < deadline) {
+      if (signal?.aborted === true) {
+        throw new DeepSeekWebError('deepseek-web: image parse wait aborted', 'ABORTED', { submitted: false });
+      }
+      let status;
+      try {
+        status = await this.fetchFileStatus(fileId, { signal });
+      } catch (error) {
+        markUnsubmitted(error);
+        throw error;
+      }
+      last = status.status;
+      if (status.status === 'SUCCESS') return;
+      if (status.status !== 'PENDING' && status.status !== 'PARSING') {
+        throw new DeepSeekWebError(
+          `deepseek-web: image parse did not succeed (status ${status.status}, audit ${status.auditResult || 'unknown'})`,
+          'BIZ',
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, FILE_PARSE_POLL_MS));
+    }
+    throw new DeepSeekWebError(`deepseek-web: image parse timed out (last status ${last || 'unknown'})`, 'TIMEOUT');
+  }
+
+  /**
    * Request and solve the proof-of-work challenge for one target path.
    *
    * The solve runs on a worker thread: it is a ~1 s CPU loop, and blocking the
@@ -385,6 +551,7 @@ export class DeepSeekWebApi {
    *   parentMessageId?: number | null,
    *   thinking?: boolean,
    *   search?: boolean,
+   *   refFileIds?: string[],
    *   signal?: AbortSignal,
    * }} request
    */
@@ -393,7 +560,6 @@ export class DeepSeekWebApi {
       throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL', { submitted: false });
     }
     const { chatSessionId, prompt, parentMessageId = null, thinking = false, search = false, signal } = request;
-
     // Everything up to the POST can fail without the model ever seeing the prompt,
     // so those errors are marked `submitted: false` and the adapter may retry.
     // The marker is applied to ANY error, not just `DeepSeekWebError`: a plain
@@ -412,7 +578,7 @@ export class DeepSeekWebApi {
       parent_message_id: parentMessageId,
       model_type: 'default',
       prompt,
-      ref_file_ids: [],
+      ref_file_ids: Array.isArray(request.refFileIds) ? request.refFileIds.filter((id) => typeof id === 'string' && id !== '') : [],
       thinking_enabled: thinking,
       search_enabled: search,
       source: 'default',

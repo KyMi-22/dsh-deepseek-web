@@ -95,11 +95,60 @@ function blocksToText(content) {
     if (block === null || typeof block !== 'object') continue;
     if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
     else if (block.type === 'reasoning' && typeof block.text === 'string') continue;
-    else if (block.type === 'image') parts.push('[图片]');
+    else if (block.type === 'image') continue; // carried separately, not flattened
     else if (block.type === 'file') parts.push('[文件]');
     else if (block.type === 'tool-call') continue;
   }
   return parts.join('\n').trim();
+}
+
+/**
+ * A plausible filename for one media type.
+ *
+ * The upload endpoint stores whatever name it is given and the web UI shows it;
+ * the DSH attachment ref usually has none, so a stable extension keeps the
+ * conversation's file list readable.
+ *
+ * @param {string} mediaType
+ */
+function guessImageName(mediaType) {
+  const ext = mediaType === 'image/jpeg' ? 'jpg' : mediaType === 'image/webp' ? 'webp' : mediaType === 'image/gif' ? 'gif' : 'png';
+  return `image.${ext}`;
+}
+
+/**
+ * Every distinct image reference in one message list, in message order.
+ *
+ * The web endpoint takes images as `ref_file_ids` — ids of files uploaded
+ * beforehand — so the adapter needs the references themselves, not a text
+ * rendering of them. A reference is `{ attachmentId, mediaType }` off the DSH
+ * `ImageBlock.attachment`; the bytes are fetched through the attachment service
+ * at upload time, not carried in the message.
+ *
+ * @param {ReadonlyArray<object>} messages
+ * @returns {Array<{ attachmentId: string, mediaType: string, name?: string }>}
+ */
+export function imageRefs(messages) {
+  const refs = [];
+  const seen = new Set();
+  for (const message of messages) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type !== 'image') continue;
+      const ref = block.attachment;
+      if (ref === null || typeof ref !== 'object') continue;
+      const id = typeof ref.attachmentId === 'string' ? ref.attachmentId : '';
+      if (id === '' || seen.has(id)) continue;
+      seen.add(id);
+      refs.push({
+        attachmentId: id,
+        mediaType: typeof ref.mediaType === 'string' ? ref.mediaType : 'image/png',
+        name: typeof ref.name === 'string' && ref.name !== '' ? ref.name : undefined,
+      });
+    }
+  }
+  return refs;
 }
 
 /**
@@ -312,9 +361,25 @@ export class DeepSeekWebAdapter {
     });
   }
 
-  /** The web endpoint cannot accept request images. */
-  imageRequestPricing() {
-    return undefined;
+  /**
+   * Provider-side request-image pricing.
+   *
+   * The web product meters images on its own side (the upload reply carries
+   * `token_usage`), so DSH's meter should treat every retained occurrence as
+   * "model-visible, unknown cost" rather than estimating from pixels: the web
+   * endpoint never receives raw image bytes from us, only an id.
+   *
+   * @param {string} _provider
+   * @param {string} _model
+   */
+  imageRequestPricing(_provider, _model) {
+    return {
+      priceImages: (images) =>
+        images.map(({ offloaded }) => ({
+          visualTokens: 0,
+          text: offloaded === true ? '' : '[image uploaded to the web conversation]',
+        })),
+    };
   }
 
   /** @param {string} provider */
@@ -324,7 +389,9 @@ export class DeepSeekWebAdapter {
       id: entry.id,
       name: entry.name,
       description: entry.description,
-      inputModalities: ['text'],
+      // Images ride along as uploaded file references (`ref_file_ids`); the web
+      // product itself offers image input on every chat model.
+      inputModalities: ['text', 'image'],
     }));
   }
 
@@ -339,7 +406,7 @@ export class DeepSeekWebAdapter {
       id: entry.id,
       name: entry.name,
       description: entry.description,
-      inputModalities: ['text'],
+      inputModalities: ['text', 'image'],
       context: { contextWindow: 1_000_000 },
       defaultMaxTokens: 8192,
     };
@@ -467,6 +534,43 @@ export class DeepSeekWebAdapter {
       binding = await this.refreshParent(binding);
     }
 
+    // Upload the turn's images, if any, before the completion POST. The web
+    // endpoint takes images as `ref_file_ids` — ids from a prior upload — so
+    // nothing model-visible happens until the completion call itself. Every
+    // failure here is therefore `submitted: false`: the turn may retry whole.
+    /** @type {string[]} */
+    let refFileIds = [];
+    const refs = imageRefs(messages);
+    if (refs.length > 0) {
+      const readImage = this.deps.readImage;
+      if (typeof readImage !== 'function') {
+        const error = new Error('deepseek-web: image input needs the attachment service, which is unavailable');
+        error.submitted = false;
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+        yield finishError(error);
+        return;
+      }
+      try {
+        for (const ref of refs) {
+          const stored = await readImage(ref);
+          const fileId = await this.deps.api.uploadImage({
+            bytes: stored.data,
+            mediaType: ref.mediaType,
+            fileName: ref.name ?? guessImageName(ref.mediaType),
+            thinking: entry.thinking,
+            signal: options.signal,
+          });
+          refFileIds.push(fileId);
+        }
+      } catch (error) {
+        // Nothing reached the model — uploads precede the completion POST.
+        error.submitted = false;
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+        yield finishError(error);
+        return;
+      }
+    }
+
     let reasoningIndex = -1;
     let textIndex = -1;
     let reasoningText = '';
@@ -484,6 +588,7 @@ export class DeepSeekWebAdapter {
         parentMessageId: binding.parentMessageId,
         thinking: entry.thinking,
         search: entry.search === true,
+        refFileIds,
         signal: options.signal,
       })) {
         if (event.kind === 'message') {

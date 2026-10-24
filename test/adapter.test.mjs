@@ -9,7 +9,7 @@
 //   node test/adapter.test.mjs
 
 import assert from 'node:assert';
-import { DeepSeekWebAdapter, MODELS, isHarnessInjection, newestRealUser } from '../src/adapter.js';
+import { DeepSeekWebAdapter, MODELS, isHarnessInjection, newestRealUser, imageRefs } from '../src/adapter.js';
 import { DeepSeekWebError } from '../src/api.js';
 
 /** An API double that records what the adapter asked for. */
@@ -35,6 +35,11 @@ function fakeApi(events, options = {}) {
     async renameSession(chatSessionId, title) {
       calls.renames.push({ chatSessionId, title });
     },
+    async uploadImage(request) {
+      calls.uploads ??= [];
+      calls.uploads.push({ mediaType: request.mediaType, fileName: request.fileName, bytes: request.bytes?.length ?? 0 });
+      return `file-${calls.uploads.length}`;
+    },
     async *streamCompletion(request) {
       calls.completions.push({
         prompt: request.prompt,
@@ -42,6 +47,7 @@ function fakeApi(events, options = {}) {
         search: request.search,
         chatSessionId: request.chatSessionId,
         parentMessageId: request.parentMessageId,
+        refFileIds: request.refFileIds,
       });
       if (options.completionError !== undefined) {
         const failure = options.completionError;
@@ -98,6 +104,9 @@ function makeAdapter(events, options = {}) {
     },
     warn: (message) => console.log('WARN', message),
   });
+  if (options.readImage !== undefined) {
+    adapter.deps.readImage = options.readImage;
+  }
   return { adapter, bindings, api, sent };
 }
 
@@ -170,6 +179,128 @@ assert.equal(
   }
   assert.equal(api.calls.completions.length, 1, 'one request reached the web');
   assert.equal(api.calls.completions[0].prompt, '我的问题', 'the human message is the prompt, not the clock stanza');
+}
+
+// ── imageRefs collects distinct image references in message order ─────────
+{
+  const img = (id, mediaType = 'image/png') => ({
+    type: 'image',
+    attachment: { attachmentId: id, mediaType, bytes: 10, width: 4, height: 4 },
+  });
+  const one = [{ role: 'user', content: [{ type: 'text', text: '看这张' }, img('a')] }];
+  assert.deepEqual(imageRefs(one), [{ attachmentId: 'a', mediaType: 'image/png', name: undefined }]);
+
+  // Dedup across messages; message order preserved.
+  const two = [
+    { role: 'user', content: [img('a', 'image/jpeg'), img('b')] },
+    { role: 'assistant', content: [{ type: 'text', text: '收到' }] },
+    { role: 'user', content: [img('a'), img('c', 'image/webp')] },
+  ];
+  assert.deepEqual(
+    imageRefs(two).map((r) => r.attachmentId),
+    ['a', 'b', 'c'],
+    'a repeated id uploads once, first media type wins',
+  );
+
+  // Non-image and malformed content is skipped silently.
+  assert.deepEqual(imageRefs([{ role: 'user', content: [{ type: 'text', text: 'x' }] }]), []);
+  assert.deepEqual(imageRefs([{ role: 'user', content: [{ type: 'image' }] }]), []);
+  assert.deepEqual(imageRefs([]), []);
+}
+
+// ── a turn with images uploads them and forwards the ids ──────────────────
+{
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+  const reads = [];
+  const { adapter, api, bindings } = makeAdapter([ANSWER('我看到了')], {
+    readImage: async (ref) => {
+      reads.push(ref.attachmentId);
+      return { ref, data: png };
+    },
+  });
+  const messages = [
+    {
+      id: 'm1',
+      role: 'user',
+      content: [
+        { type: 'text', text: '这张图里是什么？' },
+        { type: 'image', attachment: { attachmentId: 'att-1', mediaType: 'image/png', bytes: png.length, width: 4, height: 4 } },
+      ],
+      source: { kind: 'user' },
+    },
+  ];
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages,
+    sessionId: 'sess-img',
+  })) {
+    chunks.push(chunk);
+  }
+  assert.deepEqual(reads, ['att-1'], 'the attachment bytes were read once');
+  assert.deepEqual(api.calls.uploads, [{ mediaType: 'image/png', fileName: 'image.png', bytes: png.length }], 'one upload with the right media type');
+  assert.deepEqual(api.calls.completions[0].refFileIds, ['file-1'], 'the uploaded id rides on the completion');
+  assert.equal(api.calls.completions[0].prompt, '这张图里是什么？', 'the text is unchanged by the image path');
+  assert.equal(bindings.get('sess-img').seeded, true, 'the exchange completed normally');
+  const ends = chunks.filter((c) => c.type === 'block-end');
+  assert.equal(ends.length, 1, 'one text block closed');
+}
+
+// ── no images means no upload and an empty ref list ───────────────────────
+{
+  const { adapter, api } = makeAdapter([ANSWER('好')], {
+    readImage: async () => {
+      throw new Error('must not be called');
+    },
+  });
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m1', '纯文本')],
+    sessionId: 'sess-plain',
+  })) {
+    chunks.push(chunk);
+  }
+  assert.equal(api.calls.uploads, undefined, 'nothing uploaded');
+  assert.deepEqual(api.calls.completions[0].refFileIds, [], 'the completion carries an empty ref list');
+}
+
+// ── an upload failure surfaces as a retryable, unsubmitted error ──────────
+{
+  const { adapter, api, sent } = makeAdapter([ANSWER('不该发生')], {
+    readImage: async () => ({ ref: {}, data: new Uint8Array([1]) }),
+  });
+  // Make the upload fail once.
+  api.uploadImage = async () => {
+    const error = new Error('upload broke');
+    throw error;
+  };
+  const messages = [
+    {
+      id: 'm1',
+      role: 'user',
+      content: [
+        { type: 'text', text: '带图的问题' },
+        { type: 'image', attachment: { attachmentId: 'att-x', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } },
+      ],
+      source: { kind: 'user' },
+    },
+  ];
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages,
+    sessionId: 'sess-fail',
+  })) {
+    chunks.push(chunk);
+  }
+  const finish = chunks.find((c) => c.type === 'finish');
+  assert.notEqual(finish, undefined, 'the turn ended with a finish chunk');
+  assert.equal(api.calls.completions.length, 0, 'no completion was attempted after the upload failure');
+  assert.equal(sent.get('sess-fail')?.has('m1') ?? false, false, 'the message was released for retry');
 }
 
 // ── reasoning then answer, with the prompt kept clean ──────────────────────

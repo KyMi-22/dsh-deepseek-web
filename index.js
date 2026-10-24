@@ -215,6 +215,18 @@ export async function apply(ctx, config = {}) {
     warn,
   });
 
+  // Image uploads read bytes out of the Host's attachment store. The service is
+  // resolved lazily: the adapter only touches it for turns that actually carry
+  // images, and a missing service degrades to a clear per-turn error instead of
+  // failing plugin load on deployments that mount no attachment store.
+  adapter.deps.readImage = async (ref) => {
+    const attachments = ctx.get('attachments');
+    if (attachments?.readImage === undefined) {
+      throw new Error('deepseek-web: no attachment service is mounted');
+    }
+    return attachments.readImage(ref);
+  };
+
   // Both registrations are fiber-owned: their handles unwind with this plugin.
   ctx.llm.registerAdapter([PROVIDER], adapter);
   ctx.llm.registerConfigurableProviders([
