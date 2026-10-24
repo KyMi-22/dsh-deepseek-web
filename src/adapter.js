@@ -565,6 +565,11 @@ export class DeepSeekWebAdapter {
       } catch (error) {
         // Nothing reached the model — uploads precede the completion POST.
         error.submitted = false;
+        // The failure surfaces to the user as a bare turn error; log the cause
+        // here so the Host log shows WHY the upload did not go through.
+        this.deps.warn?.(
+          `deepseek-web: image upload failed before the prompt was sent (${error instanceof Error ? error.message : String(error)})`,
+        );
         this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
         yield finishError(error);
         return;
@@ -684,18 +689,27 @@ export class DeepSeekWebAdapter {
   }
 }
 
-/** Map a transport failure onto a terminal `finish` chunk. */
+/**
+ * Map a transport failure onto a terminal `finish` chunk.
+ *
+ * The harness validates every chunk as lossless JSON, and its walker rejects an
+ * object graph containing an `undefined` property value — a `status: undefined`
+ * here would replace the real failure with "Assistant stream chunk must be
+ * losslessly JSON-serializable". Optional fields are therefore omitted, never
+ * set to `undefined`.
+ */
 function finishError(error) {
   const isWeb = error instanceof DeepSeekWebError;
+  const failure = {
+    message: error instanceof Error ? error.message : String(error),
+    code: isWeb ? error.code : 'TRANSPORT',
+  };
+  if (isWeb && error.status !== undefined) failure.status = error.status;
   return {
     type: 'finish',
     reason: {
       kind: 'error',
-      failure: {
-        message: error instanceof Error ? error.message : String(error),
-        code: isWeb ? error.code : 'TRANSPORT',
-        status: isWeb ? error.status : undefined,
-      },
+      failure,
     },
   };
 }

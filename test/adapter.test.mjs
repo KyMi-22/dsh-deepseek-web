@@ -664,4 +664,64 @@ assert.equal(
   assert.equal(api.calls.createSession, 0, 'and no web conversation is minted');
 }
 
+// ── every chunk the adapter emits must be lossless JSON ────────────────────
+{
+  // The harness validates each chunk with a strict JSON walker that REJECTS an
+  // `undefined` property value (unlike JSON.stringify, which silently drops it).
+  // An old `finishError` carried `status: undefined`, so a real upload failure
+  // surfaced as "Assistant stream chunk must be losslessly JSON-serializable"
+  // instead of the cause. This walker mirrors the harness's plain-object rules
+  // closely enough to pin the contract: no undefined values anywhere.
+  const walkerRejects = (value, ancestors = new Set()) => {
+    if (value === null || typeof value !== 'object') return false;
+    if (ancestors.has(value)) return true;
+    ancestors.add(value);
+    for (const key of Object.keys(value)) {
+      if (value[key] === undefined) return true;
+      if (typeof value[key] === 'object' && walkerRejects(value[key], ancestors)) return true;
+    }
+    ancestors.delete(value);
+    return false;
+  };
+
+  const withImage = {
+    id: 'm1',
+    role: 'user',
+    content: [
+      { type: 'image', attachment: { attachmentId: 'a', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } },
+      { type: 'text', text: '带图' },
+    ],
+    source: { kind: 'user' },
+  };
+
+  // 1. the happy path
+  {
+    const { adapter } = makeAdapter([THINK('想'), ANSWER('答')], { readImage: async () => ({ ref: {}, data: new Uint8Array([1]) }) });
+    for await (const chunk of adapter.stream({
+      provider: 'deepseek-web',
+      model: 'deepseek-web-search-think',
+      messages: [withImage],
+      sessionId: 'sess-json-ok',
+    })) {
+      assert.equal(walkerRejects(chunk), false, `chunk ${JSON.stringify(chunk).slice(0, 120)} is lossless JSON`);
+    }
+  }
+  // 2. the failure path: a non-DeepSeekWebError (no status at all) must serialize
+  {
+    const { adapter } = makeAdapter([ANSWER('不该发生')], {
+      readImage: async () => {
+        throw new Error('read broke');
+      },
+    });
+    for await (const chunk of adapter.stream({
+      provider: 'deepseek-web',
+      model: 'deepseek-web-chat',
+      messages: [withImage],
+      sessionId: 'sess-json-err',
+    })) {
+      assert.equal(walkerRejects(chunk), false, `failure chunk ${JSON.stringify(chunk).slice(0, 120)} is lossless JSON`);
+    }
+  }
+}
+
 console.log('adapter.test.mjs: all assertions passed');
