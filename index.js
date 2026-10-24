@@ -24,6 +24,7 @@
  */
 
 import { DeepSeekWebApi } from './src/api.js';
+import fs from 'node:fs';
 import { DeepSeekWebAdapter, MODELS, PROVIDER } from './src/adapter.js';
 import {
   conversationDir,
@@ -224,7 +225,33 @@ export async function apply(ctx, config = {}) {
     if (attachments?.readImage === undefined) {
       throw new Error('deepseek-web: no attachment service is mounted');
     }
-    return attachments.readImage(ref);
+    try {
+      return await attachments.readImage(ref);
+    } catch (error) {
+      // The store validates stored bytes against the reference; when that fails,
+      // record both sides so the log shows WHICH field disagreed.
+      if (error instanceof Error && error.message.includes('does not match')) {
+        let actual = '(unreadable)';
+        try {
+          const hostPath = attachments.imageHostPath?.(ref);
+          if (typeof hostPath === 'string') {
+            const data = await fs.promises.readFile(hostPath);
+            actual = `${data.length} bytes, header ${data.subarray(0, 3).toString('hex')}`;
+          }
+        } catch {
+          /* the diagnostic must not mask the original error */
+        }
+        warn(
+          `deepseek-web: attachment ${ref.attachmentId} ref=${JSON.stringify({
+            mediaType: ref.mediaType,
+            bytes: ref.bytes,
+            width: ref.width,
+            height: ref.height,
+          })} stored=${actual}`,
+        );
+      }
+      throw error;
+    }
   };
 
   // Both registrations are fiber-owned: their handles unwind with this plugin.
