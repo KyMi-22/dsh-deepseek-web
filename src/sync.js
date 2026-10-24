@@ -266,6 +266,7 @@ export function buildSeedEvents(messages, meta) {
       turn: 1,
       step: 1,
       message: {
+        id: randomUUID(),
         role: 'system',
         content: [{ type: 'text', text: `Imported from the DeepSeek web product. Original model: ${model}.` }],
       },
