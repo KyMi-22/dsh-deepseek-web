@@ -133,7 +133,7 @@ assert.equal(cited.type, 'user/message', 'title cites the first user message');
 
 // Surface events carry a surfaceOp; bookkeeping events must not.
 for (const event of events) {
-  const isSurface = event.type === 'user/message' || event.type === 'assistant/message';
+  const isSurface = event.type === 'user/message' || event.type === 'assistant/message' || event.type === 'system/message';
   if (isSurface) assert.equal(event.surfaceOp, 'append', `${event.type} carries surfaceOp`);
   else assert.equal(event.surfaceOp, undefined, `${event.type} carries no surfaceOp`);
 }
