@@ -103,16 +103,33 @@ function blocksToText(content) {
 }
 
 /**
- * A plausible filename for one media type.
+ * The extension the upload endpoint associates with one media type.
  *
- * The upload endpoint stores whatever name it is given and the web UI shows it;
- * the DSH attachment ref usually has none, so a stable extension keeps the
- * conversation's file list readable.
+ * The endpoint judges the file type by the filename EXTENSION — the browser
+ * always sends one — so a name without an extension (or with one that
+ * disagrees with `mediaType`) is rejected as "unsupported file type" even
+ * though the bytes themselves are fine.
  *
  * @param {string} mediaType
  */
-function guessImageName(mediaType) {
-  const ext = mediaType === 'image/jpeg' ? 'jpg' : mediaType === 'image/webp' ? 'webp' : mediaType === 'image/gif' ? 'gif' : 'png';
+function imageExtension(mediaType) {
+  return mediaType === 'image/jpeg' ? 'jpg' : mediaType === 'image/webp' ? 'webp' : mediaType === 'image/gif' ? 'gif' : 'png';
+}
+
+/**
+ * The filename one upload carries.
+ *
+ * The DSH attachment's display name is kept when it already ends with the
+ * right extension; anything else (no name, no extension, or a mismatched one —
+ * a `.png` name on WebP bytes happens when a file is saved renamed) is
+ * replaced by a generated name, because the endpoint type-checks by extension.
+ *
+ * @param {string | undefined} name
+ * @param {string} mediaType
+ */
+function uploadFileName(name, mediaType) {
+  const ext = imageExtension(mediaType);
+  if (typeof name === 'string' && name.toLowerCase().endsWith(`.${ext}`)) return name;
   return `image.${ext}`;
 }
 
@@ -548,7 +565,7 @@ export class DeepSeekWebAdapter {
           const fileId = await this.deps.api.uploadImage({
             bytes: stored.data,
             mediaType: ref.mediaType,
-            fileName: ref.name ?? guessImageName(ref.mediaType),
+            fileName: uploadFileName(ref.name, ref.mediaType),
             thinking: entry.thinking,
             signal: options.signal,
           });

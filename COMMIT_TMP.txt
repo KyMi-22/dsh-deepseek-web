@@ -1,0 +1,15 @@
+fix: the upload endpoint type-checks by filename extension
+
+Live testing against the real service caught this: the upload endpoint
+judges the file type by the filename EXTENSION (the browser always sends
+one). A display name without an extension, or one that disagrees with
+the declared mediaType, is rejected as "unsupported file type" even
+though the bytes are fine - the paste-from-clipboard path only worked
+because guessImageName() happened to mint a matching name.
+
+uploadFileName() now keeps a display name only when it ends with the
+extension that matches the declared media type, and regenerates
+image.<ext> otherwise. Covered by a four-case unit test and by
+test/live-image.mjs, a new live smoke test that walks upload -> parse
+wait -> completion with ref_file_ids against the real service (part of
+npm run test:live).

@@ -11,6 +11,8 @@
 - **删除死代码**：`webSessions` Set（4 处写入、0 处读取，其注释宣称的职责已由 durable binding ledger 承担）与 `StateStore.importedBySession()`（无调用方）。
 - **设置页 status 路由的模型列表提为模块级常量**：常量数据不再每次请求重建。
 - `adapter.stream()` 里 `newestRealUser` 的重复遍历合并为一次（`buildPrompt` 就是同一次遍历的包装）。
+- **上传文件名必须带与声明类型一致的扩展名**（实测发现）：网页端按文件名扩展判断文件类型，`ref.name` 无扩展名或扩展名与 `mediaType` 不符（改名保存的 `.png` 实为 WebP 之类）会被拒为 `unsupported file type`。现在这样的名字会被替换为生成的 `image.<ext>`，名字与类型一致时保留原名。
+- 新增 `test/live-image.mjs`（`npm run test:live` 的一部分）：用真实凭证走完 上传 → 解析等待 → 带 `ref_file_ids` 的 completion 全链路，实测验证 PoW 求解器与上传链路。
 - 删除 `test/__surfaces.mjs`：引用本机绝对路径的一次性诊断脚本，不属于测试套件。
 
 ## 0.2.0 — 2026-10-24

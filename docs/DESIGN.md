@@ -135,6 +135,7 @@ ctx.on('session/event', (session, event) => {
 两个容易踩的坑：
 
 - **附件引用必须原样传递**。`ImageBlock.attachment` 里的 `bytes/width/height` 不是装饰信息：本地附件存储读取时会重新探测存储对象，逐字段核对引用（`mediaType`、`bytes`、`width`、`height`），缺一个字段就是 `ATTACHMENT_CORRUPT`。0.2.0 曾把引用裁剪成 `{attachmentId, mediaType, name}`，导致每条带图消息在上传前就被拒。
+- **上传文件名按扩展名校验**。端点用文件名的扩展判断类型：无扩展名、或扩展名与 `mediaType` 不符（改名保存的文件常这样）都会被拒为 `unsupported file type`。适配器只保留与声明类型一致的名字，其余重新生成为 `image.<ext>`。
 - **解析未完成就发送会被拒**（HTTP 422），所以等到 `SUCCESS` 才继续；等待上限 60 秒，轮询间隔 1.2 秒。全部失败都发生在 completion 之前，整轮可以安全重试。
 
 网页端对图片自行计量（上传响应带 `token_usage`），DSH 侧把保留出现的图片计为「模型可见、成本未知」（`imageRequestPricing` 返回 `visualTokens: 0`），不从像素估算。

@@ -262,6 +262,48 @@ assert.equal(
   assert.equal(ends.length, 1, 'one text block closed');
 }
 
+// ── the upload filename always carries the extension the endpoint checks ──
+{
+  // The endpoint type-checks by filename EXTENSION, so a display name without
+  // one — or with one that disagrees with the declared media type — must be
+  // replaced, not passed through.
+  const { adapter, api } = makeAdapter([ANSWER('好')], {
+    readImage: async (ref) => ({ ref, data: new Uint8Array([1]) }),
+  });
+  const withName = (name) => [
+    {
+      id: 'm1',
+      role: 'user',
+      content: [
+        { type: 'text', text: '看图' },
+        { type: 'image', attachment: { attachmentId: name ?? 'x', mediaType: 'image/png', bytes: 1, width: 1, height: 1, name } },
+      ],
+      source: { kind: 'user' },
+    },
+  ];
+  for await (const _c of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: withName('截图01'), sessionId: 'sess-name-1',
+  })) { /* drain */ }
+  for await (const _c of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: withName('saved-as-png.webp'), sessionId: 'sess-name-2',
+  })) { /* drain */ }
+  for await (const _c of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: withName('photo.jpg'), sessionId: 'sess-name-3',
+  })) { /* drain */ }
+  for await (const _c of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: withName('shot.png'), sessionId: 'sess-name-4',
+  })) { /* drain */ }
+  assert.deepEqual(
+    api.calls.uploads.map((u) => u.fileName),
+    ['image.png', 'image.png', 'image.png', 'shot.png'],
+    'names without the declared extension are regenerated; a matching one is kept',
+  );
+}
+
 // ── no images means no upload and an empty ref list ───────────────────────
 {
   const { adapter, api } = makeAdapter([ANSWER('好')], {
