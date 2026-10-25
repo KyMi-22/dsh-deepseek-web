@@ -250,8 +250,8 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 ```
 index.js           Host 入口：provider 注册、同步引擎、设置页路由、工具拦截
 client.js          设置页
-src/api.js         网页端接口客户端：分页、历史、SSE、错误分类
-src/adapter.js     provider 适配：messages → prompt，SSE → StreamChunk
+src/api.js         网页端接口客户端：分页、历史、上传、SSE、错误分类
+src/adapter.js     provider 适配：messages → prompt，图片引用收集，SSE → StreamChunk
 src/sync.js        网页对话 → 种子会话；工作区；撤销
 src/store.js       插件状态（token、会话绑定、导入账本）
 src/pow.js         DeepSeekHashV1 求解器

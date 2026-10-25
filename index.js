@@ -24,7 +24,6 @@
  */
 
 import { DeepSeekWebApi } from './src/api.js';
-import fs from 'node:fs';
 import { DeepSeekWebAdapter, MODELS, PROVIDER } from './src/adapter.js';
 import {
   conversationDir,
@@ -34,6 +33,7 @@ import {
 } from './src/store.js';
 import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
 import { readJsonBody, sendJson } from './src/http.js';
+import { readFile } from 'node:fs/promises';
 import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
 
 export { isToolAllowedInWebSession } from './src/tool-guard.js';
@@ -46,6 +46,9 @@ export const inject = ['llm'];
 
 /** Same-origin route prefix owned by this plugin. */
 export const API_PREFIX = '/dsh-deepseek-web/api';
+
+/** The model rows the settings page renders; built once, it is constant data. */
+const MODEL_SUMMARY = MODELS.map((entry) => ({ id: entry.id, name: entry.name, description: entry.description }));
 
 /** How many per-conversation failures one sync report carries. */
 const MAX_REPORTED_ERRORS = 5;
@@ -167,8 +170,6 @@ export async function apply(ctx, config = {}) {
   // ── adapter ───────────────────────────────────────────────────────────────
   /** Sessions already prompted, so one turn cannot re-ask the model. */
   const promptedMessages = new Map();
-  /** Sessions using this provider, used by the file-write guard. */
-  const webSessions = new Set();
 
   const adapter = new DeepSeekWebAdapter({
     api,
@@ -181,7 +182,6 @@ export async function apply(ctx, config = {}) {
       // keeping the two records separate changes nothing about repeated passes
       // and stops an undo from deleting a conversation the user started here.
       store.setBinding(sessionId, binding);
-      webSessions.add(sessionId);
     },
     updateBinding: (sessionId, patch) => {
       const current = store.binding(sessionId);
@@ -189,7 +189,6 @@ export async function apply(ctx, config = {}) {
       store.setBinding(sessionId, { ...current, ...patch });
     },
     noteSent: (sessionId, messageId) => {
-      webSessions.add(sessionId);
       let seen = promptedMessages.get(sessionId);
       if (seen === undefined) {
         seen = new Set();
@@ -235,7 +234,7 @@ export async function apply(ctx, config = {}) {
         try {
           const hostPath = attachments.imageHostPath?.(ref);
           if (typeof hostPath === 'string') {
-            const data = await fs.promises.readFile(hostPath);
+            const data = await readFile(hostPath);
             actual = `${data.length} bytes, header ${data.subarray(0, 3).toString('hex')}`;
           }
         } catch {
@@ -493,7 +492,6 @@ export async function apply(ctx, config = {}) {
             // Provenance: this one was pulled FROM the web, so undo may delete it.
             origin: 'imported',
           });
-          webSessions.add(dshSessionId);
           report.imported++;
         } catch (error) {
           report.failed++;
@@ -670,7 +668,7 @@ export async function apply(ctx, config = {}) {
               sendJson(res, 200, {
                 plugin: name,
                 provider: PROVIDER,
-                models: MODELS.map((entry) => ({ id: entry.id, name: entry.name, description: entry.description })),
+                models: MODEL_SUMMARY,
                 workspaceTitle: WORKSPACE_TITLE,
                 workspaceId: store.state.workspaceId,
                 conversationDir: directory,

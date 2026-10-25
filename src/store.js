@@ -371,11 +371,6 @@ export class StateStore {
     this.flushSoon();
   }
 
-  /** @param {string} sessionId */
-  importedBySession(sessionId) {
-    return this.state.imported[sessionId];
-  }
-
   /** @param {ImportedConversation} entry */
   recordImported(entry) {
     this.state.imported[entry.chatSessionId] = entry;

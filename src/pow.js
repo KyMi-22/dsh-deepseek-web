@@ -52,6 +52,11 @@ const SHA3_PAD = 0x06;
 const scratchC = new Uint32Array(10);
 const scratchD = new Uint32Array(10);
 const scratchW = new Uint32Array(2);
+// The scratch buffers are fully overwritten before each read within a round
+// (theta writes all of C and D, rhoPi/chi rewrite what they read), so no
+// clearing between rounds is needed — and none is done: a solve runs the
+// permutation ~23×136×150k times, and the three fill(0) calls that used to
+// sit at the bottom of the loop were measurable pure overhead.
 
 /** Copy one 64-bit lane between word arrays. */
 function copyLane(src, srcLane, dst, dstLane) {
@@ -125,9 +130,6 @@ function permute(state) {
     rhoPi(state, scratchC, scratchW);
     chi(state, scratchC);
     iota(state, round);
-    scratchC.fill(0);
-    scratchD.fill(0);
-    scratchW.fill(0);
   }
 }
 

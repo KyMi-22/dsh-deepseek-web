@@ -267,22 +267,6 @@ export function newestRealUser(messages) {
 }
 
 /**
- * The prompt the web endpoint receives.
- *
- * Exactly the newest human message — never the system prompt, never earlier
- * turns, never injected context. The web conversation keeps its own history, so
- * re-sending the transcript would duplicate it and drag harness internals into
- * the user's chats. A session whose first turn is the first human message needs
- * nothing older, and an imported conversation already holds its history on the
- * web side.
- *
- * @param {ReadonlyArray<object>} messages
- */
-function buildPrompt(messages) {
-  return newestRealUser(messages)?.text ?? '';
-}
-
-/**
  * Answer one auxiliary request locally.
  *
  * `session-title` wants a short label and `compaction` wants a condensed digest;
@@ -433,16 +417,6 @@ export class DeepSeekWebAdapter {
   }
 
   /**
-   * Stream one reply.
-   *
-   * @param {{
-   *   provider: string, model: string,
-   *   messages: ReadonlyArray<object>, system?: string, purpose?: 'compaction' | 'session-title',
-   *   signal?: AbortSignal, sessionId?: string,
-   * }} options
-   * @returns {AsyncIterable<object>} harness `StreamChunk` values.
-   */
-  /**
    * Re-read the web conversation's latest message id when the binding may be stale.
    *
    * The web side moves independently: the user can keep talking on
@@ -476,6 +450,16 @@ export class DeepSeekWebAdapter {
     }
   }
 
+  /**
+   * Stream one reply.
+   *
+   * @param {{
+   *   provider: string, model: string,
+   *   messages: ReadonlyArray<object>, system?: string, purpose?: 'compaction' | 'session-title',
+   *   signal?: AbortSignal, sessionId?: string,
+   * }} options
+   * @returns {AsyncIterable<object>} harness `StreamChunk` values.
+   */
   async *stream(options) {
     // The loop also drives auxiliary calls — title generation and compaction —
     // through this same adapter. Forwarding them to the web product would mint a
@@ -491,14 +475,14 @@ export class DeepSeekWebAdapter {
     const entry = modelRow(options.model);
     const messages = Array.isArray(options.messages) ? options.messages : [];
 
+    // The prompt is exactly the newest human message — never the system prompt,
+    // never earlier turns, never injected context. The web conversation keeps
+    // its own history, so re-sending the transcript would duplicate it and drag
+    // harness internals into the user's chats. An imported conversation already
+    // holds its history on the web side.
     const newest = newestRealUser(messages);
-    if (newest === null) {
-      yield { type: 'finish', reason: { kind: 'stop' } };
-      return;
-    }
-
-    const prompt = buildPrompt(messages);
-    if (prompt === '') {
+    const prompt = newest?.text ?? '';
+    if (newest === null || prompt === '') {
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
