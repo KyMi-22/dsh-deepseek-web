@@ -12,6 +12,12 @@
 - 声明 `inputModalities: ["text", "image"]`，Host 不再在入口处拒绝带图消息
 - 附件服务未挂载的部署上，带图消息明确报错，纯文本不受影响
 
+### 分支内修复（2026-10-25）
+
+- **修复带图消息必然失败的问题**：`imageRefs()` 原来把附件引用裁剪成 `{attachmentId, mediaType, name}` 再传给附件服务的 `readImage`，而本地附件存储（`dsh-attachment-local`）读取时会**重新探测存储对象**并逐字段核对引用里的 `mediaType/bytes/width/height`——被裁掉的 `bytes/width/height` 变成 `undefined`，`data.byteLength !== undefined` 恒成立，于是每一次带图消息都以 `Stored attachment metadata does not match its reference`（`ATTACHMENT_CORRUPT`）被拒。这是前面几个诊断 commit 一直在追的那个"上传失败"。现在引用原样携带全部验证字段，只有显示名会被规整。
+- error finish chunk 不再携带 `undefined` 的 `status`（harness 的 JSON walker 会拒绝，真实错误被序列化错误掩盖）
+- 导入的会话种子补上带 id、带 `system-prompt` source 的 protected system head（否则第一条真实 system/message 会把整个 session log 判为损坏）
+
 
 ## 0.1.20 — 2026-10-23
 

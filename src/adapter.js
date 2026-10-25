@@ -121,12 +121,17 @@ function guessImageName(mediaType) {
  *
  * The web endpoint takes images as `ref_file_ids` — ids of files uploaded
  * beforehand — so the adapter needs the references themselves, not a text
- * rendering of them. A reference is `{ attachmentId, mediaType }` off the DSH
- * `ImageBlock.attachment`; the bytes are fetched through the attachment service
- * at upload time, not carried in the message.
+ * rendering of them. A reference is the DSH `ImageBlock.attachment` minus its
+ * display name, and it must keep EVERY verification field (`bytes`, `width`,
+ * `height`): the attachment store's `readImage` re-reads the stored object and
+ * rejects a reference whose recorded facts do not match the bytes, and a
+ * trimmed `{attachmentId, mediaType}` ref made every image turn fail with
+ * "Stored attachment metadata does not match its reference" (byteLength never
+ * equals `undefined`). The bytes themselves are fetched through the attachment
+ * service at upload time, not carried in the message.
  *
  * @param {ReadonlyArray<object>} messages
- * @returns {Array<{ attachmentId: string, mediaType: string, name?: string }>}
+ * @returns {Array<{ attachmentId: string, mediaType: string, bytes?: number, width?: number, height?: number, name?: string }>}
  */
 export function imageRefs(messages) {
   const refs = [];
@@ -144,6 +149,9 @@ export function imageRefs(messages) {
       refs.push({
         attachmentId: id,
         mediaType: typeof ref.mediaType === 'string' ? ref.mediaType : 'image/png',
+        bytes: typeof ref.bytes === 'number' ? ref.bytes : undefined,
+        width: typeof ref.width === 'number' ? ref.width : undefined,
+        height: typeof ref.height === 'number' ? ref.height : undefined,
         name: typeof ref.name === 'string' && ref.name !== '' ? ref.name : undefined,
       });
     }

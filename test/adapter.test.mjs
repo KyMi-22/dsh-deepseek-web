@@ -188,7 +188,14 @@ assert.equal(
     attachment: { attachmentId: id, mediaType, bytes: 10, width: 4, height: 4 },
   });
   const one = [{ role: 'user', content: [{ type: 'text', text: '看这张' }, img('a')] }];
-  assert.deepEqual(imageRefs(one), [{ attachmentId: 'a', mediaType: 'image/png', name: undefined }]);
+  assert.deepEqual(imageRefs(one), [{ attachmentId: 'a', mediaType: 'image/png', bytes: 10, width: 4, height: 4, name: undefined }]);
+
+  // The full reference is kept: the attachment store verifies stored bytes
+  // against the recorded facts, so dropping any of bytes/width/height would
+  // make every read fail with ATTACHMENT_CORRUPT.
+  const full = { attachmentId: 'z', mediaType: 'image/webp', bytes: 77, width: 9, height: 8, name: 'shot.webp' };
+  const withFull = [{ role: 'user', content: [{ type: 'image', attachment: full }] }];
+  assert.deepEqual(imageRefs(withFull), [{ attachmentId: 'z', mediaType: 'image/webp', bytes: 77, width: 9, height: 8, name: 'shot.webp' }]);
 
   // Dedup across messages; message order preserved.
   const two = [
@@ -214,7 +221,7 @@ assert.equal(
   const reads = [];
   const { adapter, api, bindings } = makeAdapter([ANSWER('我看到了')], {
     readImage: async (ref) => {
-      reads.push(ref.attachmentId);
+      reads.push(ref);
       return { ref, data: png };
     },
   });
@@ -238,7 +245,15 @@ assert.equal(
   })) {
     chunks.push(chunk);
   }
-  assert.deepEqual(reads, ['att-1'], 'the attachment bytes were read once');
+  assert.equal(reads.length, 1, 'the attachment bytes were read once');
+  // The reference reaches the attachment store with every verification fact:
+  // the store re-reads the object and compares mediaType/bytes/width/height
+  // against the reference, so a trimmed ref fails as ATTACHMENT_CORRUPT.
+  assert.deepEqual(
+    reads[0],
+    { attachmentId: 'att-1', mediaType: 'image/png', bytes: png.length, width: 4, height: 4, name: undefined },
+    'the store receives the full reference, not a trimmed one',
+  );
   assert.deepEqual(api.calls.uploads, [{ mediaType: 'image/png', fileName: 'image.png', bytes: png.length }], 'one upload with the right media type');
   assert.deepEqual(api.calls.completions[0].refFileIds, ['file-1'], 'the uploaded id rides on the completion');
   assert.equal(api.calls.completions[0].prompt, '这张图里是什么？', 'the text is unchanged by the image path');
