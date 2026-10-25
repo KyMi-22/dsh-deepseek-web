@@ -250,8 +250,8 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 ```
 index.js           Host 入口：provider 注册、同步引擎、设置页路由、工具拦截
 client.js          设置页
-src/api.js         网页端接口客户端：分页、历史、SSE、错误分类
-src/adapter.js     provider 适配：messages → prompt，SSE → StreamChunk
+src/api.js         网页端接口客户端：分页、历史、上传、SSE、错误分类
+src/adapter.js     provider 适配：messages → prompt，图片引用收集，SSE → StreamChunk
 src/sync.js        网页对话 → 种子会话；工作区；撤销
 src/store.js       插件状态（token、会话绑定、导入账本）
 src/pow.js         DeepSeekHashV1 求解器
@@ -322,6 +322,15 @@ DeepSeek 网页版的接口只收一段文本，没有函数调用通道。这�
 - **不支持内嵌网页**：`chat.deepseek.com` 设置了 `frame-ancestors 'none'`，任何页面都无法用 iframe 嵌入。
 - **同步有延迟**：网页端没有推送接口，只能轮询。
 - **网页对话会一直变长**：一个 DSH 会话绑定一个网页对话后就不再更换，聊得越久上下文占用越多。见下面的「后续计划」。
+
+### 图片输入
+
+可以直接在对话里贴图。插件把图片上传到网页端（走和浏览器一样的 `upload_file` 接口，需要单独过一次 PoW），拿到文件 id 后随消息一起发出，所以图片保存在网页对话里，不在本地落盘。
+
+两点行为差异值得知道：
+
+- **上传要等解析**：图片传上去后网页端异步解析（一般一两秒，大图更久），解析完成前发送会失败。插件会自动等，超时是 60 秒。
+- **附件服务不可用时**：这个功能依赖 DSH 的附件存储。个别部署没挂载它时，带图的消息会明确报错，纯文本不受影响。
 
 ## 后续计划
 

@@ -95,11 +95,85 @@ function blocksToText(content) {
     if (block === null || typeof block !== 'object') continue;
     if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
     else if (block.type === 'reasoning' && typeof block.text === 'string') continue;
-    else if (block.type === 'image') parts.push('[图片]');
+    else if (block.type === 'image') continue; // carried separately, not flattened
     else if (block.type === 'file') parts.push('[文件]');
     else if (block.type === 'tool-call') continue;
   }
   return parts.join('\n').trim();
+}
+
+/**
+ * The extension the upload endpoint associates with one media type.
+ *
+ * The endpoint judges the file type by the filename EXTENSION — the browser
+ * always sends one — so a name without an extension (or with one that
+ * disagrees with `mediaType`) is rejected as "unsupported file type" even
+ * though the bytes themselves are fine.
+ *
+ * @param {string} mediaType
+ */
+function imageExtension(mediaType) {
+  return mediaType === 'image/jpeg' ? 'jpg' : mediaType === 'image/webp' ? 'webp' : mediaType === 'image/gif' ? 'gif' : 'png';
+}
+
+/**
+ * The filename one upload carries.
+ *
+ * The DSH attachment's display name is kept when it already ends with the
+ * right extension; anything else (no name, no extension, or a mismatched one —
+ * a `.png` name on WebP bytes happens when a file is saved renamed) is
+ * replaced by a generated name, because the endpoint type-checks by extension.
+ *
+ * @param {string | undefined} name
+ * @param {string} mediaType
+ */
+function uploadFileName(name, mediaType) {
+  const ext = imageExtension(mediaType);
+  if (typeof name === 'string' && name.toLowerCase().endsWith(`.${ext}`)) return name;
+  return `image.${ext}`;
+}
+
+/**
+ * Every distinct image reference in one message list, in message order.
+ *
+ * The web endpoint takes images as `ref_file_ids` — ids of files uploaded
+ * beforehand — so the adapter needs the references themselves, not a text
+ * rendering of them. A reference is the DSH `ImageBlock.attachment` minus its
+ * display name, and it must keep EVERY verification field (`bytes`, `width`,
+ * `height`): the attachment store's `readImage` re-reads the stored object and
+ * rejects a reference whose recorded facts do not match the bytes, and a
+ * trimmed `{attachmentId, mediaType}` ref made every image turn fail with
+ * "Stored attachment metadata does not match its reference" (byteLength never
+ * equals `undefined`). The bytes themselves are fetched through the attachment
+ * service at upload time, not carried in the message.
+ *
+ * @param {ReadonlyArray<object>} messages
+ * @returns {Array<{ attachmentId: string, mediaType: string, bytes?: number, width?: number, height?: number, name?: string }>}
+ */
+export function imageRefs(messages) {
+  const refs = [];
+  const seen = new Set();
+  for (const message of messages) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type !== 'image') continue;
+      const ref = block.attachment;
+      if (ref === null || typeof ref !== 'object') continue;
+      const id = typeof ref.attachmentId === 'string' ? ref.attachmentId : '';
+      if (id === '' || seen.has(id)) continue;
+      seen.add(id);
+      refs.push({
+        attachmentId: id,
+        mediaType: typeof ref.mediaType === 'string' ? ref.mediaType : 'image/png',
+        bytes: typeof ref.bytes === 'number' ? ref.bytes : undefined,
+        width: typeof ref.width === 'number' ? ref.width : undefined,
+        height: typeof ref.height === 'number' ? ref.height : undefined,
+        name: typeof ref.name === 'string' && ref.name !== '' ? ref.name : undefined,
+      });
+    }
+  }
+  return refs;
 }
 
 /**
@@ -210,22 +284,6 @@ export function newestRealUser(messages) {
 }
 
 /**
- * The prompt the web endpoint receives.
- *
- * Exactly the newest human message — never the system prompt, never earlier
- * turns, never injected context. The web conversation keeps its own history, so
- * re-sending the transcript would duplicate it and drag harness internals into
- * the user's chats. A session whose first turn is the first human message needs
- * nothing older, and an imported conversation already holds its history on the
- * web side.
- *
- * @param {ReadonlyArray<object>} messages
- */
-function buildPrompt(messages) {
-  return newestRealUser(messages)?.text ?? '';
-}
-
-/**
  * Answer one auxiliary request locally.
  *
  * `session-title` wants a short label and `compaction` wants a condensed digest;
@@ -312,9 +370,25 @@ export class DeepSeekWebAdapter {
     });
   }
 
-  /** The web endpoint cannot accept request images. */
-  imageRequestPricing() {
-    return undefined;
+  /**
+   * Provider-side request-image pricing.
+   *
+   * The web product meters images on its own side (the upload reply carries
+   * `token_usage`), so DSH's meter should treat every retained occurrence as
+   * "model-visible, unknown cost" rather than estimating from pixels: the web
+   * endpoint never receives raw image bytes from us, only an id.
+   *
+   * @param {string} _provider
+   * @param {string} _model
+   */
+  imageRequestPricing(_provider, _model) {
+    return {
+      priceImages: (images) =>
+        images.map(({ offloaded }) => ({
+          visualTokens: 0,
+          text: offloaded === true ? '' : '[image uploaded to the web conversation]',
+        })),
+    };
   }
 
   /** @param {string} provider */
@@ -324,7 +398,9 @@ export class DeepSeekWebAdapter {
       id: entry.id,
       name: entry.name,
       description: entry.description,
-      inputModalities: ['text'],
+      // Images ride along as uploaded file references (`ref_file_ids`); the web
+      // product itself offers image input on every chat model.
+      inputModalities: ['text', 'image'],
     }));
   }
 
@@ -339,7 +415,7 @@ export class DeepSeekWebAdapter {
       id: entry.id,
       name: entry.name,
       description: entry.description,
-      inputModalities: ['text'],
+      inputModalities: ['text', 'image'],
       context: { contextWindow: 1_000_000 },
       defaultMaxTokens: 8192,
     };
@@ -357,16 +433,6 @@ export class DeepSeekWebAdapter {
     };
   }
 
-  /**
-   * Stream one reply.
-   *
-   * @param {{
-   *   provider: string, model: string,
-   *   messages: ReadonlyArray<object>, system?: string, purpose?: 'compaction' | 'session-title',
-   *   signal?: AbortSignal, sessionId?: string,
-   * }} options
-   * @returns {AsyncIterable<object>} harness `StreamChunk` values.
-   */
   /**
    * Re-read the web conversation's latest message id when the binding may be stale.
    *
@@ -401,6 +467,16 @@ export class DeepSeekWebAdapter {
     }
   }
 
+  /**
+   * Stream one reply.
+   *
+   * @param {{
+   *   provider: string, model: string,
+   *   messages: ReadonlyArray<object>, system?: string, purpose?: 'compaction' | 'session-title',
+   *   signal?: AbortSignal, sessionId?: string,
+   * }} options
+   * @returns {AsyncIterable<object>} harness `StreamChunk` values.
+   */
   async *stream(options) {
     // The loop also drives auxiliary calls — title generation and compaction —
     // through this same adapter. Forwarding them to the web product would mint a
@@ -416,14 +492,14 @@ export class DeepSeekWebAdapter {
     const entry = modelRow(options.model);
     const messages = Array.isArray(options.messages) ? options.messages : [];
 
+    // The prompt is exactly the newest human message — never the system prompt,
+    // never earlier turns, never injected context. The web conversation keeps
+    // its own history, so re-sending the transcript would duplicate it and drag
+    // harness internals into the user's chats. An imported conversation already
+    // holds its history on the web side.
     const newest = newestRealUser(messages);
-    if (newest === null) {
-      yield { type: 'finish', reason: { kind: 'stop' } };
-      return;
-    }
-
-    const prompt = buildPrompt(messages);
-    if (prompt === '') {
+    const prompt = newest?.text ?? '';
+    if (newest === null || prompt === '') {
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
@@ -467,6 +543,48 @@ export class DeepSeekWebAdapter {
       binding = await this.refreshParent(binding);
     }
 
+    // Upload the turn's images, if any, before the completion POST. The web
+    // endpoint takes images as `ref_file_ids` — ids from a prior upload — so
+    // nothing model-visible happens until the completion call itself. Every
+    // failure here is therefore `submitted: false`: the turn may retry whole.
+    /** @type {string[]} */
+    let refFileIds = [];
+    const refs = imageRefs(messages);
+    if (refs.length > 0) {
+      const readImage = this.deps.readImage;
+      if (typeof readImage !== 'function') {
+        const error = new Error('deepseek-web: image input needs the attachment service, which is unavailable');
+        error.submitted = false;
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+        yield finishError(error);
+        return;
+      }
+      try {
+        for (const ref of refs) {
+          const stored = await readImage(ref);
+          const fileId = await this.deps.api.uploadImage({
+            bytes: stored.data,
+            mediaType: ref.mediaType,
+            fileName: uploadFileName(ref.name, ref.mediaType),
+            thinking: entry.thinking,
+            signal: options.signal,
+          });
+          refFileIds.push(fileId);
+        }
+      } catch (error) {
+        // Nothing reached the model — uploads precede the completion POST.
+        error.submitted = false;
+        // The failure surfaces to the user as a bare turn error; log the cause
+        // here so the Host log shows WHY the upload did not go through.
+        this.deps.warn?.(
+          `deepseek-web: image upload failed before the prompt was sent (${error instanceof Error ? error.message : String(error)})`,
+        );
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+        yield finishError(error);
+        return;
+      }
+    }
+
     let reasoningIndex = -1;
     let textIndex = -1;
     let reasoningText = '';
@@ -484,6 +602,7 @@ export class DeepSeekWebAdapter {
         parentMessageId: binding.parentMessageId,
         thinking: entry.thinking,
         search: entry.search === true,
+        refFileIds,
         signal: options.signal,
       })) {
         if (event.kind === 'message') {
@@ -579,18 +698,27 @@ export class DeepSeekWebAdapter {
   }
 }
 
-/** Map a transport failure onto a terminal `finish` chunk. */
+/**
+ * Map a transport failure onto a terminal `finish` chunk.
+ *
+ * The harness validates every chunk as lossless JSON, and its walker rejects an
+ * object graph containing an `undefined` property value — a `status: undefined`
+ * here would replace the real failure with "Assistant stream chunk must be
+ * losslessly JSON-serializable". Optional fields are therefore omitted, never
+ * set to `undefined`.
+ */
 function finishError(error) {
   const isWeb = error instanceof DeepSeekWebError;
+  const failure = {
+    message: error instanceof Error ? error.message : String(error),
+    code: isWeb ? error.code : 'TRANSPORT',
+  };
+  if (isWeb && error.status !== undefined) failure.status = error.status;
   return {
     type: 'finish',
     reason: {
       kind: 'error',
-      failure: {
-        message: error instanceof Error ? error.message : String(error),
-        code: isWeb ? error.code : 'TRANSPORT',
-        status: isWeb ? error.status : undefined,
-      },
+      failure,
     },
   };
 }

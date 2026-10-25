@@ -33,6 +33,7 @@ import {
 } from './src/store.js';
 import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
 import { readJsonBody, sendJson } from './src/http.js';
+import { readFile } from 'node:fs/promises';
 import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
 
 export { isToolAllowedInWebSession } from './src/tool-guard.js';
@@ -45,6 +46,9 @@ export const inject = ['llm'];
 
 /** Same-origin route prefix owned by this plugin. */
 export const API_PREFIX = '/dsh-deepseek-web/api';
+
+/** The model rows the settings page renders; built once, it is constant data. */
+const MODEL_SUMMARY = MODELS.map((entry) => ({ id: entry.id, name: entry.name, description: entry.description }));
 
 /** How many per-conversation failures one sync report carries. */
 const MAX_REPORTED_ERRORS = 5;
@@ -166,8 +170,6 @@ export async function apply(ctx, config = {}) {
   // ── adapter ───────────────────────────────────────────────────────────────
   /** Sessions already prompted, so one turn cannot re-ask the model. */
   const promptedMessages = new Map();
-  /** Sessions using this provider, used by the file-write guard. */
-  const webSessions = new Set();
 
   const adapter = new DeepSeekWebAdapter({
     api,
@@ -180,7 +182,6 @@ export async function apply(ctx, config = {}) {
       // keeping the two records separate changes nothing about repeated passes
       // and stops an undo from deleting a conversation the user started here.
       store.setBinding(sessionId, binding);
-      webSessions.add(sessionId);
     },
     updateBinding: (sessionId, patch) => {
       const current = store.binding(sessionId);
@@ -188,7 +189,6 @@ export async function apply(ctx, config = {}) {
       store.setBinding(sessionId, { ...current, ...patch });
     },
     noteSent: (sessionId, messageId) => {
-      webSessions.add(sessionId);
       let seen = promptedMessages.get(sessionId);
       if (seen === undefined) {
         seen = new Set();
@@ -214,6 +214,44 @@ export async function apply(ctx, config = {}) {
     },
     warn,
   });
+
+  // Image uploads read bytes out of the Host's attachment store. The service is
+  // resolved lazily: the adapter only touches it for turns that actually carry
+  // images, and a missing service degrades to a clear per-turn error instead of
+  // failing plugin load on deployments that mount no attachment store.
+  adapter.deps.readImage = async (ref) => {
+    const attachments = ctx.get('attachments');
+    if (attachments?.readImage === undefined) {
+      throw new Error('deepseek-web: no attachment service is mounted');
+    }
+    try {
+      return await attachments.readImage(ref);
+    } catch (error) {
+      // The store validates stored bytes against the reference; when that fails,
+      // record both sides so the log shows WHICH field disagreed.
+      if (error instanceof Error && error.message.includes('does not match')) {
+        let actual = '(unreadable)';
+        try {
+          const hostPath = attachments.imageHostPath?.(ref);
+          if (typeof hostPath === 'string') {
+            const data = await readFile(hostPath);
+            actual = `${data.length} bytes, header ${data.subarray(0, 3).toString('hex')}`;
+          }
+        } catch {
+          /* the diagnostic must not mask the original error */
+        }
+        warn(
+          `deepseek-web: attachment ${ref.attachmentId} ref=${JSON.stringify({
+            mediaType: ref.mediaType,
+            bytes: ref.bytes,
+            width: ref.width,
+            height: ref.height,
+          })} stored=${actual}`,
+        );
+      }
+      throw error;
+    }
+  };
 
   // Both registrations are fiber-owned: their handles unwind with this plugin.
   ctx.llm.registerAdapter([PROVIDER], adapter);
@@ -454,7 +492,6 @@ export async function apply(ctx, config = {}) {
             // Provenance: this one was pulled FROM the web, so undo may delete it.
             origin: 'imported',
           });
-          webSessions.add(dshSessionId);
           report.imported++;
         } catch (error) {
           report.failed++;
@@ -631,7 +668,7 @@ export async function apply(ctx, config = {}) {
               sendJson(res, 200, {
                 plugin: name,
                 provider: PROVIDER,
-                models: MODELS.map((entry) => ({ id: entry.id, name: entry.name, description: entry.description })),
+                models: MODEL_SUMMARY,
                 workspaceTitle: WORKSPACE_TITLE,
                 workspaceId: store.state.workspaceId,
                 conversationDir: directory,

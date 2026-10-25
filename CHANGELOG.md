@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.1 — 2026-10-25
+
+图片输入修复 + 一轮精简。功能无变化。
+
+- **修复带图消息必然失败的问题**：`imageRefs()` 原来把附件引用裁剪成 `{attachmentId, mediaType, name}` 再传给附件服务的 `readImage`，而本地附件存储（`dsh-attachment-local`）读取时会**重新探测存储对象**并逐字段核对引用里的 `mediaType/bytes/width/height`——被裁掉的 `bytes/width/height` 变成 `undefined`，`data.byteLength !== undefined` 恒成立，于是每一次带图消息都以 `Stored attachment metadata does not match its reference`（`ATTACHMENT_CORRUPT`）被拒。现在引用原样携带全部验证字段，只有显示名会被规整。回归测试断言附件服务收到完整引用。
+- error finish chunk 不再携带 `undefined` 的 `status`（harness 的 JSON walker 会拒绝，真实错误被序列化错误掩盖）
+- 导入的会话种子补上带 id、带 `system-prompt` source 的 protected system head（否则第一条真实 system/message 会把整个 session log 判为损坏）
+- **PoW 求解器去掉每轮的 scratch 清零**：三个 `fill(0)` 在每轮 Keccak 置换后执行，但 scratch 缓冲在下一轮被读取前总会被完全重写——清零是纯开销。一次 solve 跑约 15 万次候选 × 23 轮 × 136 字节块，这是热路径里可测的浪费。删除后对真实挑战向量（`9ca9fc17…`，答案 121636）行为逐位一致。
+- **删除死代码**：`webSessions` Set（4 处写入、0 处读取，其注释宣称的职责已由 durable binding ledger 承担）与 `StateStore.importedBySession()`（无调用方）。
+- **设置页 status 路由的模型列表提为模块级常量**：常量数据不再每次请求重建。
+- `adapter.stream()` 里 `newestRealUser` 的重复遍历合并为一次（`buildPrompt` 就是同一次遍历的包装）。
+- **上传文件名必须带与声明类型一致的扩展名**（实测发现）：网页端按文件名扩展判断文件类型，`ref.name` 无扩展名或扩展名与 `mediaType` 不符（改名保存的 `.png` 实为 WebP 之类）会被拒为 `unsupported file type`。现在这样的名字会被替换为生成的 `image.<ext>`，名字与类型一致时保留原名。
+- 新增 `test/live-image.mjs`（`npm run test:live` 的一部分）：用真实凭证走完 上传 → 解析等待 → 带 `ref_file_ids` 的 completion 全链路，实测验证 PoW 求解器与上传链路。
+- 删除 `test/__surfaces.mjs`：引用本机绝对路径的一次性诊断脚本，不属于测试套件。
+
+## 0.2.0 — 2026-10-24
+
+支持图片输入。
+
+在 DSH 里用「DeepSeek 网页版」模型的对话可以直接贴图了。图片走网页端自己的上传接口（`POST /api/v0/file/upload_file`，为该端点单独解一次 PoW），上传后轮询解析状态，拿到文件 id 随 `ref_file_ids` 一起进入 completion——与浏览器端的请求形状一致。
+
+- 图片存在网页对话里，不在本地落盘
+- 解析未完成时发送会被拒（HTTP 422），所以上传后等到 `SUCCESS` 才继续；等待上限 60 秒
+- 上传/解析失败都发生在 completion 之前，整轮可以安全重试
+- 声明 `inputModalities: ["text", "image"]`，Host 不再在入口处拒绝带图消息
+- 附件服务未挂载的部署上，带图消息明确报错，纯文本不受影响
+
+
 ## 0.1.20 — 2026-10-23
 
 同步范围从「本周」改为**最近 7 个自然日**。

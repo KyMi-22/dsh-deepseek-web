@@ -22,8 +22,8 @@ DSH 会话 ──► deepseek-web provider ──► chat.deepseek.com
 |---|---|
 | `index.js` | Host 入口：注册 provider、同步引擎、设置页路由、工具拦截 |
 | `client.js` | 浏览器半边：设置页 |
-| `src/api.js` | `/api/v0` 客户端：分页、历史、建会话、SSE 解析、错误分类 |
-| `src/adapter.js` | provider 适配：message → prompt，SSE → `StreamChunk` |
+| `src/api.js` | `/api/v0` 客户端：分页、历史、建会话、图片上传、SSE 解析、错误分类 |
+| `src/adapter.js` | provider 适配：message → prompt，图片引用收集，SSE → `StreamChunk` |
 | `src/sync.js` | 网页对话 → 种子会话；工作区；撤销 |
 | `src/store.js` | 插件状态（token、绑定、账本），原子写入 |
 | `src/pow.js` | `DeepSeekHashV1` 求解器 |
@@ -125,6 +125,20 @@ ctx.on('session/event', (session, event) => {
 网页端发消息要过 PoW 挑战。`DeepSeekHashV1` 是自定义 Keccak 变体：lane 的 32 位两半互换、23 轮、自定义 rho/pi 表——**不是**标准 SHA3-256。求解器照 worker 逐字移植。
 
 求解是一秒量级的紧循环，跑在 Host 线程上会卡住所有其它会话，所以放进 worker 线程（`pow-async.js`），worker 不可用时回退到进程内并记一次告警。每次求解新建 worker：复用线程能省 30–50 ms 启动，但要回答"线程求解中途死了，排队的人怎么办"，半死的线程池比慢一点的开机更糟。
+
+置换的 scratch 缓冲（`C`/`D`/`W`）**不做轮间清零**：theta 在读之前写满 `C` 和 `D`，rhoPi/chi 重写它们消费的内容，清零是纯开销。一次 solve 大约 15 万候选 × 23 轮 × 136 字节块，这是包里最热的循环。正确性由 `pow.test.mjs` 里钉住的真实挑战向量（服务端签发并已解出答案的那一条）保证——算法漂移会立刻被它抓住。
+
+## 图片上传
+
+带图消息在 completion 之前走三步：`readImage`（附件存储校验读取）→ `upload_file`（该端点单独解一次 PoW）→ 轮询 `fetch_files` 等解析离开 `PENDING`。上传拿到的是文件 id，随 `ref_file_ids` 进入 completion——与浏览器端的请求形状一致。
+
+两个容易踩的坑：
+
+- **附件引用必须原样传递**。`ImageBlock.attachment` 里的 `bytes/width/height` 不是装饰信息：本地附件存储读取时会重新探测存储对象，逐字段核对引用（`mediaType`、`bytes`、`width`、`height`），缺一个字段就是 `ATTACHMENT_CORRUPT`。0.2.0 曾把引用裁剪成 `{attachmentId, mediaType, name}`，导致每条带图消息在上传前就被拒。
+- **上传文件名按扩展名校验**。端点用文件名的扩展判断类型：无扩展名、或扩展名与 `mediaType` 不符（改名保存的文件常这样）都会被拒为 `unsupported file type`。适配器只保留与声明类型一致的名字，其余重新生成为 `image.<ext>`。
+- **解析未完成就发送会被拒**（HTTP 422），所以等到 `SUCCESS` 才继续；等待上限 60 秒，轮询间隔 1.2 秒。全部失败都发生在 completion 之前，整轮可以安全重试。
+
+网页端对图片自行计量（上传响应带 `token_usage`），DSH 侧把保留出现的图片计为「模型可见、成本未知」（`imageRequestPricing` 返回 `visualTokens: 0`），不从像素估算。
 
 ## token
 

@@ -237,6 +237,8 @@ export function buildSeedEvents(messages, meta) {
   let turnOpen = false;
   let headerSent = false;
   let titleSent = false;
+  /** Whether the protected system head has been seeded. */
+  let systemSent = false;
 
   /** Append one event with the next sequence number. */
   const push = (type, time, data, surfaceOp) => {
@@ -245,6 +247,31 @@ export function buildSeedEvents(messages, meta) {
     if (surfaceOp !== undefined) event.surfaceOp = surfaceOp;
     events.push(event);
     return seq - 1;
+  };
+
+  /**
+   * Seed the protected system head, once, at the very front of the surface.
+   *
+   * The v4 log format expects a session's FIRST surface event to be a
+   * `system/message` ("protected head"). When a later turn appends another
+   * system message — the live loop does this every step — a surface that
+   * started with user content has no protected head, and the reader rejects
+   * the whole log as corrupt ("system/message requires a protected first
+   * surface head"). Seeding one makes every subsequent append legal.
+   */
+  const ensureSystemHead = (time) => {
+    if (systemSent) return;
+    systemSent = true;
+    push('system/message', time, {
+      turn: 1,
+      step: 1,
+      message: {
+        id: randomUUID(),
+        role: 'system',
+        content: [{ type: 'text', text: `Imported from the DeepSeek web product. Original model: ${model}.` }],
+        source: { kind: 'system-prompt' },
+      },
+    }, 'append');
   };
 
   /** Open a turn and its single step. */
@@ -273,6 +300,7 @@ export function buildSeedEvents(messages, meta) {
       if (text === '') continue;
       closeTurn(time);
       openTurn(time);
+      ensureSystemHead(time);
       const userSeq = push('user/message', time, {
         id: randomUUID(),
         role: 'user',
