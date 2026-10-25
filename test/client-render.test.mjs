@@ -96,6 +96,7 @@ function textOf(tree) {
 }
 
 // ── run the bundle in a sandbox ─────────────────────────────────────────────
+const registrations = [];
 let registration = null;
 const fakeCtx = {
   slots: {
@@ -105,6 +106,7 @@ const fakeCtx = {
     },
     register(options, Component) {
       registration = { options, Component };
+      registrations.push(registration);
       return () => {};
     },
   },
@@ -173,7 +175,7 @@ fn(sandbox.window, sandbox.document, sandbox.console, sandbox.fetch, URL, Date, 
 const exportsObj = sandbox.__exports;
 assert.ok(exportsObj, 'factory ran and produced exports');
 assert.equal(typeof exportsObj.apply, 'function', 'apply exported');
-assert.deepEqual(exportsObj.inject, ['slots', 'locale'], 'inject list');
+assert.deepEqual(exportsObj.inject, ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight'], 'inject list');
 
 // ── apply registers one settings page ──────────────────────────────────────
 exportsObj.apply(fakeCtx);
@@ -182,7 +184,6 @@ assert.equal(registration.options.name, 'settings.section');
 assert.equal(registration.options.id, 'deepseek-web');
 assert.equal(registration.options.order, 120);
 assert.ok(registration.options.label, 'has a label');
-
 const Page = registration.Component;
 assert.equal(typeof Page, 'function', 'registered value is a component');
 
@@ -233,6 +234,70 @@ assert.equal(typeof Page, 'function', 'registered value is a component');
   // The auto-sync cadence is visible, so a user can tell why the sidebar lags.
   assert.ok(text.includes('自动同步'), 'the auto-sync row renders');
   assert.ok(text.includes('每 5 分钟'), 'the interval is shown in minutes');
+}
+
+// ── quick-ask: without the sidebar services only the settings page registers ─
+{
+  // fakeCtx has no sidebarRight/sidebarRightTabs, so accessing them throws —
+  // exactly what the guarded lookup in apply() must survive.
+  registration = null;
+  registrations.length = 0;
+  exportsObj.apply(fakeCtx);
+  const names = registrations.map((row) => row.options.name);
+  assert.deepEqual(names, ['settings.section'], 'no sidebar services → settings page only');
+}
+
+// ── quick-ask: with the sidebar services the panel registers too ────────────
+{
+  const tabTypes = [];
+  let opened = null;
+  const sidebarCtx = {
+    ...fakeCtx,
+    effect(labelOrRun, maybeRun) {
+      // The tab type registers through ctx.effect(label, run); run it
+      // immediately so the test registry sees the definition.
+      const run = typeof maybeRun === 'function' ? maybeRun : labelOrRun;
+      if (typeof run === 'function') run();
+      return () => {};
+    },
+    sidebarRightTabs: {
+      register(definition) {
+        tabTypes.push(definition);
+        return () => {};
+      },
+    },
+    sidebarRight: {
+      openTab(kind, options) { opened = { kind, options }; },
+    },
+  };
+  // The bundle reads services off the context object directly (Cordis inject),
+  // so plain properties are enough.
+  registration = null;
+  registrations.length = 0;
+  exportsObj.apply(sidebarCtx);
+  const names = registrations.map((row) => row.options.name);
+  assert.ok(names.includes('settings.section'), 'settings page still registers');
+  assert.ok(names.includes('sidebar.right.pane.tab'), 'the panel body registers under the tab key');
+  assert.ok(names.includes('conversation.session.header.utilities'), 'the header entry button registers');
+
+  // The tab type: one quick-ask kind, titled from the dictionary.
+  assert.equal(tabTypes.length, 1, 'one tab type');
+  assert.equal(tabTypes[0].kind, 'deepseek-web-quick-ask');
+  assert.equal(typeof tabTypes[0].title(), 'string');
+  assert.ok(tabTypes[0].title().length > 0, 'the tab has a title');
+
+  // The entry button opens the panel tab in the right sidebar.
+  const entry = registrations.find((row) => row.options.name === 'conversation.session.header.utilities');
+  const button = entry.Component({ sessionId: 's1' });
+  assert.equal(button.type, 'button', 'the entry renders a button');
+  assert.ok(button.props['aria-label'].includes('快捷侧问'), 'the entry is labelled');
+  button.props.onClick();
+  assert.deepEqual(opened, { kind: 'deepseek-web-quick-ask', options: { preferNewPane: true } });
+
+  // The panel body renders its loading state without throwing.
+  const panel = registrations.find((row) => row.options.name === 'sidebar.right.pane.tab');
+  const tree = panel.Component({ sessionId: 's1' });
+  assert.ok(tree !== null && typeof tree === 'object', 'the panel renders');
 }
 
 console.log('\nclient-render.test.mjs: all assertions passed');

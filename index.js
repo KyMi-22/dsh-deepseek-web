@@ -35,6 +35,7 @@ import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, 
 import { readJsonBody, sendJson } from './src/http.js';
 import { readFile } from 'node:fs/promises';
 import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
+import { QuickAsk } from './src/quick-ask.js';
 
 export { isToolAllowedInWebSession } from './src/tool-guard.js';
 
@@ -631,6 +632,16 @@ export async function apply(ctx, config = {}) {
   }
 
   // ── settings route ────────────────────────────────────────────────────────
+  // Quick-ask controller: one instance per mount, sharing the credential and
+  // the state store with the adapter. The persistence service is resolved on
+  // use (like the workspace registry) because it may mount after this plugin.
+  const quickAsk = new QuickAsk({
+    api,
+    store,
+    persistence: () => ctx.get('sessionPersistence'),
+    warn,
+  });
+
   const webServer = ctx.get('webServer');
   if (webServer?.register !== undefined) {
     ctx.effect(() =>
@@ -829,6 +840,69 @@ export async function apply(ctx, config = {}) {
               } catch (error) {
                 sendJson(res, 200, { ok: false, detail: String(error?.message ?? error) });
               }
+              return;
+            }
+            // ── quick-ask panel routes ───────────────────────────────────────
+            if (req.method === 'GET' && route === '/quick-ask/status') {
+              const sessionId = url.searchParams.get('sessionId') ?? '';
+              if (sessionId === '') {
+                sendJson(res, 400, { ok: false, error: 'missing-session' });
+                return;
+              }
+              sendJson(res, 200, await quickAsk.status(sessionId));
+              return;
+            }
+            if (req.method === 'POST' && route === '/quick-ask/reset') {
+              const body = await readJsonBody(req);
+              const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+              if (sessionId === '') {
+                sendJson(res, 400, { ok: false, error: 'missing-session' });
+                return;
+              }
+              if (!api.ready) {
+                sendJson(res, 409, { ok: false, error: 'no-token' });
+                return;
+              }
+              try {
+                const thread = await quickAsk.refreshThread(sessionId);
+                sendJson(res, 200, { ok: true, exchanges: thread.exchanges.map((row) => ({ ...row })) });
+              } catch (error) {
+                sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+              }
+              return;
+            }
+            if (req.method === 'POST' && route === '/quick-ask/send') {
+              const body = await readJsonBody(req);
+              const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+              const prompt = typeof body.prompt === 'string' ? body.prompt : '';
+              if (sessionId === '' || prompt.trim() === '') {
+                sendJson(res, 400, { ok: false, error: 'missing-session-or-prompt' });
+                return;
+              }
+              if (!api.ready) {
+                sendJson(res, 409, { ok: false, error: 'no-token' });
+                return;
+              }
+              // The generation is cancelled by the request aborting; forward it.
+              const abort = new AbortController();
+              req.on('close', () => abort.abort());
+              res.writeHead(200, {
+                'content-type': 'text/event-stream; charset=utf-8',
+                'cache-control': 'no-store',
+                connection: 'keep-alive',
+              });
+              try {
+                for await (const event of quickAsk.stream(sessionId, prompt, {
+                  thinking: body.thinking === true,
+                  search: body.search === true,
+                  signal: abort.signal,
+                })) {
+                  res.write(`data: ${JSON.stringify(event)}\n\n`);
+                }
+              } catch (error) {
+                res.write(`data: ${JSON.stringify({ kind: 'error', message: String(error?.message ?? error) })}\n\n`);
+              }
+              res.end();
               return;
             }
             sendJson(res, 404, { ok: false, error: 'not-found' });

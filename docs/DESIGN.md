@@ -20,17 +20,18 @@ DSH 会话 ──► deepseek-web provider ──► chat.deepseek.com
 
 | 文件 | 职责 |
 |---|---|
-| `index.js` | Host 入口：注册 provider、同步引擎、设置页路由、工具拦截 |
-| `client.js` | 浏览器半边：设置页 |
+| `index.js` | Host 入口：注册 provider、同步引擎、设置页路由、快捷侧问路由、工具拦截 |
+| `client.js` | 浏览器半边：设置页 + 快捷侧问面板（右栏 tab 与入口按钮） |
 | `src/api.js` | `/api/v0` 客户端：分页、历史、建会话、图片上传、SSE 解析、错误分类 |
 | `src/adapter.js` | provider 适配：message → prompt，图片引用收集，SSE → `StreamChunk` |
 | `src/sync.js` | 网页对话 → 种子会话；工作区；撤销 |
-| `src/store.js` | 插件状态（token、绑定、账本），原子写入 |
+| `src/store.js` | 插件状态（token、绑定、账本、侧问线程），原子写入 |
 | `src/pow.js` | `DeepSeekHashV1` 求解器 |
 | `src/pow-async.js` | 求解放到 worker 线程，带进程内回退 |
 | `src/pow-worker.js` | worker 入口 |
 | `src/http.js` | 设置页路由用的 JSON / 请求体工具 |
 | `src/tool-guard.js` | 网页版会话的工具白名单 |
+| `src/quick-ask.js` | 快捷侧问：压缩背景、每会话一条网页线程、SSE 泵 |
 
 ## 为什么是「工作区」
 
@@ -191,3 +192,14 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 `src/tool-guard.js` 是白名单，不是黑名单。插件承诺「网页版对话不写本地文件」，黑名单保不住这个承诺——组合里新增一个工具，名单就静默失效一次。早期的黑名单漏了 `pwsh`（任意命令）和 `plugin_manager`（安装代码）。
 
 网页版对话本来也不会发起工具调用（接口没有通道），所以拒绝未知工具没有代价。
+
+## 快捷侧问
+
+「用内置模型聊到一半，切网页模型问个小问题」的老办法有两个代价：网页端得到一个只有一句的孤立对话，DSH 原对话的上下文又被这轮往返撑长。快捷侧问把这两个问题一起解掉：问答发生在一个**独立的右栏面板**里，背景是原对话的**压缩摘要**，原对话的日志一个字节都不动。
+
+- **入口**：会话头部 `conversation.session.header.utilities` 席位里的常驻按钮（三点按钮旁边）。菜单项本身（`session-log-export` 的「更多操作」）没有扩展席位，塞不进去。
+- **面板**：`ctx.sidebarRightTabs.register` + `sidebar.right.pane.tab` 正文注册，走文档预览同款的公开两级路径；`ctx.sidebarRight.openTab(kind, { preferNewPane: true })` 打开并展开右栏。右栏布局本就按会话隔离，侧问线程与面板天然同生命周期。
+- **线程**：每个 DSH 会话**一条**网页对话，首次提问时创建并把压缩背景作为第一条消息发过去（`parent_message_id` 续链）。线程记录落在 `state.json` 的 `quickAsk`，重开面板可续聊。「刷新背景」丢弃当前线程、用最新压缩重建——旧网页对话不删（已属网页产品），只是不再引用。
+- **压缩**：规则压缩，零成本、确定性。读 `sessionPersistence` 的只读句柄取会话日志，过滤出人类输入（`source.kind === 'user'`，剔除 harness 注入的运行时上下文）与助手回答（丢推理块和工具流量），从最新往回装进 12000 字符预算，每轮截 1600 字符，被裁掉的轮数以一行标注。
+- **数据面**：`/quick-ask/status`（面板状态）、`/quick-ask/reset`（换线程）、`/quick-ask/send`（SSE 流式回复，请求断开即中止生成）。问答记录只进 `quickAsk` 账本，**不写会话日志**——这是整个功能的存在理由。
+- **失败语义**：创建线程（PoW、建会话、发背景）失败时面板报错、不落线程记录，可整轮重试；回复流中断则保留已到手的片段，父消息标记不动，避免重试分叉出两条回答。

@@ -146,6 +146,21 @@ window.__ModuleLoader__.load({
         'time.minutes': '{n} 分钟前',
         'time.hours': '{n} 小时前',
         'time.days': '{n} 天前',
+        'qa.tab.title': '快捷侧问',
+        'qa.entry.label': '快捷侧问（DeepSeek 网页版）',
+        'qa.title': '快捷侧问',
+        'qa.hint': '在这里向 DeepSeek 网页版提问。面板打开时已把当前对话压缩成背景发给它；问答只留在这个面板里，不会写进当前对话。',
+        'qa.placeholder': '问点什么…（Enter 发送，Shift+Enter 换行）',
+        'qa.send': '发送',
+        'qa.reset': '刷新背景',
+        'qa.resetHint': '丢弃当前侧问线程，用当前对话的最新内容重新生成压缩背景。',
+        'qa.noToken': '尚未配置 user token：到 设置 → DeepSeek 网页版 保存后再来。',
+        'qa.empty': '还没有提问，直接输入即可。',
+        'qa.context': '背景 {chars} 字',
+        'qa.contextNone': '无背景（当前对话还没有内容）',
+        'qa.error': '出错了：{message}',
+        'qa.streamError': '回复中断：{message}',
+        'qa.busy': '上一条回复还在进行中',
       },
       en: {
         'nav': 'DeepSeek Web',
@@ -224,6 +239,21 @@ window.__ModuleLoader__.load({
         'time.minutes': '{n} min ago',
         'time.hours': '{n} h ago',
         'time.days': '{n} d ago',
+        'qa.tab.title': 'Quick ask',
+        'qa.entry.label': 'Quick ask (DeepSeek Web)',
+        'qa.title': 'Quick ask',
+        'qa.hint': 'Ask the DeepSeek web model here. The panel seeds a throwaway web thread with a compressed digest of this conversation when it opens; the exchange stays in this panel and never enters the conversation.',
+        'qa.placeholder': 'Ask anything… (Enter to send, Shift+Enter for newline)',
+        'qa.send': 'Send',
+        'qa.reset': 'Refresh context',
+        'qa.resetHint': 'Drop the current side thread and reseed it with the latest digest of this conversation.',
+        'qa.noToken': 'No user token yet: save one in Settings → DeepSeek Web first.',
+        'qa.empty': 'Nothing asked yet — type below.',
+        'qa.context': '{chars} chars of context',
+        'qa.contextNone': 'No context (this conversation is still empty)',
+        'qa.error': 'Failed: {message}',
+        'qa.streamError': 'Reply interrupted: {message}',
+        'qa.busy': 'A reply is still streaming',
       },
     };
 
@@ -727,7 +757,236 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    const inject = ['slots', 'locale'];
+    /**
+     * The quick-ask panel body: a throwaway Q&A thread about the current
+     * conversation, answered on the web model. Renders the persisted
+     * transcript, streams the in-flight reply, and never writes anything back
+     * into the conversation.
+     */
+    function QuickAskPanel({ sessionId }) {
+      const [status, setStatus] = useState(null);
+      const [draft, setDraft] = useState('');
+      const [busy, setBusy] = useState(false);
+      const [live, setLive] = useState(null);
+      const [notice, setNotice] = useState(null);
+      const [localeId] = useState(
+        (() => {
+          try {
+            const lang = String(document.documentElement?.lang ?? '');
+            return lang.toLowerCase().startsWith('zh') ? 'zh' : 'en';
+          } catch {
+            return 'zh';
+          }
+        })(),
+      );
+      const t = useCallback(
+        (key, values) => {
+          const dictionary = dictionaries[localeId] ?? dictionaries.zh;
+          return format(dictionary[key] ?? key, values);
+        },
+        [localeId],
+      );
+
+      const refresh = useCallback(async () => {
+        try {
+          const response = await fetch(`${API_PATH}/quick-ask/status?sessionId=${encodeURIComponent(sessionId)}`, { credentials: 'same-origin' });
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          setStatus(await response.json());
+        } catch (error) {
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        }
+      }, [sessionId, t]);
+
+      useEffect(() => {
+        refresh();
+      }, [refresh]);
+
+      /**
+       * Send one question and consume the SSE reply.
+       *
+       * The stream carries the answer fragments as they arrive; a premature
+       * close or error keeps the partial text visible with a notice.
+       */
+      const send = useCallback(async () => {
+        const prompt = draft.trim();
+        if (prompt === '' || busy) return;
+        setBusy(true);
+        setNotice(null);
+        setLive({ answer: '', reasoning: '' });
+        setDraft('');
+        try {
+          const response = await fetch(`${API_PATH}/quick-ask/send`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, prompt }),
+          });
+          if (!response.ok || response.body === null) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.error || `HTTP ${response.status}`);
+          }
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let index;
+            while ((index = buffer.indexOf('\n\n')) >= 0) {
+              const frame = buffer.slice(0, index);
+              buffer = buffer.slice(index + 2);
+              const line = frame.split('\n').find((row) => row.startsWith('data:'));
+              if (line === undefined) continue;
+              let event;
+              try {
+                event = JSON.parse(line.slice(5).trim());
+              } catch {
+                continue;
+              }
+              if (event.kind === 'answer' || event.kind === 'reasoning') {
+                setLive((prev) => (prev === null ? prev : { ...prev, [event.kind === 'answer' ? 'answer' : 'reasoning']: (prev[event.kind === 'answer' ? 'answer' : 'reasoning'] ?? '') + event.text }));
+              } else if (event.kind === 'error') {
+                setNotice({ kind: 'bad', text: t('qa.streamError', { message: event.message || '?' }) });
+              }
+            }
+          }
+        } catch (error) {
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        } finally {
+          setBusy(false);
+          setLive(null);
+          await refresh();
+        }
+      }, [sessionId, draft, busy, t]);
+
+      const reset = useCallback(async () => {
+        setBusy(true);
+        setNotice(null);
+        try {
+          const response = await fetch(`${API_PATH}/quick-ask/reset`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+          });
+          const body = await response.json().catch(() => ({}));
+          if (!body.ok) throw new Error(body.error || `HTTP ${response.status}`);
+          await refresh();
+        } catch (error) {
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        } finally {
+          setBusy(false);
+        }
+      }, [sessionId, refresh, t]);
+
+      if (status !== null && status.ready === false) {
+        return h('div', { style: qaStyles.root }, h('div', { style: styles.hint }, t('qa.noToken')));
+      }
+
+      const exchanges = status === null ? [] : Array.isArray(status.exchanges) ? status.exchanges : [];
+      const rows = exchanges.slice();
+      if (live !== null) {
+        rows.push({ role: 'user', text: '' });
+        rows.push({ role: 'assistant', text: live.answer || live.reasoning || '…' });
+      }
+
+      return h('div', { style: qaStyles.root }, [
+        h('div', { key: 'head', style: qaStyles.head }, [
+          h('div', { key: 'hint', style: styles.hint }, t('qa.hint')),
+          h('div', { key: 'meta', style: qaStyles.meta },
+            status !== null
+              ? (status.contextChars > 0 ? t('qa.context', { chars: status.contextChars }) : t('qa.contextNone'))
+              : ''),
+          h('button', {
+            key: 'reset',
+            style: styles.button,
+            type: 'button',
+            title: t('qa.resetHint'),
+            disabled: busy || (status !== null && !status.hasThread),
+            onClick: reset,
+          }, t('qa.reset')),
+        ]),
+        notice === null ? null : h('div', { key: 'notice', style: { ...styles.notice, ...(notice.kind === 'ok' ? styles.ok : styles.bad) } }, notice.text),
+        h('div', { key: 'list', style: qaStyles.list },
+          rows.length === 0 && live === null
+            ? h('div', { key: 'empty', style: styles.hint }, t('qa.empty'))
+            : rows.map((row, index) => h('div', {
+                key: String(index),
+                style: row.role === 'user' ? qaStyles.bubbleUser : qaStyles.bubbleAssistant,
+              }, row.text))),
+        h('div', { key: 'input', style: qaStyles.inputRow }, [
+          h('textarea', {
+            key: 'text',
+            style: qaStyles.textarea,
+            rows: 2,
+            placeholder: t('qa.placeholder'),
+            value: draft,
+            disabled: busy,
+            onChange: (event) => setDraft(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent?.isComposing) {
+                event.preventDefault();
+                send();
+              }
+            },
+          }),
+          h('button', {
+            key: 'send',
+            style: styles.buttonPrimary,
+            type: 'button',
+            disabled: busy || draft.trim() === '',
+            onClick: send,
+          }, t('qa.send')),
+        ]),
+      ]);
+    }
+
+    /** Inline styles for the quick-ask panel (a column, not a settings page). */
+    const qaStyles = {
+      root: { display: 'flex', flexDirection: 'column', gap: '10px', height: '100%', minHeight: 0, padding: '12px', boxSizing: 'border-box' },
+      head: { display: 'flex', flexDirection: 'column', gap: '6px', flex: 'none' },
+      meta: { fontSize: '11.5px', opacity: 0.55 },
+      list: { display: 'flex', flexDirection: 'column', gap: '8px', flex: '1 1 auto', minHeight: 0, overflowY: 'auto' },
+      bubbleUser: {
+        alignSelf: 'flex-end',
+        maxWidth: '86%',
+        padding: '8px 12px',
+        borderRadius: '12px',
+        background: 'rgba(77, 107, 254, 0.16)',
+        fontSize: '13px',
+        lineHeight: 1.6,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+      },
+      bubbleAssistant: {
+        alignSelf: 'flex-start',
+        maxWidth: '92%',
+        padding: '8px 12px',
+        borderRadius: '12px',
+        background: 'rgba(128, 128, 128, 0.10)',
+        fontSize: '13px',
+        lineHeight: 1.6,
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
+      },
+      inputRow: { display: 'flex', gap: '8px', alignItems: 'flex-end', flex: 'none' },
+      textarea: {
+        flex: '1 1 auto',
+        resize: 'none',
+        padding: '8px 10px',
+        borderRadius: '8px',
+        border: '1px solid rgba(128, 128, 128, 0.35)',
+        background: 'transparent',
+        color: 'inherit',
+        fontSize: '13px',
+        fontFamily: 'inherit',
+        outline: 'none',
+        lineHeight: 1.5,
+      },
+    };
+
+    const inject = ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight'];
 
     function apply(ctx) {
       // Register the dictionaries so the nav label and every string resolve
@@ -740,7 +999,94 @@ window.__ModuleLoader__.load({
         label: 'DeepSeek 网页版',
         locale: NS,
       }, DeepSeekWebSettings));
+
+      // ── quick-ask panel ─────────────────────────────────────────────────────
+      // Tab type + body through the public two-stage path (the same one
+      // document preview uses). Services beyond slots/locale are optional: a
+      // composition without the right sidebar leaves the entry button off
+      // instead of breaking the settings page.
+      const sidebarRight = (() => {
+        try {
+          return ctx.sidebarRight;
+        } catch {
+          return undefined;
+        }
+      })();
+      const sidebarRightTabs = (() => {
+        try {
+          return ctx.sidebarRightTabs;
+        } catch {
+          return undefined;
+        }
+      })();
+
+      if (sidebarRightTabs !== undefined && sidebarRight !== undefined) {
+        const QA_TAB_ID = 'dsh-deepseek-web/quick-ask';
+        const QA_TAB_KIND = 'deepseek-web-quick-ask';
+        ctx.effect(() => sidebarRightTabs.register({
+          id: QA_TAB_ID,
+          kind: QA_TAB_KIND,
+          title: () => {
+            const lang = String((typeof document !== 'undefined' && document.documentElement?.lang) ?? '');
+            const dictionary = lang.toLowerCase().startsWith('en') ? dictionaries.en : dictionaries.zh;
+            return dictionary['qa.tab.title'];
+          },
+        }), 'dsh-deepseek-web: quick-ask tab type');
+        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+          name: 'sidebar.right.pane.tab',
+          key: QA_TAB_ID,
+          locale: NS,
+        }, QuickAskPanel), 'dsh-deepseek-web: quick-ask tab body');
+
+        // The entry: a small persistent button next to the header's
+        // more-actions button, opening (and revealing) the panel tab.
+        ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+          name: 'conversation.session.header.utilities',
+          id: 'deepseek-web-quick-ask',
+          order: 10,
+          locale: NS,
+        }, (props) => {
+          const open = () => {
+            try {
+              sidebarRight.openTab(QA_TAB_KIND, { preferNewPane: true });
+            } catch (error) {
+              console.warn('[dsh-deepseek-web] could not open the quick-ask panel:', error);
+            }
+          };
+          return h('button', {
+            type: 'button',
+            style: qaEntryStyle,
+            title: t9n('qa.entry.label'),
+            'aria-label': t9n('qa.entry.label'),
+            onClick: open,
+          }, '⚡');
+        }));
+      }
     }
+
+    /** Locale lookup for components outside the settings page (no hook state). */
+    function t9n(key) {
+      try {
+        const lang = String(document.documentElement?.lang ?? '');
+        const dictionary = lang.toLowerCase().startsWith('en') ? dictionaries.en : dictionaries.zh;
+        return dictionary[key] ?? key;
+      } catch {
+        return key;
+      }
+    }
+
+    /** Inline style for the header entry button (mirrors the more-actions button). */
+    const qaEntryStyle = {
+      width: '28px',
+      color: 'var(--dsw-alias-label-secondary, inherit)',
+      flex: 'none',
+      padding: 0,
+      border: 'none',
+      background: 'transparent',
+      cursor: 'pointer',
+      fontSize: '13px',
+      lineHeight: '28px',
+    };
 
     exports.apply = apply;
     exports.inject = inject;
