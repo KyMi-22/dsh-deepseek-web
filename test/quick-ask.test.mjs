@@ -6,12 +6,48 @@
 
 import assert from 'node:assert';
 import {
+  QUICK_ASK_FALLBACK_TITLE,
+  QUICK_ASK_TAG,
   QuickAsk,
   compressExchanges,
   contextPrimer,
   extractExchanges,
+  extractSessionTitle,
+  isQuickAskTitle,
+  quickAskTitle,
   readSessionEvents,
 } from '../src/quick-ask.js';
+
+// ── sidebar naming ───────────────────────────────────────────────────────────
+
+{
+  // The DSH title comes from the LAST session/title event in the log.
+  assert.equal(
+    extractSessionTitle([
+      { type: 'session/title', data: { title: '旧名字' } },
+      { type: 'user/message', data: {} },
+      { type: 'session/title', data: { title: '新名字' } },
+    ]),
+    '新名字',
+  );
+  assert.equal(extractSessionTitle([]), '');
+  assert.equal(extractSessionTitle([{ type: 'session/title', data: { title: '  ' } }]), '', 'blank titles are ignored');
+
+  // The web conversation title is `SideBar：<DSH title>`.
+  assert.equal(quickAskTitle('项目重构'), `${QUICK_ASK_TAG}项目重构`);
+  assert.equal(quickAskTitle(''), QUICK_ASK_FALLBACK_TITLE, 'a titleless session falls back');
+  const long = quickAskTitle('长'.repeat(80));
+  assert.ok(long.startsWith(QUICK_ASK_TAG), 'the tag always leads');
+  assert.ok(long.length < 60, 'the label is clipped so the tag stays visible');
+
+  // The import rule recognizes the current tag and historical spellings.
+  assert.equal(isQuickAskTitle(`${QUICK_ASK_TAG}项目重构`), true);
+  assert.equal(isQuickAskTitle('[SideBar] 旧版本'), true, 'the older bracket spelling stays excluded');
+  assert.equal(isQuickAskTitle('[快捷侧问] 更早版本'), true);
+  assert.equal(isQuickAskTitle('普通对话'), false);
+  assert.equal(isQuickAskTitle(''), false);
+  assert.equal(isQuickAskTitle(undefined), false);
+}
 
 // ── extractExchanges ─────────────────────────────────────────────────────────
 
@@ -88,7 +124,7 @@ import {
 
 /** A fake web client: createSession + a scripted completion stream. */
 function fakeApi({ reply = '回答', failAt } = {}) {
-  const calls = { created: 0, completions: [] };
+  const calls = { created: 0, completions: [], renamed: [] };
   return {
     calls,
     ready: true,
@@ -96,6 +132,9 @@ function fakeApi({ reply = '回答', failAt } = {}) {
     async createSession() {
       calls.created += 1;
       return { id: `web-${calls.created}`, title: null, updatedAt: 0 };
+    },
+    async renameSession(chatSessionId, title) {
+      calls.renamed.push({ chatSessionId, title });
     },
     async *streamCompletion(request) {
       calls.completions.push(request);
@@ -121,7 +160,12 @@ function fakeStore(state = {}) {
     async open() {
       return {
         async read() {
-          return { events: [{ type: 'user/message', data: { message: { role: 'user', content: [{ type: 'text', text: '背景问题' }], source: { kind: 'user' } } } }] };
+          return {
+            events: [
+              { type: 'session/title', data: { title: '原对话标题' } },
+              { type: 'user/message', data: { message: { role: 'user', content: [{ type: 'text', text: '背景问题' }], source: { kind: 'user' } } } },
+            ],
+          };
         },
         async close() {},
       };
@@ -135,6 +179,10 @@ function fakeStore(state = {}) {
     events.push(event);
   }
   assert.equal(store.state.quickAsk['sess-1'].chatSessionId, 'web-1', 'thread bound to the session');
+  // The web conversation is tagged with the DSH conversation's name, so a sync
+  // pass can tell it apart from a conversation the user wrote.
+  assert.deepEqual(api.calls.renamed[0], { chatSessionId: 'web-1', title: 'SideBar：原对话标题' });
+  assert.equal(store.state.quickAsk['sess-1'].titled, true, 'the tag rename is recorded');
   // Two completions went out: the primer, then the question.
   assert.equal(api.calls.completions.length, 2, 'primer + question');
   assert.ok(api.calls.completions[0].prompt.includes('背景问题'), 'the primer carries the context');
@@ -180,6 +228,31 @@ function fakeStore(state = {}) {
   }
   assert.equal(api.calls.completions.length, 1, 'no primer for an empty log');
   assert.equal(api.calls.completions[0].parentMessageId, null);
+}
+
+{
+  // The web product refuses to rename an empty conversation, so the tag
+  // rename attempted at creation fails; the first settled exchange retries it
+  // and succeeds.
+  const api = fakeApi();
+  let failures = 1;
+  const realRename = api.renameSession.bind(api);
+  api.renameSession = async (chatSessionId, title) => {
+    if (failures > 0) {
+      failures -= 1;
+      throw new Error('empty conversation');
+    }
+    return realRename(chatSessionId, title);
+  };
+  const store = fakeStore();
+  const qa = new QuickAsk({ api, store, persistence: () => undefined });
+  const thread = await qa.ensureThread('bare');
+  assert.equal(thread.titled, undefined, 'creation left the thread untitled');
+  for await (const event of qa.stream('bare', '第一个问题')) {
+    void event;
+  }
+  assert.equal(thread.titled, true, 'the settled exchange retried the tag rename');
+  assert.deepEqual(api.calls.renamed.at(-1), { chatSessionId: 'web-1', title: QUICK_ASK_FALLBACK_TITLE });
 }
 
 {

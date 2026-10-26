@@ -189,6 +189,27 @@ const DAY = 86_400_000;
   assert.equal(selectImportBatch(sessions, now - 7 * DAY).length, 3);
 }
 
+// ── quick-ask side threads are never imported ─────────────────────────────
+{
+  const now = Date.now();
+  const sessions = [
+    { id: 'side-thread', title: 'SideBar：项目重构', updatedAt: (now - 1 * DAY) / 1000 },
+    { id: 'side-legacy', title: '[SideBar] 旧版本', updatedAt: (now - 1 * DAY) / 1000 },
+    { id: 'regular', title: '普通对话', updatedAt: (now - 1 * DAY) / 1000 },
+    { id: 'untitled', updatedAt: (now - 1 * DAY) / 1000 },
+  ];
+
+  const batch = selectImportBatch(sessions, now - 7 * DAY);
+  assert.deepEqual(
+    batch.map((entry) => entry.id),
+    ['regular', 'untitled'],
+    'SideBar-tagged threads are machinery, not conversations to import',
+  );
+  // The rule also holds inside an explicit exclude set.
+  const narrowed = selectImportBatch(sessions, now - 7 * DAY, new Set(['regular']));
+  assert.deepEqual(narrowed.map((entry) => entry.id), ['untitled']);
+}
+
 // ── attachSessions ─────────────────────────────────────────────────────────
 {
   const attached = [];

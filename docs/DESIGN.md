@@ -32,6 +32,7 @@ DSH 会话 ──► deepseek-web provider ──► chat.deepseek.com
 | `src/http.js` | 设置页路由用的 JSON / 请求体工具 |
 | `src/tool-guard.js` | 网页版会话的工具白名单 |
 | `src/quick-ask.js` | 快捷侧问：压缩背景、每会话一条网页线程、SSE 泵 |
+| `src/quick-ask-tag.js` | 侧问线程命名与导入排除规则（无依赖叶子模块） |
 
 ## 为什么是「工作区」
 
@@ -200,6 +201,8 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 - **入口**：会话头部 `conversation.session.header.utilities` 席位里的常驻按钮（三点按钮旁边）。菜单项本身（`session-log-export` 的「更多操作」）没有扩展席位，塞不进去。
 - **面板**：`ctx.sidebarRightTabs.register` + `sidebar.right.pane.tab` 正文注册，走文档预览同款的公开两级路径；`ctx.sidebarRight.openTab(kind, { preferNewPane: true })` 打开并展开右栏。右栏布局本就按会话隔离，侧问线程与面板天然同生命周期。
 - **线程**：每个 DSH 会话**一条**网页对话，首次提问时创建并把压缩背景作为第一条消息发过去（`parent_message_id` 续链）。线程记录落在 `state.json` 的 `quickAsk`，重开面板可续聊。「刷新背景」丢弃当前线程、用最新压缩重建——旧网页对话不删（已属网页产品），只是不再引用。
+- **命名与导入排除**：线程创建后立即把网页对话重命名为 `SideBar：<对应 DSH 对话名>`（`session/title` 事件的最后一个值；无标题时回退 `SideBar：快捷侧问`）。网页端拒绝给空对话改名，所以「无背景的裸线程」会在第一条回答落定后补改。导入规则（`selectImportBatch`）拒绝带该前缀的对话——其中也接受旧版本的 `[SideBar]` / `[快捷侧问]` 拼写。第二道保险是 `quickAsk` 账本里的网页对话 id 并入 `boundChatIds`，覆盖改名尚未落地的窗口。
 - **压缩**：规则压缩，零成本、确定性。读 `sessionPersistence` 的只读句柄取会话日志，过滤出人类输入（`source.kind === 'user'`，剔除 harness 注入的运行时上下文）与助手回答（丢推理块和工具流量），从最新往回装进 12000 字符预算，每轮截 1600 字符，被裁掉的轮数以一行标注。
+- **视觉**：面板与入口按钮使用宿主主题变量（`--dsw-specific-bubble`、`--dsw-radius-lg`、`--dsw-alias-*`），随明暗主题自动切换；入口图标是宿主自带的 Sparkle 轮廓路径（与三点按钮同尺寸、同 hover 底色）。顶部说明可折叠，偏好存 `localStorage`。
 - **数据面**：`/quick-ask/status`（面板状态）、`/quick-ask/reset`（换线程）、`/quick-ask/send`（SSE 流式回复，请求断开即中止生成）。问答记录只进 `quickAsk` 账本，**不写会话日志**——这是整个功能的存在理由。
 - **失败语义**：创建线程（PoW、建会话、发背景）失败时面板报错、不落线程记录，可整轮重试；回复流中断则保留已到手的片段，父消息标记不动，避免重试分叉出两条回答。

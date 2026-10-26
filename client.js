@@ -47,7 +47,7 @@ window.__ModuleLoader__.load({
     }
 
     const { jsx } = jsxRuntime;
-    const { useCallback, useEffect, useState } = react;
+    const { useCallback, useEffect, useRef, useState } = react;
 
     /**
      * Build one element with children folded into props.
@@ -161,6 +161,8 @@ window.__ModuleLoader__.load({
         'qa.error': '出错了：{message}',
         'qa.streamError': '回复中断：{message}',
         'qa.busy': '上一条回复还在进行中',
+        'qa.showHint': '显示说明',
+        'qa.hideHint': '隐藏说明',
       },
       en: {
         'nav': 'DeepSeek Web',
@@ -254,6 +256,8 @@ window.__ModuleLoader__.load({
         'qa.error': 'Failed: {message}',
         'qa.streamError': 'Reply interrupted: {message}',
         'qa.busy': 'A reply is still streaming',
+        'qa.showHint': 'Show explanation',
+        'qa.hideHint': 'Hide explanation',
       },
     };
 
@@ -769,6 +773,26 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false);
       const [live, setLive] = useState(null);
       const [notice, setNotice] = useState(null);
+      // The explanation is hideable; the choice survives remounts of the tab
+      // body (a reload is the only thing that forgets it).
+      const [hintOpen, setHintOpen] = useState(() => {
+        try {
+          return localStorage.getItem('dsh.quick-ask.hint-open') !== '0';
+        } catch {
+          return true;
+        }
+      });
+      const toggleHint = useCallback(() => {
+        setHintOpen((open) => {
+          const next = !open;
+          try {
+            localStorage.setItem('dsh.quick-ask.hint-open', next ? '1' : '0');
+          } catch {
+            /* private mode may refuse storage; the toggle still works */
+          }
+          return next;
+        });
+      }, []);
       const [localeId] = useState(
         (() => {
           try {
@@ -801,6 +825,16 @@ window.__ModuleLoader__.load({
         refresh();
       }, [refresh]);
 
+      // Keep the newest turn in view: the transcript scrolls to the bottom as
+      // the answer streams and when a settled exchange arrives.
+      const listRef = useRef(null);
+      const exchangeCount = status !== null && Array.isArray(status.exchanges) ? status.exchanges.length : 0;
+      const liveLength = live === null ? 0 : (live.answer?.length ?? 0) + (live.reasoning?.length ?? 0);
+      useEffect(() => {
+        const node = listRef.current;
+        if (node !== null && node !== undefined) node.scrollTop = node.scrollHeight;
+      }, [exchangeCount, liveLength]);
+
       /**
        * Send one question and consume the SSE reply.
        *
@@ -812,7 +846,7 @@ window.__ModuleLoader__.load({
         if (prompt === '' || busy) return;
         setBusy(true);
         setNotice(null);
-        setLive({ answer: '', reasoning: '' });
+        setLive({ answer: '', reasoning: '', prompt });
         setDraft('');
         try {
           const response = await fetch(`${API_PATH}/quick-ask/send`, {
@@ -881,44 +915,57 @@ window.__ModuleLoader__.load({
       }, [sessionId, refresh, t]);
 
       if (status !== null && status.ready === false) {
-        return h('div', { style: qaStyles.root }, h('div', { style: styles.hint }, t('qa.noToken')));
+        return h('div', { className: 'dsh-qa-root' }, h('div', { className: 'dsh-qa-hint' }, t('qa.noToken')));
       }
 
       const exchanges = status === null ? [] : Array.isArray(status.exchanges) ? status.exchanges : [];
       const rows = exchanges.slice();
       if (live !== null) {
-        rows.push({ role: 'user', text: '' });
-        rows.push({ role: 'assistant', text: live.answer || live.reasoning || '…' });
+        rows.push({ role: 'user', text: live.prompt ?? '' });
+        rows.push({ role: 'assistant', text: live.answer || live.reasoning || '…', live: true });
       }
 
-      return h('div', { style: qaStyles.root }, [
-        h('div', { key: 'head', style: qaStyles.head }, [
-          h('div', { key: 'hint', style: styles.hint }, t('qa.hint')),
-          h('div', { key: 'meta', style: qaStyles.meta },
-            status !== null
-              ? (status.contextChars > 0 ? t('qa.context', { chars: status.contextChars }) : t('qa.contextNone'))
-              : ''),
-          h('button', {
-            key: 'reset',
-            style: styles.button,
-            type: 'button',
-            title: t('qa.resetHint'),
-            disabled: busy || (status !== null && !status.hasThread),
-            onClick: reset,
-          }, t('qa.reset')),
+      const metaText = status !== null
+        ? (status.contextChars > 0 ? t('qa.context', { chars: status.contextChars }) : t('qa.contextNone'))
+        : '';
+
+      return h('div', { className: 'dsh-qa-root' }, [
+        h('div', { key: 'head', className: 'dsh-qa-head' }, [
+          h('div', { key: 'headrow', className: 'dsh-qa-headrow' }, [
+            h('div', { key: 'meta', className: 'dsh-qa-meta' }, metaText),
+            h('button', {
+              key: 'reset',
+              className: 'dsh-qa-ghost',
+              type: 'button',
+              title: t('qa.resetHint'),
+              disabled: busy || (status !== null && !status.hasThread),
+              onClick: reset,
+            }, t('qa.reset')),
+            h('button', {
+              key: 'toggle',
+              className: 'dsh-qa-toggle',
+              type: 'button',
+              'aria-expanded': hintOpen ? 'true' : 'false',
+              'aria-label': hintOpen ? t('qa.hideHint') : t('qa.showHint'),
+              title: hintOpen ? t('qa.hideHint') : t('qa.showHint'),
+              onClick: toggleHint,
+            }, h(ChevronIcon)),
+          ]),
+          h('div', { key: 'hint', className: 'dsh-qa-hint', hidden: hintOpen ? undefined : true }, t('qa.hint')),
         ]),
-        notice === null ? null : h('div', { key: 'notice', style: { ...styles.notice, ...(notice.kind === 'ok' ? styles.ok : styles.bad) } }, notice.text),
-        h('div', { key: 'list', style: qaStyles.list },
-          rows.length === 0 && live === null
-            ? h('div', { key: 'empty', style: styles.hint }, t('qa.empty'))
+        notice === null ? null : h('div', { key: 'notice', className: 'dsh-qa-notice', 'data-kind': notice.kind }, notice.text),
+        h('div', { key: 'list', className: 'dsh-qa-list', ref: listRef },
+          rows.length === 0
+            ? h('div', { key: 'empty', className: 'dsh-qa-empty' }, t('qa.empty'))
             : rows.map((row, index) => h('div', {
                 key: String(index),
-                style: row.role === 'user' ? qaStyles.bubbleUser : qaStyles.bubbleAssistant,
+                className: row.role === 'user' ? 'dsh-qa-user' : 'dsh-qa-assistant',
+                'data-live': row.live === true ? 'true' : undefined,
               }, row.text))),
-        h('div', { key: 'input', style: qaStyles.inputRow }, [
+        h('div', { key: 'input', className: 'dsh-qa-inputrow' }, [
           h('textarea', {
             key: 'text',
-            style: qaStyles.textarea,
+            className: 'dsh-qa-textarea',
             rows: 2,
             placeholder: t('qa.placeholder'),
             value: draft,
@@ -933,7 +980,7 @@ window.__ModuleLoader__.load({
           }),
           h('button', {
             key: 'send',
-            style: styles.buttonPrimary,
+            className: 'dsh-qa-send',
             type: 'button',
             disabled: busy || draft.trim() === '',
             onClick: send,
@@ -942,49 +989,76 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    /** Inline styles for the quick-ask panel (a column, not a settings page). */
-    const qaStyles = {
-      root: { display: 'flex', flexDirection: 'column', gap: '10px', height: '100%', minHeight: 0, padding: '12px', boxSizing: 'border-box' },
-      head: { display: 'flex', flexDirection: 'column', gap: '6px', flex: 'none' },
-      meta: { fontSize: '11.5px', opacity: 0.55 },
-      list: { display: 'flex', flexDirection: 'column', gap: '8px', flex: '1 1 auto', minHeight: 0, overflowY: 'auto' },
-      bubbleUser: {
-        alignSelf: 'flex-end',
-        maxWidth: '86%',
-        padding: '8px 12px',
-        borderRadius: '12px',
-        background: 'rgba(77, 107, 254, 0.16)',
-        fontSize: '13px',
-        lineHeight: 1.6,
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-word',
-      },
-      bubbleAssistant: {
-        alignSelf: 'flex-start',
-        maxWidth: '92%',
-        padding: '8px 12px',
-        borderRadius: '12px',
-        background: 'rgba(128, 128, 128, 0.10)',
-        fontSize: '13px',
-        lineHeight: 1.6,
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-word',
-      },
-      inputRow: { display: 'flex', gap: '8px', alignItems: 'flex-end', flex: 'none' },
-      textarea: {
-        flex: '1 1 auto',
-        resize: 'none',
-        padding: '8px 10px',
-        borderRadius: '8px',
-        border: '1px solid rgba(128, 128, 128, 0.35)',
-        background: 'transparent',
-        color: 'inherit',
-        fontSize: '13px',
-        fontFamily: 'inherit',
-        outline: 'none',
-        lineHeight: 1.5,
-      },
-    };
+    /**
+     * The quick-ask stylesheet.
+     *
+     * Written against the shell's own theme tokens (`--dsw-*`), the same ones
+     * the chat transcript and composer use, so the panel follows the
+     * light/dark switch with no per-theme code. Every token carries a fallback
+     * for compositions that render the plugin outside the themed shell.
+     */
+    const QA_CSS = [
+      '.dsh-qa-entry{box-sizing:border-box;width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;flex:none;padding:0;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background-color .1s,color .1s}',
+      '.dsh-qa-entry:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-primary,inherit)}',
+      '.dsh-qa-entry:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);outline-offset:-2px}',
+      '.dsh-qa-entry svg{width:15px;height:15px;display:block}',
+      '.dsh-qa-root{box-sizing:border-box;display:flex;flex-direction:column;gap:10px;height:100%;min-height:0;padding:10px 12px 12px;font-size:var(--dsh-content-font-size,14px)}',
+      '.dsh-qa-head{display:flex;flex-direction:column;gap:6px;flex:none}',
+      '.dsh-qa-headrow{display:flex;align-items:center;gap:8px;min-width:0}',
+      '.dsh-qa-meta{flex:1 1 auto;min-width:0;font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-hint{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#81858c);padding:0 2px}',
+      '.dsh-qa-hint[hidden]{display:none}',
+      '.dsh-qa-toggle{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:none;padding:0;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-tertiary,#81858c);cursor:pointer}',
+      '.dsh-qa-toggle:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-secondary,inherit)}',
+      '.dsh-qa-toggle svg{width:13px;height:13px;transition:transform .15s ease}',
+      '.dsh-qa-toggle[aria-expanded="false"] svg{transform:rotate(-90deg)}',
+      '.dsh-qa-ghost{padding:4px 10px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));background:transparent;color:var(--dsw-alias-label-secondary,inherit);font-size:12px;font-family:inherit;cursor:pointer;white-space:nowrap}',
+      '.dsh-qa-ghost:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
+      '.dsh-qa-ghost:disabled{opacity:.45;cursor:default}',
+      '.dsh-qa-notice{font-size:12.5px;line-height:1.55;border-radius:var(--dsw-radius-sm,8px);padding:8px 12px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
+      '.dsh-qa-notice[data-kind="bad"]{color:var(--dsw-alias-label-error,#e03131)}',
+      '.dsh-qa-list{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px;overflow-y:auto;padding:2px 2px 2px 0;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}',
+      '.dsh-qa-user{align-self:flex-end;max-width:86%;padding:8px 12px;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-specific-bubble,#edf3fe);color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.55;white-space:pre-wrap;word-break:break-word}',
+      '.dsh-qa-assistant{align-self:flex-start;max-width:100%;padding:0 2px;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.6;white-space:pre-wrap;word-break:break-word}',
+      '.dsh-qa-assistant[data-live="true"]{color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-empty{font-size:12.5px;color:var(--dsw-alias-label-tertiary,#81858c);padding:6px 2px}',
+      '.dsh-qa-inputrow{display:flex;gap:8px;align-items:flex-end;flex:none}',
+      '.dsh-qa-textarea{flex:1 1 auto;min-height:40px;max-height:120px;resize:none;padding:8px 10px;border-radius:var(--dsw-radius-lg,16px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);font-family:inherit;line-height:1.5;outline:none}',
+      '.dsh-qa-textarea:focus{border-color:var(--dsw-alias-state-business-primary,#4176e6)}',
+      '.dsh-qa-send{padding:0 16px;height:36px;border-radius:var(--dsw-radius-lg,16px);border:none;background:var(--dsw-alias-button-primary-fill,#4176e6);color:var(--dsw-alias-label-primary-foreground,#fff);font-size:13px;font-weight:600;font-family:inherit;cursor:pointer;white-space:nowrap}',
+      '.dsh-qa-send:hover:not(:disabled){opacity:.9}',
+      '.dsh-qa-send:disabled{opacity:.45;cursor:default}',
+    ].join('\n');
+
+    /** Inject the panel stylesheet once; cosmetic failures never break the panel. */
+    function injectQuickAskStyles() {
+      try {
+        if (typeof document === 'undefined' || typeof document.createElement !== 'function' || document.head === undefined) return;
+        if (document.querySelector('style[data-plugin-css="dsh-deepseek-web/quick-ask"]') !== null) return;
+        const tag = document.createElement('style');
+        tag.dataset.pluginCss = 'dsh-deepseek-web/quick-ask';
+        tag.textContent = QA_CSS;
+        document.head.appendChild(tag);
+      } catch {
+        /* the fallback inline styles still render a usable panel */
+      }
+    }
+
+    /** The DSH sparkle glyph, drawn with the shell's own outline paths. */
+    function QuickAskIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'p1', d: 'M5.875 3C5.875 6.33333 7.54167 8 10.875 8C7.54167 8 5.875 9.66667 5.875 13C5.875 9.66667 4.20833 8 0.875 8C4.20833 8 5.875 6.33333 5.875 3Z', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 'p2', d: 'M12.375 1.55823C12.375 3.39156 13.2917 4.30823 15.125 4.30823C13.2917 4.30823 12.375 5.22489 12.375 7.05823C12.375 5.22489 11.4583 4.30823 9.625 4.30823C11.4583 4.30823 12.375 3.39156 12.375 1.55823Z', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 'p3', d: 'M12.375 10.4418C12.375 11.7751 13.0417 12.4418 14.375 12.4418C13.0417 12.4418 12.375 13.1084 12.375 14.4418C12.375 13.1084 11.7083 12.4418 10.375 12.4418C11.7083 12.4418 12.375 11.7751 12.375 10.4418Z', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
+
+    /** The DSH chevron, used by the collapsible hint. */
+    function ChevronIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'c', d: 'M4 6L7.29289 9.29289C7.68342 9.68342 8.31658 9.68342 8.70711 9.29289L12 6', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
 
     const inject = ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight'];
 
@@ -1021,6 +1095,7 @@ window.__ModuleLoader__.load({
       })();
 
       if (sidebarRightTabs !== undefined && sidebarRight !== undefined) {
+        injectQuickAskStyles();
         const QA_TAB_ID = 'dsh-deepseek-web/quick-ask';
         const QA_TAB_KIND = 'deepseek-web-quick-ask';
         ctx.effect(() => sidebarRightTabs.register({
@@ -1055,11 +1130,11 @@ window.__ModuleLoader__.load({
           };
           return h('button', {
             type: 'button',
-            style: qaEntryStyle,
+            className: 'dsh-qa-entry',
             title: t9n('qa.entry.label'),
             'aria-label': t9n('qa.entry.label'),
             onClick: open,
-          }, '⚡');
+          }, h(QuickAskIcon));
         }));
       }
     }
@@ -1074,19 +1149,6 @@ window.__ModuleLoader__.load({
         return key;
       }
     }
-
-    /** Inline style for the header entry button (mirrors the more-actions button). */
-    const qaEntryStyle = {
-      width: '28px',
-      color: 'var(--dsw-alias-label-secondary, inherit)',
-      flex: 'none',
-      padding: 0,
-      border: 'none',
-      background: 'transparent',
-      cursor: 'pointer',
-      fontSize: '13px',
-      lineHeight: '28px',
-    };
 
     exports.apply = apply;
     exports.inject = inject;

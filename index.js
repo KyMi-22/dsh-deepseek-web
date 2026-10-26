@@ -391,11 +391,19 @@ export async function apply(ctx, config = {}) {
       // A conversation this plugin CREATED for a new DSH session already has a
       // bound DSH session. Importing it again would produce a second, empty copy
       // of the same conversation, so those ids are excluded before selection.
-      const boundChatIds = new Set(
-        Object.values(store.state.bindings)
+      // Quick-ask threads are the same kind of machinery (they belong to a DSH
+      // session's side panel, not to the sidebar): the ledger ids cover the
+      // window before a thread's `SideBar：` rename lands, and the title tag
+      // (checked in `selectImportBatch`) covers threads the ledger no longer
+      // knows — a refresh mints a NEW web id that the tag still marks.
+      const boundChatIds = new Set([
+        ...Object.values(store.state.bindings)
           .map((binding) => binding?.chatSessionId)
           .filter((id) => typeof id === 'string' && id !== ''),
-      );
+        ...Object.values(store.state.quickAsk ?? {})
+          .map((thread) => thread?.chatSessionId)
+          .filter((id) => typeof id === 'string' && id !== ''),
+      ]);
       const inWindow = selectImportBatch(sessions, since);
       const batch = selectImportBatch(sessions, since, boundChatIds);
       report.windowStart = since;

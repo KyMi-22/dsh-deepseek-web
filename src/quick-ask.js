@@ -20,6 +20,9 @@
 'use strict';
 
 import { isHumanMessage, isHarnessInjection } from './adapter.js';
+import { extractSessionTitle, quickAskTitle } from './quick-ask-tag.js';
+
+export { QUICK_ASK_FALLBACK_TITLE, QUICK_ASK_TAG, extractSessionTitle, isQuickAskTitle, quickAskTitle } from './quick-ask-tag.js';
 
 /** How many code units one turn may contribute before it is truncated. */
 const MAX_TURN_CHARS = 1600;
@@ -195,6 +198,8 @@ function clipStored(text) {
  * @property {number} createdAt
  * @property {number} updatedAt
  * @property {string} contextSent - the primer the thread was seeded with
+ * @property {string} [sessionTitle] - the DSH conversation title the thread is named after
+ * @property {boolean} [titled] - whether the `SideBar：` tag rename landed
  * @property {Array<{ role: 'user' | 'assistant', text: string }>} exchanges
  */
 
@@ -277,6 +282,7 @@ export class QuickAsk {
       const events = await readSessionEvents(this.persistence(), sessionId);
       const exchanges = extractExchanges(events ?? []);
       const context = compressExchanges(exchanges);
+      const sessionTitle = extractSessionTitle(events ?? []);
       const web = await this.api.createSession();
       /** @type {QuickAskThread} */
       const thread = {
@@ -285,6 +291,7 @@ export class QuickAsk {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         contextSent: context,
+        sessionTitle,
         exchanges: [],
       };
       // Seed the thread with the primer when there IS context. A session with
@@ -295,6 +302,18 @@ export class QuickAsk {
         parentId = await this.sendAndSettle(web.id, null, contextPrimer(context), false);
       }
       thread.parentMessageId = parentId;
+      // Tag the conversation BEFORE it can ever meet a sync pass. The web
+      // product refuses to rename an empty conversation, so the rename rides
+      // the primer's completion; a bare thread (no context) is renamed after
+      // its first panel answer settles instead (`stream` does that).
+      try {
+        await this.api.renameSession(web.id, quickAskTitle(sessionTitle));
+        thread.titled = true;
+      } catch (error) {
+        // Not fatal: the ledger row still excludes this thread from import, and
+        // a later settled exchange retries the rename below.
+        this.warn(`deepseek-web: could not tag the quick-ask conversation: ${String(error)}`);
+      }
       this.store.state.quickAsk[sessionId] = thread;
       await this.store.flush();
       return thread;
@@ -427,6 +446,17 @@ export class QuickAsk {
       thread.exchanges.push({ role: 'assistant', text: clipStored(answer) });
       if (thread.exchanges.length > MAX_STORED_EXCHANGES * 2) {
         thread.exchanges.splice(0, thread.exchanges.length - MAX_STORED_EXCHANGES * 2);
+      }
+      // A bare thread could not be renamed at creation (the web product
+      // refuses an empty conversation); the first settled exchange is the
+      // first moment the tag can land. Retried until it sticks.
+      if (thread.titled !== true) {
+        try {
+          await this.api.renameSession(thread.chatSessionId, quickAskTitle(thread.sessionTitle));
+          thread.titled = true;
+        } catch (error) {
+          this.warn(`deepseek-web: could not tag the quick-ask conversation: ${String(error)}`);
+        }
       }
       await this.store.flush();
       yield { kind: 'done' };

@@ -18,6 +18,7 @@
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { sessionDirFor } from './store.js';
+import { isQuickAskTitle } from './quick-ask-tag.js';
 
 /** Workspace title shown in the sidebar. */
 export const WORKSPACE_TITLE = '对话';
@@ -160,7 +161,11 @@ export function nextSyncDelayMs(baseSeconds, random = Math.random) {
  * session, so importing them would produce a second, empty copy of the same
  * conversation — one the user never asked for.
  *
- * @param {ReadonlyArray<{ id: string, updatedAt: number }>} sessions
+ * Quick-ask threads are excluded by their `[SideBar]` title tag: they are
+ * plugin machinery, not conversations the user wrote, and the ledger does not
+ * name them (a refreshed thread is a NEW web id the ledger has never seen).
+ *
+ * @param {ReadonlyArray<{ id: string, updatedAt: number, title?: string }>} sessions
  * @param {number} since - epoch milliseconds; 0 keeps everything.
  * @param {ReadonlySet<string>} [excludeIds] - web conversation ids already bound.
  * @returns {Array<{ id: string, updatedAt: number }>}
@@ -169,6 +174,7 @@ export function selectImportBatch(sessions, since, excludeIds) {
   return sessions
     .filter((session) => (Number(session.updatedAt) || 0) * 1000 >= since)
     .filter((session) => excludeIds === undefined || !excludeIds.has(String(session.id)))
+    .filter((session) => !isQuickAskTitle(session.title))
     .sort((a, b) => (Number(a.updatedAt) || 0) - (Number(b.updatedAt) || 0));
 }
 
