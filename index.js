@@ -32,7 +32,7 @@ import {
   stateFile,
 } from './src/store.js';
 import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
-import { readJsonBody, sendJson } from './src/http.js';
+import { readJsonBody, readRawBody, sendJson } from './src/http.js';
 import { readFile } from 'node:fs/promises';
 import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
 import { QuickAsk } from './src/quick-ask.js';
@@ -67,6 +67,9 @@ const QUICK_ASK_MODELS = MODELS.map((entry) => ({
 
 /** How many per-conversation failures one sync report carries. */
 const MAX_REPORTED_ERRORS = 5;
+
+/** Hard cap for one file handed to the web upload endpoint (bytes). */
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 
 /**
  * Ask the harness to recompose the plugin tree.
@@ -266,6 +269,26 @@ export async function apply(ctx, config = {}) {
       }
       throw error;
     }
+  };
+
+  // Document uploads read the verbatim bytes out of the same attachment store.
+  // `readFileStream` yields bounded chunks; the upload endpoint needs one
+  // buffer, so they are joined here under a hard size cap.
+  adapter.deps.readFileBytes = async (ref) => {
+    const attachments = ctx.get('attachments');
+    if (typeof attachments?.readFileStream !== 'function') {
+      throw new Error('deepseek-web: no attachment service is mounted');
+    }
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of attachments.readFileStream(ref)) {
+      total += chunk.length;
+      if (total > MAX_UPLOAD_BYTES) {
+        throw new Error(`deepseek-web: file is larger than the ${MAX_UPLOAD_BYTES}-byte upload limit`);
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
   };
 
   // Both registrations are fiber-owned: their handles unwind with this plugin.
@@ -893,6 +916,43 @@ export async function apply(ctx, config = {}) {
               }
               return;
             }
+            if (req.method === 'POST' && route === '/quick-ask/upload') {
+              // Raw bytes, filename and media type in the query, because the
+              // browser already holds the File object. The body cap is enforced
+              // while reading.
+              const fileName = url.searchParams.get('name') ?? '';
+              const mediaType = url.searchParams.get('type') ?? '';
+              if (!api.ready) {
+                sendJson(res, 409, { ok: false, error: 'no-token' });
+                return;
+              }
+              let bytes;
+              try {
+                bytes = await readRawBody(req, MAX_UPLOAD_BYTES);
+              } catch (error) {
+                if (error?.code === 'TOO_LARGE') {
+                  sendJson(res, 413, { ok: false, error: 'too-large', detail: `上限 ${MAX_UPLOAD_BYTES} 字节` });
+                  return;
+                }
+                throw error;
+              }
+              if (bytes.length === 0) {
+                sendJson(res, 400, { ok: false, error: 'empty-file' });
+                return;
+              }
+              try {
+                const fileId = await quickAsk.uploadFile({
+                  bytes,
+                  fileName,
+                  mediaType,
+                  signal: undefined,
+                });
+                sendJson(res, 200, { ok: true, fileId, name: fileName });
+              } catch (error) {
+                sendJson(res, 502, { ok: false, error: String(error?.message ?? error) });
+              }
+              return;
+            }
             if (req.method === 'POST' && route === '/quick-ask/send') {
               const body = await readJsonBody(req);
               const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
@@ -917,6 +977,8 @@ export async function apply(ctx, config = {}) {
                 for await (const event of quickAsk.stream(sessionId, prompt, {
                   thinking: body.thinking === true,
                   search: body.search === true,
+                  refFileIds: Array.isArray(body.refFileIds) ? body.refFileIds : [],
+                  files: Array.isArray(body.files) ? body.files : [],
                   signal: abort.signal,
                 })) {
                   res.write(`data: ${JSON.stringify(event)}\n\n`);

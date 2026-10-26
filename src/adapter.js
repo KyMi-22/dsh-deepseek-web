@@ -117,6 +117,66 @@ function imageExtension(mediaType) {
 }
 
 /**
+ * Extensions the upload endpoint understands, keyed by media type.
+ *
+ * Used only when a document arrives without a filename extension; a name that
+ * already ends with something is kept as is, because the endpoint decides the
+ * type from it.
+ */
+const DOCUMENT_EXTENSIONS = Object.freeze({
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'text/plain': 'txt',
+  'text/markdown': 'md',
+  'text/csv': 'csv',
+  'application/json': 'json',
+  'text/html': 'html',
+  'application/zip': 'zip',
+});
+
+/**
+ * Media type guessed from a filename, for documents arriving without one.
+ *
+ * The DSH file reference carries a name but no media type (verbatim files are
+ * type-agnostic in the attachment store), so the upload's Content-Type comes
+ * from the extension. An unknown extension becomes a binary stream.
+ *
+ * @param {string | undefined} name
+ * @returns {string}
+ */
+export function mediaTypeForName(name) {
+  const match = typeof name === 'string' ? name.match(/\.([A-Za-z0-9]{1,8})$/u) : null;
+  const ext = match === null ? '' : match[1].toLowerCase();
+  switch (ext) {
+    case 'png': return 'image/png';
+    case 'jpg':
+    case 'jpeg': return 'image/jpeg';
+    case 'webp': return 'image/webp';
+    case 'gif': return 'image/gif';
+    case 'pdf': return 'application/pdf';
+    case 'doc': return 'application/msword';
+    case 'docx': return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case 'xls': return 'application/vnd.ms-excel';
+    case 'xlsx': return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    case 'ppt': return 'application/vnd.ms-powerpoint';
+    case 'pptx': return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+    case 'txt': return 'text/plain';
+    case 'md': return 'text/markdown';
+    case 'csv': return 'text/csv';
+    case 'json': return 'application/json';
+    case 'html':
+    case 'htm': return 'text/html';
+    case 'zip': return 'application/zip';
+    default: return 'application/octet-stream';
+  }
+}
+
+/**
  * The filename one upload carries.
  *
  * The DSH attachment's display name is kept when it already ends with the
@@ -131,6 +191,54 @@ function uploadFileName(name, mediaType) {
   const ext = imageExtension(mediaType);
   if (typeof name === 'string' && name.toLowerCase().endsWith(`.${ext}`)) return name;
   return `image.${ext}`;
+}
+
+/**
+ * The filename one document upload carries.
+ *
+ * Unlike images there is no canonical extension to compare against, so a name
+ * that already has ANY extension is trusted (the endpoint is the authority on
+ * what it accepts); a nameless or extensionless file gets one from its media
+ * type.
+ *
+ * @param {string | undefined} name
+ * @param {string} mediaType
+ */
+function documentFileName(name, mediaType) {
+  const base = typeof name === 'string' && name.trim() !== '' ? name.trim().replace(/[\\/]/gu, '_') : '';
+  if (/\.([A-Za-z0-9]{1,8})$/u.test(base)) return base;
+  const ext = DOCUMENT_EXTENSIONS[mediaType] ?? 'bin';
+  return base === '' ? `file.${ext}` : `${base}.${ext}`;
+}
+
+/**
+ * Every distinct document reference in one message list, in message order.
+ *
+ * A file block carries a `FileAttachmentRef` (`attachmentId`, `name`, digest
+ * facts) with no media type — verbatim files are type-agnostic in the store —
+ * so the media type is derived from the name at upload time.
+ *
+ * @param {ReadonlyArray<object>} messages
+ * @returns {Array<{ attachmentId: string, name: string }>}
+ */
+export function fileRefs(messages) {
+  const refs = [];
+  const seen = new Set();
+  for (const message of messages) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type !== 'file') continue;
+      const ref = block.attachment;
+      if (ref === null || typeof ref !== 'object') continue;
+      const id = typeof ref.attachmentId === 'string' ? ref.attachmentId : '';
+      const name = typeof ref.name === 'string' && ref.name.trim() !== '' ? ref.name.trim() : '';
+      if (id === '' || seen.has(id)) continue;
+      seen.add(id);
+      refs.push({ attachmentId: id, name });
+    }
+  }
+  return refs;
 }
 
 /**
@@ -578,6 +686,47 @@ export class DeepSeekWebAdapter {
         // here so the Host log shows WHY the upload did not go through.
         this.deps.warn?.(
           `deepseek-web: image upload failed before the prompt was sent (${error instanceof Error ? error.message : String(error)})`,
+        );
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+        yield finishError(error);
+        return;
+      }
+    }
+
+    // Documents ride the same upload path with the `file` model type. Their
+    // bytes come verbatim out of the attachment store; the prompt keeps the
+    // `[文件]` placeholder so a file-only turn still has a non-empty prompt.
+    const documents = fileRefs(messages);
+    if (documents.length > 0) {
+      const readFileBytes = this.deps.readFileBytes;
+      if (typeof readFileBytes !== 'function') {
+        const error = new Error('deepseek-web: file input needs the attachment service, which is unavailable');
+        error.submitted = false;
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+        yield finishError(error);
+        return;
+      }
+      try {
+        for (const ref of documents) {
+          const bytes = await readFileBytes(ref);
+          const mediaType = mediaTypeForName(ref.name);
+          const fileId = await this.deps.api.uploadFile({
+            bytes,
+            mediaType,
+            fileName: documentFileName(ref.name, mediaType),
+            // A generic file whose name happens to be an image still needs the
+            // vision route, or the server parses it as a document.
+            modelType: mediaType.startsWith('image/') ? 'vision' : 'file',
+            thinking: entry.thinking,
+            signal: options.signal,
+          });
+          refFileIds.push(fileId);
+        }
+      } catch (error) {
+        // Nothing reached the model — uploads precede the completion POST.
+        error.submitted = false;
+        this.deps.warn?.(
+          `deepseek-web: file upload failed before the prompt was sent (${error instanceof Error ? error.message : String(error)})`,
         );
         this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
         yield finishError(error);

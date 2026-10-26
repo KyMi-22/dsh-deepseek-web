@@ -314,6 +314,49 @@ function fakeStore(state = {}) {
 }
 
 {
+  // Attachments: the upload ids ride on the completion and the names stay in
+  // the transcript for display.
+  const api = fakeApi();
+  const store = fakeStore();
+  const qa = new QuickAsk({ api, store, persistence: () => undefined });
+  for await (const event of qa.stream('sess-files', '看看这个', {
+    refFileIds: ['doc-1', 'doc-2'],
+    files: [{ name: '报告.pdf' }, { name: '数据.xlsx' }],
+  })) {
+    void event;
+  }
+  assert.deepEqual(api.calls.completions[0].refFileIds, ['doc-1', 'doc-2'], 'the ids reach the completion');
+  const recorded = store.state.quickAsk['sess-files'].exchanges[0];
+  assert.deepEqual(recorded.files, [{ name: '报告.pdf' }, { name: '数据.xlsx' }], 'the transcript keeps the names');
+  assert.equal(recorded.role, 'user');
+}
+
+{
+  // The panel's upload helper picks the model type and repairs a missing
+  // extension before handing the file to the web endpoint.
+  const api = fakeApi();
+  const uploaded = [];
+  api.uploadFile = async (request) => {
+    uploaded.push(request);
+    return `web-${uploaded.length}`;
+  };
+  const qa = new QuickAsk({ api, store: fakeStore(), persistence: () => undefined });
+  const docId = await qa.uploadFile({ bytes: new Uint8Array([1, 2, 3]), fileName: 'report.pdf', mediaType: 'application/pdf' });
+  assert.equal(docId, 'web-1');
+  assert.deepEqual(
+    { fileName: uploaded[0].fileName, mediaType: uploaded[0].mediaType, modelType: uploaded[0].modelType },
+    { fileName: 'report.pdf', mediaType: 'application/pdf', modelType: 'file' },
+  );
+  const imageId = await qa.uploadFile({ bytes: new Uint8Array([1]), fileName: 'shot', mediaType: 'image/png' });
+  assert.equal(imageId, 'web-2');
+  assert.equal(uploaded[1].modelType, 'vision', 'images take the vision route');
+  assert.equal(uploaded[1].fileName, 'shot.png', 'a missing extension is added');
+  // A path-like name is flattened: the endpoint takes a bare filename.
+  await qa.uploadFile({ bytes: new Uint8Array([1]), fileName: 'C\\temp\\a.txt', mediaType: 'text/plain' });
+  assert.equal(uploaded[2].fileName, 'C_temp_a.txt');
+}
+
+{
   // The transcript is bounded: ancient exchanges fall off the end.
   const api = fakeApi();
   const store = fakeStore();

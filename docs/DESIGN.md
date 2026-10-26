@@ -130,14 +130,16 @@ ctx.on('session/event', (session, event) => {
 
 置换的 scratch 缓冲（`C`/`D`/`W`）**不做轮间清零**：theta 在读之前写满 `C` 和 `D`，rhoPi/chi 重写它们消费的内容，清零是纯开销。一次 solve 大约 15 万候选 × 23 轮 × 136 字节块，这是包里最热的循环。正确性由 `pow.test.mjs` 里钉住的真实挑战向量（服务端签发并已解出答案的那一条）保证——算法漂移会立刻被它抓住。
 
-## 图片上传
+## 图片与文件上传
 
 带图消息在 completion 之前走三步：`readImage`（附件存储校验读取）→ `upload_file`（该端点单独解一次 PoW）→ 轮询 `fetch_files` 等解析离开 `PENDING`。上传拿到的是文件 id，随 `ref_file_ids` 进入 completion——与浏览器端的请求形状一致。
+
+文档走同一条链路，差别只有三处：字节来自 `readFileStream`（逐块拼接，20 MB 上限）、媒体类型由扩展名推断（`mediaTypeForName`）、上传头部的 `x-model-type` 用 `file`（图片用 `vision`）。`FileBlock` 的引用只有 `{attachmentId, name}`，没有媒体类型——这是附件存储「文件原样、类型无关」的设计，所以类型在适配器侧补。
 
 两个容易踩的坑：
 
 - **附件引用必须原样传递**。`ImageBlock.attachment` 里的 `bytes/width/height` 不是装饰信息：本地附件存储读取时会重新探测存储对象，逐字段核对引用（`mediaType`、`bytes`、`width`、`height`），缺一个字段就是 `ATTACHMENT_CORRUPT`。0.2.0 曾把引用裁剪成 `{attachmentId, mediaType, name}`，导致每条带图消息在上传前就被拒。
-- **上传文件名按扩展名校验**。端点用文件名的扩展判断类型：无扩展名、或扩展名与 `mediaType` 不符（改名保存的文件常这样）都会被拒为 `unsupported file type`。适配器只保留与声明类型一致的名字，其余重新生成为 `image.<ext>`。
+- **上传文件名按扩展名校验**。端点用文件名的扩展判断类型：无扩展名、或扩展名与 `mediaType` 不符（改名保存的文件常这样）都会被拒为 `unsupported file type`。适配器只保留与声明类型一致的名字，其余重新生成为 `image.<ext>`；文档的名字若已带任意扩展名就保留，缺扩展名时按媒体类型补（`documentFileName`）。
 - **解析未完成就发送会被拒**（HTTP 422），所以等到 `SUCCESS` 才继续；等待上限 60 秒，轮询间隔 1.2 秒。全部失败都发生在 completion 之前，整轮可以安全重试。
 
 网页端对图片自行计量（上传响应带 `token_usage`），DSH 侧把保留出现的图片计为「模型可见、成本未知」（`imageRequestPricing` 返回 `visualTokens: 0`），不从像素估算。
@@ -207,5 +209,6 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 - **回复渲染**：助手回复用面板内自带的小型 Markdown 渲染器（`renderMarkdown`）转成 React 节点——标题、粗体/斜体/删除线、行内代码、围栏代码、列表、引用、分隔线、链接、管道表格、段内换行。**不拼 HTML 字符串**，模型输出无法注入标记；流式期间未闭合的围栏按代码块渲染。用户提问保持原文，不参与渲染。回复容器是圆角底色块（无描边），代码与表格按主题 token 着色；流式与落定同色（不设 `data-live` 弱化色）。
 - **消息元信息**：每条消息渲染为「行容器 → 气泡 → 元信息行」：元信息行放复制按钮（DSH copy 轮廓，复制后短暂显示勾选）与时间戳（`HH:mm`，来自 Host 记录的 `at`；旧记录无该字段则不显示）。
 - **输入框**：套用原生 composer 的两段式结构（输入区 + 底部工具栏），背景是半透明毛玻璃（`backdrop-filter` + 内高光 + 主题描边）。左下角的模型胶囊取代宿主的权限选择：菜单向上弹出，列出 `MODELS` 的四条网页路由（普通 / 深度思考 / 智能搜索 / 搜索+深度思考），选择后由 `/quick-ask/send` 的 `thinking`/`search` 标志决定走哪条路由。选项由 `/quick-ask/status` 下发（Host 的 `MODELS` 单一来源），浏览器端保留一份首帧兜底表。发送按钮是纸飞机图标圆钮。
-- **数据面**：`/quick-ask/status`（面板状态 + 模型选项）、`/quick-ask/reset`（换线程）、`/quick-ask/send`（SSE 流式回复，请求断开即中止生成）。问答记录只进 `quickAsk` 账本，**不写会话日志**——这是整个功能的存在理由。
+- **附件**：回形针按钮打开多选文件选择器；选中的文件以原始字节 POST 到 `/quick-ask/upload`（文件名与媒体类型在 query，`readRawBody` 边读边限 20 MB），Host 调 `uploadFile`（`vision`/`file` 按媒体类型）上传到网页端并返回 id。发送时 id 进 `ref_file_ids`、文件名进 `quickAsk` 记录（气泡内展示为文件条）。只附文件不打字时 prompt 自动写成「请查看附件：…」，保证文本非空；发送失败会把暂存附件放回去，便于重试。
+- **数据面**：`/quick-ask/status`（面板状态 + 模型选项）、`/quick-ask/upload`（原始字节上传）、`/quick-ask/reset`（换线程）、`/quick-ask/send`（SSE 流式回复，请求断开即中止生成）。问答记录只进 `quickAsk` 账本，**不写会话日志**——这是整个功能的存在理由。
 - **失败语义**：创建线程（PoW、建会话、发背景）失败时面板报错、不落线程记录，可整轮重试；回复流中断则保留已到手的片段，父消息标记不动，避免重试分叉出两条回答。

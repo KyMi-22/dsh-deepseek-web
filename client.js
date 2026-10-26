@@ -166,6 +166,10 @@ window.__ModuleLoader__.load({
         'qa.hintTitle': '快捷侧问说明',
         'qa.copy': '复制',
         'qa.copied': '已复制',
+        'qa.attach': '添加文件',
+        'qa.uploading': '上传中…',
+        'qa.removeFile': '移除附件',
+        'qa.attachFailed': '附件 {name} 上传失败：{message}',
       },
       en: {
         'nav': 'DeepSeek Web',
@@ -264,6 +268,10 @@ window.__ModuleLoader__.load({
         'qa.hintTitle': 'About quick ask',
         'qa.copy': 'Copy',
         'qa.copied': 'Copied',
+        'qa.attach': 'Attach files',
+        'qa.uploading': 'Uploading…',
+        'qa.removeFile': 'Remove attachment',
+        'qa.attachFailed': 'Could not upload {name}: {message}',
       },
     };
 
@@ -828,6 +836,11 @@ window.__ModuleLoader__.load({
       const [modelOpen, setModelOpen] = useState(false);
       // Which message's copy button just copied (brief check-mark feedback).
       const [copiedKey, setCopiedKey] = useState(null);
+      // Files staged for the next question: `{ name, fileId }` after the web
+      // upload settled, so the send only needs to reference the ids.
+      const [attachments, setAttachments] = useState([]);
+      const [uploading, setUploading] = useState(0);
+      const fileInputRef = useRef(null);
       const t = useCallback(
         (key, values) => {
           const dictionary = dictionaries[localeId] ?? dictionaries.zh;
@@ -873,6 +886,43 @@ window.__ModuleLoader__.load({
         }
       }, [t]);
 
+      /**
+       * Upload staged files straight to the web product.
+       *
+       * The panel owns no attachment store: each file goes to
+       * `/quick-ask/upload` as raw bytes, the Host relays it to `upload_file`,
+       * and the returned id is what `ref_file_ids` takes on send. A failed file
+       * is reported and skipped — the others still stage.
+       */
+      const uploadFiles = useCallback(async (fileList) => {
+        const files = Array.from(fileList ?? []).filter((file) => file instanceof Blob);
+        if (files.length === 0) return;
+        setUploading((count) => count + files.length);
+        for (const file of files) {
+          try {
+            const name = typeof file.name === 'string' && file.name !== '' ? file.name : 'file';
+            const type = typeof file.type === 'string' && file.type !== '' ? file.type : 'application/octet-stream';
+            const response = await fetch(
+              `${API_PATH}/quick-ask/upload?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`,
+              {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'content-type': type },
+                body: file,
+              },
+            );
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok || !body.ok) throw new Error(body.error || `HTTP ${response.status}`);
+            setAttachments((list) => [...list, { name, fileId: body.fileId }]);
+          } catch (error) {
+            const message = String(error && error.message ? error.message : error);
+            setNotice({ kind: 'bad', text: t('qa.attachFailed', { name: file.name || '?', message }) });
+          } finally {
+            setUploading((count) => Math.max(0, count - 1));
+          }
+        }
+      }, [t]);
+
       const refresh = useCallback(async () => {
         try {
           const response = await fetch(`${API_PATH}/quick-ask/status?sessionId=${encodeURIComponent(sessionId)}`, { credentials: 'same-origin' });
@@ -905,14 +955,19 @@ window.__ModuleLoader__.load({
        * composer's model chip decides the web request flags.
        */
       const send = useCallback(async () => {
-        const prompt = draft.trim();
-        if (prompt === '' || busy) return;
+        const typed = draft.trim();
+        const staged = attachments.slice();
+        const prompt = typed !== ''
+          ? typed
+          : (staged.length > 0 ? `请查看附件：${staged.map((item) => item.name).join('、')}` : '');
+        if (prompt === '' || busy || uploading > 0) return;
         const options = Array.isArray(status?.models) && status.models.length > 0 ? status.models : QUICK_ASK_MODEL_FALLBACK;
         const selected = options.find((entry) => entry.id === modelId) ?? options[0];
         setBusy(true);
         setNotice(null);
-        setLive({ answer: '', reasoning: '', prompt, at: Date.now() });
+        setLive({ answer: '', reasoning: '', prompt: typed, at: Date.now(), files: staged.map((item) => ({ name: item.name })) });
         setDraft('');
+        setAttachments([]);
         try {
           const response = await fetch(`${API_PATH}/quick-ask/send`, {
             method: 'POST',
@@ -923,6 +978,8 @@ window.__ModuleLoader__.load({
               prompt,
               thinking: selected.thinking === true,
               search: selected.search === true,
+              refFileIds: staged.map((item) => item.fileId),
+              files: staged.map((item) => ({ name: item.name })),
             }),
           });
           if (!response.ok || response.body === null) {
@@ -956,13 +1013,16 @@ window.__ModuleLoader__.load({
             }
           }
         } catch (error) {
+          // The turn never left: put the staged files back so the user can
+          // retry without re-picking them.
+          if (staged.length > 0) setAttachments(staged);
           setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
         } finally {
           setBusy(false);
           setLive(null);
           await refresh();
         }
-      }, [sessionId, draft, busy, status, modelId, t]);
+      }, [sessionId, draft, busy, status, modelId, uploading, attachments, t]);
       const reset = useCallback(async () => {
         setBusy(true);
         setNotice(null);
@@ -1040,9 +1100,20 @@ window.__ModuleLoader__.load({
                 const rowKey = String(index);
                 const isUser = row.role === 'user';
                 const at = row.at ?? (row.live === true ? live?.at : undefined);
+                const rowFiles = Array.isArray(row.files) ? row.files : [];
                 return h('div', { key: rowKey, className: `dsh-qa-msg ${isUser ? 'dsh-qa-msg-user' : 'dsh-qa-msg-assistant'}` }, [
-                  h('div', { key: 'bubble', className: isUser ? 'dsh-qa-user' : 'dsh-qa-assistant' },
-                    isUser ? row.text : renderMarkdown(row.text)),
+                  h('div', { key: 'bubble', className: isUser ? 'dsh-qa-user' : 'dsh-qa-assistant' }, [
+                    isUser
+                      ? (row.text === '' ? null : h('span', { key: 'text', className: 'dsh-qa-usertext' }, row.text))
+                      : h('div', { key: 'md' }, renderMarkdown(row.text)),
+                    isUser && rowFiles.length > 0
+                      ? h('div', { key: 'files', className: 'dsh-qa-files' }, rowFiles.map((file, fileIndex) => h('span', {
+                          key: String(fileIndex),
+                          className: 'dsh-qa-file',
+                          title: typeof file?.name === 'string' ? file.name : '',
+                        }, typeof file?.name === 'string' ? file.name : '')))
+                      : null,
+                  ]),
                   h('div', { key: 'meta', className: 'dsh-qa-msgmeta' }, [
                     h('button', {
                       key: 'copy',
@@ -1057,6 +1128,22 @@ window.__ModuleLoader__.load({
                 ]);
               })),
         h('div', { key: 'input', className: 'dsh-qa-composer' }, [
+          attachments.length > 0 || uploading > 0
+            ? h('div', { key: 'pending', className: 'dsh-qa-pending' }, [
+                ...attachments.map((item, index) => h('span', { key: `file-${index}`, className: 'dsh-qa-file' }, [
+                  h('span', { key: 'name', className: 'dsh-qa-filename' }, item.name),
+                  h('button', {
+                    key: 'remove',
+                    className: 'dsh-qa-fileremove',
+                    type: 'button',
+                    title: t('qa.removeFile'),
+                    'aria-label': t('qa.removeFile'),
+                    onClick: () => setAttachments((list) => list.filter((_, at) => at !== index)),
+                  }, '×'),
+                ])),
+                uploading > 0 ? h('span', { key: 'uploading', className: 'dsh-qa-uploading' }, t('qa.uploading')) : null,
+              ])
+            : null,
           h('textarea', {
             key: 'text',
             className: 'dsh-qa-textarea',
@@ -1073,6 +1160,29 @@ window.__ModuleLoader__.load({
             },
           }),
           h('div', { key: 'bar', className: 'dsh-qa-composerbar' }, [
+            h('div', { key: 'tools', className: 'dsh-qa-composertools' }, [
+              h('button', {
+                key: 'attach',
+                className: 'dsh-qa-attach',
+                type: 'button',
+                title: t('qa.attach'),
+                'aria-label': t('qa.attach'),
+                disabled: busy || uploading > 0,
+                onClick: () => fileInputRef.current?.click(),
+              }, h(PaperclipIcon)),
+              h('input', {
+                key: 'fileinput',
+                ref: fileInputRef,
+                type: 'file',
+                multiple: true,
+                style: { display: 'none' },
+                onChange: (event) => {
+                  const picked = event.target.files;
+                  void uploadFiles(picked);
+                  event.target.value = '';
+                },
+              }),
+            ]),
             // The shell's permission picker is replaced by the web-model
             // picker: the quick-ask panel never runs local tools, so the
             // meaningful choice here is which web route answers.
@@ -1120,7 +1230,7 @@ window.__ModuleLoader__.load({
               type: 'button',
               'aria-label': t('qa.send'),
               title: t('qa.send'),
-              disabled: busy || draft.trim() === '',
+              disabled: busy || uploading > 0 || (draft.trim() === '' && attachments.length === 0),
               onClick: send,
             }, h(SendIcon)),
           ]),
@@ -1198,8 +1308,20 @@ window.__ModuleLoader__.load({
       '.dsh-qa-composer{position:relative;display:flex;flex-direction:column;gap:6px;padding:8px 10px 8px 14px;border-radius:var(--dsw-radius-panel,28px);background:color-mix(in srgb, var(--dsw-specific-input-major,#fff) 58%, transparent);-webkit-backdrop-filter:blur(20px) saturate(1.7);backdrop-filter:blur(20px) saturate(1.7);border:1px solid color-mix(in srgb, var(--dsw-alias-border-l2,rgba(0,0,0,.12)) 70%, transparent);box-shadow:var(--dsw-elevation-soft,0 4px 16px rgba(0,0,0,.05)),inset 0 1px 0 color-mix(in srgb, var(--dsw-static-neutral-bluish-00,#fff) 60%, transparent)}',
       '.dsh-qa-textarea{flex:1 1 auto;min-height:38px;max-height:120px;resize:none;padding:2px 2px 0;border:none;background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);font-family:inherit;line-height:1.55;outline:none}',
       '.dsh-qa-textarea::placeholder{color:var(--dsw-alias-label-tertiary,#81858c)}',
-      '.dsh-qa-composerbar{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:28px}',
-      '.dsh-qa-modelwrap{position:relative;min-width:0;display:flex}',
+      '.dsh-qa-composerbar{display:flex;align-items:center;gap:6px;min-height:28px}',
+      '.dsh-qa-composertools{display:flex;align-items:center;gap:2px;flex:none}',
+      '.dsh-qa-attach{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-tertiary,#81858c);cursor:pointer}',
+      '.dsh-qa-attach:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-secondary,#61666b)}',
+      '.dsh-qa-attach:disabled{opacity:.45;cursor:default}',
+      '.dsh-qa-attach svg{width:15px;height:15px}',
+      '.dsh-qa-pending{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:2px 2px 0}',
+      '.dsh-qa-file{display:inline-flex;align-items:center;gap:4px;max-width:100%;padding:2px 8px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.1));color:var(--dsw-alias-label-secondary,#61666b);font-size:11.5px}',
+      '.dsh-qa-filename{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.dsh-qa-fileremove{border:none;background:transparent;color:inherit;cursor:pointer;padding:0 2px;font-size:12px;line-height:1}',
+      '.dsh-qa-uploading{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-files{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}',
+      '.dsh-qa-usertext{white-space:pre-wrap}',
+      '.dsh-qa-modelwrap{position:relative;min-width:0;display:flex;flex:0 1 auto}',
       '.dsh-qa-model{display:inline-flex;align-items:center;gap:4px;max-width:100%;min-width:0;height:26px;padding:0 8px;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-tertiary,#81858c);font-size:12px;font-family:inherit;cursor:pointer}',
       '.dsh-qa-model:hover,.dsh-qa-model[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-secondary,#61666b)}',
       '.dsh-qa-modelname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -1212,7 +1334,7 @@ window.__ModuleLoader__.load({
       '.dsh-qa-modelrow[aria-selected="true"]{background:var(--dsw-alias-state-business-tertiary,rgba(77,107,254,.12))}',
       '.dsh-qa-modelrowname{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.dsh-qa-modelrowdesc{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-      '.dsh-qa-send{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;width:30px;height:30px;padding:0;border:none;border-radius:50%;background:var(--dsw-alias-button-primary-fill,#4176e6);color:var(--dsw-alias-label-primary-foreground,#fff);cursor:pointer}',
+      '.dsh-qa-send{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;width:30px;height:30px;padding:0;border:none;border-radius:50%;background:var(--dsw-alias-button-primary-fill,#4176e6);color:var(--dsw-alias-label-primary-foreground,#fff);cursor:pointer;margin-left:auto}',
       '.dsh-qa-send svg{width:16px;height:16px}',
       '.dsh-qa-send:hover:not(:disabled){opacity:.92}',
       '.dsh-qa-send:disabled{opacity:.4;cursor:default}',
@@ -1278,6 +1400,18 @@ window.__ModuleLoader__.load({
     function CheckIcon() {
       return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
         h('path', { key: 'k', d: 'M2.25 8.5L5.49732 11.7473C5.90519 12.1552 6.57263 12.1344 6.95426 11.7018L13.75 4', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
+
+    /** The DSH paperclip glyph, used by the composer's attach button. */
+    function PaperclipIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', {
+          key: 'p',
+          d: 'M12.75 4.5V9.5C12.75 10.7598 12.2496 11.968 11.3588 12.8588C10.468 13.7496 9.25978 14.25 8 14.25C6.74022 14.25 5.53204 13.7496 4.64124 12.8588C3.75045 11.968 3.25 10.7598 3.25 9.5V5C3.25 4.13805 3.59241 3.3114 4.2019 2.7019C4.8114 2.09241 5.63805 1.75 6.5 1.75C7.36195 1.75 8.1886 2.09241 8.7981 2.7019C9.40759 3.3114 9.75 4.13805 9.75 5V9.5C9.75 9.96413 9.56563 10.4092 9.23744 10.7374C8.90925 11.0656 8.46413 11.25 8 11.25C7.53587 11.25 7.09075 11.0656 6.76256 10.7374C6.43437 10.4092 6.25 9.96413 6.25 9.5V5.5',
+          stroke: 'currentColor',
+          strokeWidth: 1,
+        }),
       ]);
     }
 

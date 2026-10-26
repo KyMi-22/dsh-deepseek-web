@@ -381,14 +381,15 @@ export class DeepSeekWebApi {
   }
 
   /**
-   * Upload one image and wait for its parse to settle.
+   * Upload one file — image or document — and wait for its parse to settle.
    *
    * The browser client uploads through `POST /api/v0/file/upload_file` with a
    * multipart form whose only field is `file`. Three custom headers ride along:
    * the PoW proof solved for THIS endpoint (`target_path` differs from the
    * completion one, so the completion header cannot be reused), the model kind
-   * the file is destined for, and the byte size. The reply's `data.biz_data.id`
-   * is the value `ref_file_ids` takes on the next completion call.
+   * the file is destined for (`vision` for images, `file` for documents), and
+   * the byte size. The reply's `data.biz_data.id` is the value `ref_file_ids`
+   * takes on the next completion call.
    *
    * The upload lands as `PENDING` and the server parses it asynchronously; a
    * completion referencing a still-parsing id is refused with HTTP 422. This
@@ -402,17 +403,18 @@ export class DeepSeekWebApi {
    * @param {{
    *   bytes: Uint8Array,
    *   mediaType: string,
-   *   fileName?: string,
+   *   fileName: string,
+   *   modelType?: 'vision' | 'file',
    *   thinking?: boolean,
    *   signal?: AbortSignal,
    * }} request
    * @returns {Promise<string>} the uploaded file's id.
    */
-  async uploadImage(request) {
+  async uploadFile(request) {
     if (!this.ready) {
       throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL', { submitted: false });
     }
-    const { bytes, mediaType, fileName = 'image.png', thinking = false, signal } = request;
+    const { bytes, mediaType, fileName, modelType = 'file', thinking = false, signal } = request;
 
     const powHeader = await this.solveChallenge(UPLOAD_PATH, { signal }).catch((error) => {
       markUnsubmitted(error);
@@ -430,7 +432,7 @@ export class DeepSeekWebApi {
         headers: this.headers({
           'X-DS-PoW-Response': powHeader,
           'x-thinking-enabled': thinking ? '1' : '0',
-          'x-model-type': 'vision',
+          'x-model-type': modelType,
           'x-file-size': String(bytes.length),
         }),
         body: form,
@@ -444,7 +446,7 @@ export class DeepSeekWebApi {
     const text = await response.text();
     if (!response.ok) {
       throw new DeepSeekWebError(
-        `deepseek-web: image upload failed (HTTP ${response.status})`,
+        `deepseek-web: file upload failed (HTTP ${response.status})`,
         response.status === 401 || response.status === 403 ? 'UNAUTHORIZED' : 'TRANSPORT',
         { status: response.status },
       );
@@ -453,20 +455,40 @@ export class DeepSeekWebApi {
     try {
       json = text === '' ? {} : JSON.parse(text);
     } catch (error) {
-      throw new DeepSeekWebError('deepseek-web: image upload returned non-JSON', 'MALFORMED', { cause: error });
+      throw new DeepSeekWebError('deepseek-web: file upload returned non-JSON', 'MALFORMED', { cause: error });
     }
     if (json?.code !== 0 || json?.data?.biz_code !== 0) {
       throw new DeepSeekWebError(
-        `deepseek-web: image upload rejected (${json?.data?.biz_msg || json?.msg || 'unknown'})`,
+        `deepseek-web: file upload rejected (${json?.data?.biz_msg || json?.msg || 'unknown'})`,
         'BIZ',
       );
     }
     const id = json.data.biz_data?.id;
     if (typeof id !== 'string' || id === '') {
-      throw new DeepSeekWebError('deepseek-web: image upload returned no file id', 'MALFORMED');
+      throw new DeepSeekWebError('deepseek-web: file upload returned no file id', 'MALFORMED');
     }
     await this.waitForFile(id, { signal });
     return id;
+  }
+
+  /**
+   * Upload one image and wait for its parse to settle.
+   *
+   * @param {{
+   *   bytes: Uint8Array,
+   *   mediaType: string,
+   *   fileName?: string,
+   *   thinking?: boolean,
+   *   signal?: AbortSignal,
+   * }} request
+   * @returns {Promise<string>} the uploaded file's id.
+   */
+  async uploadImage(request) {
+    return this.uploadFile({
+      ...request,
+      fileName: request.fileName ?? 'image.png',
+      modelType: 'vision',
+    });
   }
 
   /**

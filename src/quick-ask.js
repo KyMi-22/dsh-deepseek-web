@@ -19,7 +19,7 @@
  */
 'use strict';
 
-import { isHumanMessage, isHarnessInjection } from './adapter.js';
+import { isHumanMessage, isHarnessInjection, mediaTypeForName } from './adapter.js';
 import { extractSessionTitle, quickAskTitle } from './quick-ask-tag.js';
 
 export { QUICK_ASK_FALLBACK_TITLE, QUICK_ASK_TAG, extractSessionTitle, isQuickAskTitle, quickAskTitle } from './quick-ask-tag.js';
@@ -342,6 +342,40 @@ export class QuickAsk {
   }
 
   /**
+   * Upload one panel attachment to the web product.
+   *
+   * The panel's files never touch the DSH attachment store: they go straight
+   * from the browser to `upload_file` and are referenced by id on the next
+   * completion, exactly like the conversation surface does. The model type
+   * follows the media type (`vision` for images, `file` for documents).
+   *
+   * @param {{ bytes: Uint8Array, fileName: string, mediaType?: string, signal?: AbortSignal }} request
+   * @returns {Promise<string>} the web file id for `ref_file_ids`.
+   */
+  async uploadFile(request) {
+    if (!this.api.ready) {
+      throw new Error('未配置 user token，请先在设置页保存');
+    }
+    const fileName = typeof request.fileName === 'string' && request.fileName.trim() !== ''
+      ? request.fileName.trim().replace(/[\\/]/gu, '_')
+      : '';
+    const mediaType = typeof request.mediaType === 'string' && request.mediaType !== ''
+      ? request.mediaType
+      : mediaTypeForName(fileName);
+    const named = /\.[A-Za-z0-9]{1,8}$/u.test(fileName)
+      ? fileName
+      : `${fileName === '' ? 'file' : fileName}.${mediaType.startsWith('image/') ? (mediaType === 'image/jpeg' ? 'jpg' : mediaType.slice(6)) : 'bin'}`;
+    return this.api.uploadFile({
+      bytes: request.bytes,
+      mediaType,
+      fileName: named,
+      modelType: mediaType.startsWith('image/') ? 'vision' : 'file',
+      thinking: false,
+      signal: request.signal,
+    });
+  }
+
+  /**
    * Send one prompt and return the settled answer's parent message id.
    *
    * Used only for the context primer during thread creation; panel questions
@@ -408,6 +442,12 @@ export class QuickAsk {
       // The question's clock starts when the panel asked; the answer's when it
       // settled, so the transcript can print both times.
       const askedAt = Date.now();
+      /** Attachment names the panel uploaded for this turn (display only). */
+      const files = Array.isArray(options.files)
+        ? options.files
+          .filter((file) => file !== null && typeof file === 'object' && typeof file.name === 'string' && file.name !== '')
+          .map((file) => ({ name: file.name }))
+        : [];
       let answer = '';
       let reasoning = '';
       let parentId = thread.parentMessageId;
@@ -418,6 +458,7 @@ export class QuickAsk {
           parentMessageId: thread.parentMessageId,
           thinking: options.thinking === true,
           search: options.search === true,
+          refFileIds: Array.isArray(options.refFileIds) ? options.refFileIds.filter((id) => typeof id === 'string' && id !== '') : [],
           signal: options.signal,
         })) {
           if (event.kind === 'message' && typeof event.messageId === 'number') {
@@ -445,7 +486,7 @@ export class QuickAsk {
       }
       thread.parentMessageId = parentId;
       thread.updatedAt = Date.now();
-      thread.exchanges.push({ role: 'user', text: clipStored(text), at: askedAt });
+      thread.exchanges.push({ role: 'user', text: clipStored(text), at: askedAt, ...(files.length > 0 ? { files } : {}) });
       thread.exchanges.push({ role: 'assistant', text: clipStored(answer), at: Date.now() });
       if (thread.exchanges.length > MAX_STORED_EXCHANGES * 2) {
         thread.exchanges.splice(0, thread.exchanges.length - MAX_STORED_EXCHANGES * 2);
