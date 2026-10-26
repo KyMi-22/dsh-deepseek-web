@@ -164,6 +164,8 @@ window.__ModuleLoader__.load({
         'qa.showHint': '显示说明',
         'qa.hideHint': '隐藏说明',
         'qa.hintTitle': '快捷侧问说明',
+        'qa.copy': '复制',
+        'qa.copied': '已复制',
       },
       en: {
         'nav': 'DeepSeek Web',
@@ -260,6 +262,8 @@ window.__ModuleLoader__.load({
         'qa.showHint': 'Show explanation',
         'qa.hideHint': 'Hide explanation',
         'qa.hintTitle': 'About quick ask',
+        'qa.copy': 'Copy',
+        'qa.copied': 'Copied',
       },
     };
 
@@ -822,6 +826,8 @@ window.__ModuleLoader__.load({
       // The composer's model menu replaces the shell's permission picker.
       const [modelId, setModelId] = useState(QUICK_ASK_MODEL_FALLBACK[0].id);
       const [modelOpen, setModelOpen] = useState(false);
+      // Which message's copy button just copied (brief check-mark feedback).
+      const [copiedKey, setCopiedKey] = useState(null);
       const t = useCallback(
         (key, values) => {
           const dictionary = dictionaries[localeId] ?? dictionaries.zh;
@@ -829,6 +835,43 @@ window.__ModuleLoader__.load({
         },
         [localeId],
       );
+
+      /** Clock time for one message; older records have no `at` and show none. */
+      const formatTime = useCallback((ms) => {
+        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '';
+        try {
+          return new Date(ms).toLocaleTimeString(localeId === 'zh' ? 'zh-CN' : 'en-US', { hour: '2-digit', minute: '2-digit' });
+        } catch {
+          return '';
+        }
+      }, [localeId]);
+
+      /**
+       * Copy one message's text, then flash the button into a check mark.
+       *
+       * The clipboard API covers the shell's Chromium; the textarea fallback
+       * keeps the button working in compositions that withhold it.
+       */
+      const copyMessage = useCallback(async (key, text) => {
+        try {
+          if (typeof navigator !== 'undefined' && navigator?.clipboard?.writeText !== undefined) {
+            await navigator.clipboard.writeText(text);
+          } else if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+            const area = document.createElement('textarea');
+            area.value = text;
+            area.style.position = 'fixed';
+            area.style.opacity = '0';
+            document.body.appendChild(area);
+            area.select();
+            document.execCommand('copy');
+            document.body.removeChild(area);
+          }
+          setCopiedKey(key);
+          setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 1600);
+        } catch (error) {
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        }
+      }, [t]);
 
       const refresh = useCallback(async () => {
         try {
@@ -868,7 +911,7 @@ window.__ModuleLoader__.load({
         const selected = options.find((entry) => entry.id === modelId) ?? options[0];
         setBusy(true);
         setNotice(null);
-        setLive({ answer: '', reasoning: '', prompt });
+        setLive({ answer: '', reasoning: '', prompt, at: Date.now() });
         setDraft('');
         try {
           const response = await fetch(`${API_PATH}/quick-ask/send`, {
@@ -993,11 +1036,26 @@ window.__ModuleLoader__.load({
         h('div', { key: 'list', className: 'dsh-qa-list', ref: listRef },
           rows.length === 0
             ? h('div', { key: 'empty', className: 'dsh-qa-empty' }, t('qa.empty'))
-            : rows.map((row, index) => h('div', {
-                key: String(index),
-                className: row.role === 'user' ? 'dsh-qa-user' : 'dsh-qa-assistant',
-                'data-live': row.live === true ? 'true' : undefined,
-              }, row.role === 'user' ? row.text : renderMarkdown(row.text)))),
+            : rows.map((row, index) => {
+                const rowKey = String(index);
+                const isUser = row.role === 'user';
+                const at = row.at ?? (row.live === true ? live?.at : undefined);
+                return h('div', { key: rowKey, className: `dsh-qa-msg ${isUser ? 'dsh-qa-msg-user' : 'dsh-qa-msg-assistant'}` }, [
+                  h('div', { key: 'bubble', className: isUser ? 'dsh-qa-user' : 'dsh-qa-assistant' },
+                    isUser ? row.text : renderMarkdown(row.text)),
+                  h('div', { key: 'meta', className: 'dsh-qa-msgmeta' }, [
+                    h('button', {
+                      key: 'copy',
+                      className: 'dsh-qa-copy',
+                      type: 'button',
+                      title: copiedKey === rowKey ? t('qa.copied') : t('qa.copy'),
+                      'aria-label': copiedKey === rowKey ? t('qa.copied') : t('qa.copy'),
+                      onClick: () => copyMessage(rowKey, row.text),
+                    }, copiedKey === rowKey ? h(CheckIcon) : h(CopyIcon)),
+                    h('span', { key: 'time', className: 'dsh-qa-time' }, formatTime(at)),
+                  ]),
+                ]);
+              })),
         h('div', { key: 'input', className: 'dsh-qa-composer' }, [
           h('textarea', {
             key: 'text',
@@ -1104,9 +1162,16 @@ window.__ModuleLoader__.load({
       '.dsh-qa-notice{font-size:12.5px;line-height:1.55;border-radius:var(--dsw-radius-sm,8px);padding:8px 12px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
       '.dsh-qa-notice[data-kind="bad"]{color:var(--dsw-alias-label-error,#e03131)}',
       '.dsh-qa-list{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:8px;overflow-y:auto;padding:2px 2px 2px 0;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}',
-      '.dsh-qa-user{align-self:flex-end;max-width:86%;padding:7px 11px;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-specific-bubble,#edf3fe);color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.55;white-space:pre-wrap;word-break:break-word}',
-      '.dsh-qa-assistant{align-self:flex-start;max-width:100%;padding:7px 11px;border-radius:var(--dsw-radius-lg,16px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.2));background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.07));color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.65;word-break:break-word;overflow-wrap:anywhere}',
-      '.dsh-qa-assistant[data-live="true"]{color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-msg{display:flex;flex-direction:column;gap:2px;min-width:0}',
+      '.dsh-qa-msg-user{align-items:flex-end}',
+      '.dsh-qa-msg-assistant{align-items:flex-start}',
+      '.dsh-qa-user{max-width:86%;padding:7px 11px;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-specific-bubble,#edf3fe);color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.55;white-space:pre-wrap;word-break:break-word}',
+      '.dsh-qa-assistant{max-width:100%;padding:7px 11px;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.07));color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.65;word-break:break-word;overflow-wrap:anywhere}',
+      '.dsh-qa-msgmeta{display:flex;align-items:center;gap:6px;min-height:22px;font-size:11px;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-copy{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:none;border-radius:6px;background:transparent;color:inherit;cursor:pointer;opacity:.75}',
+      '.dsh-qa-copy:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));opacity:1}',
+      '.dsh-qa-copy svg{width:13px;height:13px}',
+      '.dsh-qa-time{font-variant-numeric:tabular-nums}',
       '.dsh-qa-assistant > :first-child{margin-top:0}',
       '.dsh-qa-assistant > :last-child{margin-bottom:0}',
       '.dsh-qa-assistant p{margin:0 0 8px}',
@@ -1198,6 +1263,21 @@ window.__ModuleLoader__.load({
       return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
         h('path', { key: 's1', d: 'M4.74024 9.11029L1.82882 7.79865C1.75022 7.76323 1.75026 7.65161 1.82889 7.61626L12.9665 2.60943C13.0354 2.57846 13.1125 2.63213 13.1073 2.70749L12.3914 13.1388C12.3864 13.2117 12.3073 13.2548 12.2433 13.2194L6.12677 9.83657', stroke: 'currentColor', strokeWidth: 1 }),
         h('path', { key: 's2', d: 'M8.44336 11.0825L6.2832 13.2843C6.22048 13.3482 6.11182 13.3038 6.11182 13.2143V9.86772C6.11182 9.84165 6.122 9.8166 6.1402 9.79793L12.972 2.78748', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
+
+    /** The DSH copy glyph, used by each message's copy button. */
+    function CopyIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('rect', { key: 'c1', x: '1.52075', y: '4.07373', width: '10.3932', height: '10.3932', rx: '2', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 'c2', d: 'M11.9792 1.53296C13.36 1.53296 14.4792 2.65225 14.4792 4.03296V9.42847C14.4792 10.3756 13.9521 11.1987 13.1755 11.6228V10.3298C13.3652 10.0787 13.4792 9.7674 13.4792 9.42847V4.03296C13.4792 3.20453 12.8077 2.53296 11.9792 2.53296H6.58374C6.27966 2.53301 5.99684 2.6235 5.7605 2.77905H4.42358C4.85652 2.03463 5.66056 1.53304 6.58374 1.53296H11.9792Z', fill: 'currentColor' }),
+      ]);
+    }
+
+    /** The DSH check glyph, shown briefly after a copy. */
+    function CheckIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'k', d: 'M2.25 8.5L5.49732 11.7473C5.90519 12.1552 6.57263 12.1344 6.95426 11.7018L13.75 4', stroke: 'currentColor', strokeWidth: 1 }),
       ]);
     }
 

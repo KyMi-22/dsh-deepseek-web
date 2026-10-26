@@ -200,7 +200,7 @@ function clipStored(text) {
  * @property {string} contextSent - the primer the thread was seeded with
  * @property {string} [sessionTitle] - the DSH conversation title the thread is named after
  * @property {boolean} [titled] - whether the `SideBar：` tag rename landed
- * @property {Array<{ role: 'user' | 'assistant', text: string }>} exchanges
+ * @property {Array<{ role: 'user' | 'assistant', text: string, at?: number }>} exchanges
  */
 
 /**
@@ -405,6 +405,9 @@ export class QuickAsk {
     try {
       const thread = await this.ensureThread(sessionId);
       yield { kind: 'start' };
+      // The question's clock starts when the panel asked; the answer's when it
+      // settled, so the transcript can print both times.
+      const askedAt = Date.now();
       let answer = '';
       let reasoning = '';
       let parentId = thread.parentMessageId;
@@ -442,8 +445,8 @@ export class QuickAsk {
       }
       thread.parentMessageId = parentId;
       thread.updatedAt = Date.now();
-      thread.exchanges.push({ role: 'user', text: clipStored(text) });
-      thread.exchanges.push({ role: 'assistant', text: clipStored(answer) });
+      thread.exchanges.push({ role: 'user', text: clipStored(text), at: askedAt });
+      thread.exchanges.push({ role: 'assistant', text: clipStored(answer), at: Date.now() });
       if (thread.exchanges.length > MAX_STORED_EXCHANGES * 2) {
         thread.exchanges.splice(0, thread.exchanges.length - MAX_STORED_EXCHANGES * 2);
       }

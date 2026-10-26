@@ -311,8 +311,8 @@ assert.equal(typeof Page, 'function', 'registered value is a component');
       streaming: false,
       contextChars: 1200,
       exchanges: [
-        { role: 'user', text: '怎么用 **强调**？' },
-        { role: 'assistant', text: '答案：\n\n**重点**\n\n- 第一点\n- 第二点\n\n```js\nconst a = 1;\n```\n\n[链接](https://example.com)' },
+        { role: 'user', text: '怎么用 **强调**？', at: Date.now() - 60_000 },
+        { role: 'assistant', text: '答案：\n\n**重点**\n\n- 第一点\n- 第二点\n\n```js\nconst a = 1;\n```\n\n[链接](https://example.com)', at: Date.now() },
       ],
     },
     '',
@@ -345,6 +345,20 @@ assert.equal(typeof Page, 'function', 'registered value is a component');
   assert.ok(hintBody, 'the hint body exists');
   hintBar.props.onClick();
   assert.equal(stateValues[5], false, 'clicking the bar collapses the hint');
+
+  // Per-message affordances: a copy button and a timestamp under each box.
+  const copyButtons = elements.filter((node) => node.type === 'button' && node.props?.className === 'dsh-qa-copy');
+  assert.equal(copyButtons.length, 2, 'one copy button per message');
+  assert.ok(copyButtons.every((node) => typeof node.props['aria-label'] === 'string' && node.props['aria-label'].length > 0), 'copy buttons are labelled');
+  const times = elements.filter((node) => node.type === 'span' && node.props?.className === 'dsh-qa-time');
+  assert.equal(times.length, 2, 'one timestamp per message');
+  for (const node of times) {
+    const label = typeof node.props.children === 'string' ? node.props.children : '';
+    assert.ok(/^\d{1,2}:\d{2}/u.test(label), `timestamp looks like a clock time (got ${JSON.stringify(label)})`);
+  }
+  // The message wrappers carry alignment; the bubble is a child, not the row.
+  assert.ok(elements.some((node) => typeof node.props?.className === 'string' && node.props.className.includes('dsh-qa-msg-user')), 'user rows wrap their bubble');
+  assert.ok(elements.some((node) => typeof node.props?.className === 'string' && node.props.className.includes('dsh-qa-msg-assistant')), 'assistant rows wrap their bubble');
 }
 
 // ── quick-ask: composer (glass box, model picker, send) ───────────────────
