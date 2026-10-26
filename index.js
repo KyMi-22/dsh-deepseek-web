@@ -945,7 +945,6 @@ export async function apply(ctx, config = {}) {
                   bytes,
                   fileName,
                   mediaType,
-                  signal: undefined,
                 });
                 sendJson(res, 200, { ok: true, fileId, name: fileName });
               } catch (error) {

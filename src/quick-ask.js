@@ -76,8 +76,6 @@ function clip(text, budget = MAX_TURN_CHARS) {
  */
 export function extractExchanges(events) {
   const turns = [];
-  /** Index of the open user turn; `-1` when the last user turn was answered. */
-  let openUser = -1;
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue;
     const type = event.type;
@@ -90,7 +88,6 @@ export function extractExchanges(events) {
       const text = contentToText(message.content);
       if (text === '' || isHarnessInjection(text)) continue;
       turns.push({ role: 'user', text });
-      openUser = turns.length - 1;
       continue;
     }
 
@@ -100,10 +97,7 @@ export function extractExchanges(events) {
       const text = contentToText(message.content);
       if (text === '') continue;
       turns.push({ role: 'assistant', text });
-      openUser = -1;
-      continue;
     }
-    void openUser;
   }
   return turns;
 }
@@ -449,7 +443,6 @@ export class QuickAsk {
           .map((file) => ({ name: file.name }))
         : [];
       let answer = '';
-      let reasoning = '';
       let parentId = thread.parentMessageId;
       try {
         for await (const event of this.api.streamCompletion({
@@ -467,7 +460,6 @@ export class QuickAsk {
           }
           if (event.kind === 'fragment' && event.text !== '') {
             if (event.fragmentType === 'THINK') {
-              reasoning += event.text;
               yield { kind: 'reasoning', text: event.text };
             } else {
               answer += event.text;

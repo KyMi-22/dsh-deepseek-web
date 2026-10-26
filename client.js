@@ -148,7 +148,6 @@ window.__ModuleLoader__.load({
         'time.days': '{n} 天前',
         'qa.tab.title': '快捷侧问',
         'qa.entry.label': '快捷侧问（DeepSeek 网页版）',
-        'qa.title': '快捷侧问',
         'qa.hint': '在这里向 DeepSeek 网页版提问。面板打开时已把当前对话压缩成背景发给它；问答只留在这个面板里，不会写进当前对话。',
         'qa.placeholder': '问点什么…（Enter 发送，Shift+Enter 换行）',
         'qa.send': '发送',
@@ -160,7 +159,6 @@ window.__ModuleLoader__.load({
         'qa.contextNone': '无背景（当前对话还没有内容）',
         'qa.error': '出错了：{message}',
         'qa.streamError': '回复中断：{message}',
-        'qa.busy': '上一条回复还在进行中',
         'qa.showHint': '显示说明',
         'qa.hideHint': '隐藏说明',
         'qa.hintTitle': '快捷侧问说明',
@@ -250,7 +248,6 @@ window.__ModuleLoader__.load({
         'time.days': '{n} d ago',
         'qa.tab.title': 'Quick ask',
         'qa.entry.label': 'Quick ask (DeepSeek Web)',
-        'qa.title': 'Quick ask',
         'qa.hint': 'Ask the DeepSeek web model here. The panel seeds a throwaway web thread with a compressed digest of this conversation when it opens; the exchange stays in this panel and never enters the conversation.',
         'qa.placeholder': 'Ask anything… (Enter to send, Shift+Enter for newline)',
         'qa.send': 'Send',
@@ -262,7 +259,6 @@ window.__ModuleLoader__.load({
         'qa.contextNone': 'No context (this conversation is still empty)',
         'qa.error': 'Failed: {message}',
         'qa.streamError': 'Reply interrupted: {message}',
-        'qa.busy': 'A reply is still streaming',
         'qa.showHint': 'Show explanation',
         'qa.hideHint': 'Hide explanation',
         'qa.hintTitle': 'About quick ask',
@@ -1663,7 +1659,7 @@ window.__ModuleLoader__.load({
           id: 'deepseek-web-quick-ask',
           order: 10,
           locale: NS,
-        }, (props) => {
+        }, () => {
           const open = () => {
             try {
               sidebarRight.openTab(QA_TAB_KIND, { preferNewPane: true });
