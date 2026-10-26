@@ -109,6 +109,8 @@ export function sessionDirFor(sessionId, cwd) {
  * @property {string | null} lastSyncError - why the last per-conversation import failed
  * @property {string | null} lastWorkspaceError - why grouping or provisioning failed
  * @property {object | null} lastReport - the last sync report, kept for diagnosis
+ * @property {Record<string, import('./quick-ask.js').QuickAskThread>} quickAsk
+ *   quick-ask side threads, keyed by the DSH session id they serve
  */
 
 /** Empty state with a stable random device id. */
@@ -124,6 +126,7 @@ function emptyState() {
     lastSyncError: null,
     lastWorkspaceError: null,
     lastReport: null,
+    quickAsk: {},
   };
 }
 
@@ -156,6 +159,7 @@ export async function loadState() {
     lastSyncError: typeof parsed.lastSyncError === 'string' ? parsed.lastSyncError : null,
     lastWorkspaceError: typeof parsed.lastWorkspaceError === 'string' ? parsed.lastWorkspaceError : null,
     lastReport: parsed.lastReport !== null && typeof parsed.lastReport === 'object' ? parsed.lastReport : null,
+    quickAsk: parsed.quickAsk !== null && typeof parsed.quickAsk === 'object' ? parsed.quickAsk : {},
   };
 }
 

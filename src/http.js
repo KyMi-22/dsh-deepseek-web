@@ -50,3 +50,25 @@ export async function readJsonBody(req) {
   const parsed = JSON.parse(text);
   return parsed !== null && typeof parsed === 'object' ? parsed : {};
 }
+
+/**
+ * Read a raw binary body under a caller-supplied cap.
+ *
+ * Used by the quick-ask upload route: the browser posts the file's exact bytes
+ * with its media type in the request headers, so there is no multipart to
+ * parse. The cap is enforced while reading for the same reason as above.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} maxBytes
+ * @returns {Promise<Buffer>}
+ */
+export async function readRawBody(req, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > maxBytes) throw Object.assign(new Error('request body too large'), { code: 'TOO_LARGE', limit: maxBytes });
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}

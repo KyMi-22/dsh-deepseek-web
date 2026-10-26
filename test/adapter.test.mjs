@@ -40,6 +40,16 @@ function fakeApi(events, options = {}) {
       calls.uploads.push({ mediaType: request.mediaType, fileName: request.fileName, bytes: request.bytes?.length ?? 0 });
       return `file-${calls.uploads.length}`;
     },
+    async uploadFile(request) {
+      calls.fileUploads ??= [];
+      calls.fileUploads.push({
+        mediaType: request.mediaType,
+        fileName: request.fileName,
+        modelType: request.modelType,
+        bytes: request.bytes?.length ?? 0,
+      });
+      return `doc-${calls.fileUploads.length}`;
+    },
     async *streamCompletion(request) {
       calls.completions.push({
         prompt: request.prompt,
@@ -106,6 +116,9 @@ function makeAdapter(events, options = {}) {
   });
   if (options.readImage !== undefined) {
     adapter.deps.readImage = options.readImage;
+  }
+  if (options.readFileBytes !== undefined) {
+    adapter.deps.readFileBytes = options.readFileBytes;
   }
   return { adapter, bindings, api, sent };
 }
@@ -302,6 +315,85 @@ assert.equal(
     ['image.png', 'image.png', 'image.png', 'shot.png'],
     'names without the declared extension are regenerated; a matching one is kept',
   );
+}
+
+// ── document blocks upload with the `file` model type ─────────────────────
+{
+  const reads = [];
+  const { adapter, api } = makeAdapter([ANSWER('收到')], {
+    readFileBytes: async (ref) => {
+      reads.push(ref);
+      return new Uint8Array([0x25, 0x50, 0x44, 0x46]); // "%PDF"
+    },
+  });
+  const messages = [
+    {
+      id: 'm1',
+      role: 'user',
+      content: [
+        { type: 'text', text: '看看这个 PDF' },
+        { type: 'file', attachment: { attachmentId: 'doc-1', name: 'report.pdf', bytes: 4 } },
+      ],
+      source: { kind: 'user' },
+    },
+  ];
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages, sessionId: 'sess-doc',
+  })) {
+    chunks.push(chunk);
+  }
+  assert.equal(reads.length, 1, 'the verbatim bytes were read once');
+  assert.deepEqual(reads[0], { attachmentId: 'doc-1', name: 'report.pdf' }, 'the file reference reaches the store');
+  assert.deepEqual(api.calls.fileUploads, [{
+    mediaType: 'application/pdf',
+    fileName: 'report.pdf',
+    modelType: 'file',
+    bytes: 4,
+  }], 'the document uploads as a file with its own name and media type');
+  assert.deepEqual(api.calls.completions[0].refFileIds, ['doc-1'], 'the document id rides on the completion');
+  // The prompt keeps a `[文件]` placeholder for the block: a file-only turn
+  // still has a non-empty prompt, and the model sees which turn carried it.
+  assert.equal(api.calls.completions[0].prompt, '看看这个 PDF\n[文件]', 'the text prompt keeps its placeholder');
+  assert.ok(api.calls.completions.length === 1, 'one completion for the turn');
+  assert.equal(api.calls.uploads, undefined, 'the image path was not used');
+  assert.ok(chunks.some((chunk) => chunk.type === 'text-delta'), 'the reply streamed');
+}
+
+// ── a document upload failure is not retried as if it were submitted ──────
+{
+  const { adapter, api, sent } = makeAdapter([ANSWER('收到')], {
+    readFileBytes: async () => new Uint8Array([1]),
+  });
+  const original = api.uploadFile;
+  api.uploadFile = async () => {
+    throw new Error('upload refused');
+  };
+  const messages = [
+    {
+      id: 'm1',
+      role: 'user',
+      content: [
+        { type: 'text', text: '附件' },
+        { type: 'file', attachment: { attachmentId: 'doc-1', name: 'x.docx', bytes: 1 } },
+      ],
+      source: { kind: 'user' },
+    },
+  ];
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages, sessionId: 'sess-doc-fail',
+  })) {
+    chunks.push(chunk);
+  }
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.ok(finish?.reason?.kind === 'error', 'the turn failed');
+  assert.ok(String(finish.reason.failure?.message).includes('upload refused'), 'the failure names the cause');
+  assert.equal(sent.get('sess-doc-fail')?.has('m1') ?? false, false, 'nothing was submitted, so the message is released for retry');
+  assert.equal(api.calls.completions.length, 0, 'no completion was attempted');
+  api.uploadFile = original;
 }
 
 // ── no images means no upload and an empty ref list ───────────────────────

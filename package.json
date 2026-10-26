@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-web",
-  "version": "0.2.1",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "把 DeepSeek 网页版（chat.deepseek.com）的对话接入 DSH：独立「对话」工作区、网页端模型直连（不消耗 API 余额）、双向延续对话。",
@@ -37,8 +37,8 @@
     "dsh": ">=0.2.0-rc.1 <0.3.0-0"
   },
   "scripts": {
-    "check": "node --check index.js && node --check client.js && node --check src/pow.js && node --check src/pow-async.js && node --check src/pow-worker.js && node --check src/api.js && node --check src/adapter.js && node --check src/store.js && node --check src/sync.js && node --check src/http.js && node --check src/tool-guard.js",
-    "test": "node test/pow.test.mjs && node test/sse.test.mjs && node test/retry-marker.test.mjs && node test/token-serial.test.mjs && node test/http.test.mjs && node test/adapter.test.mjs && node test/seed.test.mjs && node test/sync.test.mjs && node test/client-render.test.mjs && node test/security.test.mjs && node test/manifest.test.mjs && node test/hygiene.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --check src/pow.js && node --check src/pow-async.js && node --check src/pow-worker.js && node --check src/api.js && node --check src/adapter.js && node --check src/store.js && node --check src/sync.js && node --check src/http.js && node --check src/tool-guard.js && node --check src/quick-ask.js && node --check src/quick-ask-tag.js",
+    "test": "node test/pow.test.mjs && node test/sse.test.mjs && node test/retry-marker.test.mjs && node test/token-serial.test.mjs && node test/http.test.mjs && node test/upload.test.mjs && node test/adapter.test.mjs && node test/seed.test.mjs && node test/sync.test.mjs && node test/quick-ask.test.mjs && node test/client-render.test.mjs && node test/security.test.mjs && node test/manifest.test.mjs && node test/hygiene.test.mjs",
     "test:live": "node test/live-api.mjs && node test/live-image.mjs"
   },
   "dsh": {

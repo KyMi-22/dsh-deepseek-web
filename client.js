@@ -47,7 +47,7 @@ window.__ModuleLoader__.load({
     }
 
     const { jsx } = jsxRuntime;
-    const { useCallback, useEffect, useState } = react;
+    const { useCallback, useEffect, useRef, useState } = react;
 
     /**
      * Build one element with children folded into props.
@@ -146,6 +146,28 @@ window.__ModuleLoader__.load({
         'time.minutes': '{n} 分钟前',
         'time.hours': '{n} 小时前',
         'time.days': '{n} 天前',
+        'qa.tab.title': '快捷侧问',
+        'qa.entry.label': '快捷侧问（DeepSeek 网页版）',
+        'qa.hint': '在这里向 DeepSeek 网页版提问。面板打开时已把当前对话压缩成背景发给它；问答只留在这个面板里，不会写进当前对话。',
+        'qa.placeholder': '问点什么…（Enter 发送，Shift+Enter 换行）',
+        'qa.send': '发送',
+        'qa.reset': '刷新背景',
+        'qa.resetHint': '丢弃当前侧问线程，用当前对话的最新内容重新生成压缩背景。',
+        'qa.noToken': '尚未配置 user token：到 设置 → DeepSeek 网页版 保存后再来。',
+        'qa.empty': '还没有提问，直接输入即可。',
+        'qa.context': '背景 {chars} 字',
+        'qa.contextNone': '无背景（当前对话还没有内容）',
+        'qa.error': '出错了：{message}',
+        'qa.streamError': '回复中断：{message}',
+        'qa.showHint': '显示说明',
+        'qa.hideHint': '隐藏说明',
+        'qa.hintTitle': '快捷侧问说明',
+        'qa.copy': '复制',
+        'qa.copied': '已复制',
+        'qa.attach': '添加文件',
+        'qa.uploading': '上传中…',
+        'qa.removeFile': '移除附件',
+        'qa.attachFailed': '附件 {name} 上传失败：{message}',
       },
       en: {
         'nav': 'DeepSeek Web',
@@ -224,6 +246,28 @@ window.__ModuleLoader__.load({
         'time.minutes': '{n} min ago',
         'time.hours': '{n} h ago',
         'time.days': '{n} d ago',
+        'qa.tab.title': 'Quick ask',
+        'qa.entry.label': 'Quick ask (DeepSeek Web)',
+        'qa.hint': 'Ask the DeepSeek web model here. The panel seeds a throwaway web thread with a compressed digest of this conversation when it opens; the exchange stays in this panel and never enters the conversation.',
+        'qa.placeholder': 'Ask anything… (Enter to send, Shift+Enter for newline)',
+        'qa.send': 'Send',
+        'qa.reset': 'Refresh context',
+        'qa.resetHint': 'Drop the current side thread and reseed it with the latest digest of this conversation.',
+        'qa.noToken': 'No user token yet: save one in Settings → DeepSeek Web first.',
+        'qa.empty': 'Nothing asked yet — type below.',
+        'qa.context': '{chars} chars of context',
+        'qa.contextNone': 'No context (this conversation is still empty)',
+        'qa.error': 'Failed: {message}',
+        'qa.streamError': 'Reply interrupted: {message}',
+        'qa.showHint': 'Show explanation',
+        'qa.hideHint': 'Hide explanation',
+        'qa.hintTitle': 'About quick ask',
+        'qa.copy': 'Copy',
+        'qa.copied': 'Copied',
+        'qa.attach': 'Attach files',
+        'qa.uploading': 'Uploading…',
+        'qa.removeFile': 'Remove attachment',
+        'qa.attachFailed': 'Could not upload {name}: {message}',
       },
     };
 
@@ -727,7 +771,835 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    const inject = ['slots', 'locale'];
+    /**
+     * The composer's model choices, mirroring the host's `MODELS` table.
+     *
+     * The status route ships the same rows (with their thinking/search flags);
+     * this fallback keeps the menu usable in the first frames, before the
+     * first status response arrives.
+     */
+    const QUICK_ASK_MODEL_FALLBACK = [
+      { id: 'deepseek-web-chat', name: 'DeepSeek 网页版', description: '普通对话', thinking: false, search: false },
+      { id: 'deepseek-web-reasoner', name: 'DeepSeek 网页版 · 深度思考', description: '展示推理过程', thinking: true, search: false },
+      { id: 'deepseek-web-search', name: 'DeepSeek 网页版 · 智能搜索', description: '联网查证并给出引用', thinking: false, search: true },
+      { id: 'deepseek-web-search-think', name: 'DeepSeek 网页版 · 搜索 + 深度思考', description: '联网搜索后推理', thinking: true, search: true },
+    ];
+
+    /**
+     * The quick-ask panel body: a throwaway Q&A thread about the current
+     * conversation, answered on the web model. Renders the persisted
+     * transcript, streams the in-flight reply, and never writes anything back
+     * into the conversation.
+     */
+    function QuickAskPanel({ sessionId }) {
+      const [status, setStatus] = useState(null);
+      const [draft, setDraft] = useState('');
+      const [busy, setBusy] = useState(false);
+      const [live, setLive] = useState(null);
+      const [notice, setNotice] = useState(null);
+      // The explanation is hideable; the choice survives remounts of the tab
+      // body (a reload is the only thing that forgets it).
+      const [hintOpen, setHintOpen] = useState(() => {
+        try {
+          return localStorage.getItem('dsh.quick-ask.hint-open') !== '0';
+        } catch {
+          return true;
+        }
+      });
+      const toggleHint = useCallback(() => {
+        setHintOpen((open) => {
+          const next = !open;
+          try {
+            localStorage.setItem('dsh.quick-ask.hint-open', next ? '1' : '0');
+          } catch {
+            /* private mode may refuse storage; the toggle still works */
+          }
+          return next;
+        });
+      }, []);
+      const [localeId] = useState(
+        (() => {
+          try {
+            const lang = String(document.documentElement?.lang ?? '');
+            return lang.toLowerCase().startsWith('zh') ? 'zh' : 'en';
+          } catch {
+            return 'zh';
+          }
+        })(),
+      );
+      // The composer's model menu replaces the shell's permission picker.
+      const [modelId, setModelId] = useState(QUICK_ASK_MODEL_FALLBACK[0].id);
+      const [modelOpen, setModelOpen] = useState(false);
+      // Which message's copy button just copied (brief check-mark feedback).
+      const [copiedKey, setCopiedKey] = useState(null);
+      // Files staged for the next question: `{ name, fileId }` after the web
+      // upload settled, so the send only needs to reference the ids.
+      const [attachments, setAttachments] = useState([]);
+      const [uploading, setUploading] = useState(0);
+      const fileInputRef = useRef(null);
+      const t = useCallback(
+        (key, values) => {
+          const dictionary = dictionaries[localeId] ?? dictionaries.zh;
+          return format(dictionary[key] ?? key, values);
+        },
+        [localeId],
+      );
+
+      /** Clock time for one message; older records have no `at` and show none. */
+      const formatTime = useCallback((ms) => {
+        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '';
+        try {
+          return new Date(ms).toLocaleTimeString(localeId === 'zh' ? 'zh-CN' : 'en-US', { hour: '2-digit', minute: '2-digit' });
+        } catch {
+          return '';
+        }
+      }, [localeId]);
+
+      /**
+       * Copy one message's text, then flash the button into a check mark.
+       *
+       * The clipboard API covers the shell's Chromium; the textarea fallback
+       * keeps the button working in compositions that withhold it.
+       */
+      const copyMessage = useCallback(async (key, text) => {
+        try {
+          if (typeof navigator !== 'undefined' && navigator?.clipboard?.writeText !== undefined) {
+            await navigator.clipboard.writeText(text);
+          } else if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+            const area = document.createElement('textarea');
+            area.value = text;
+            area.style.position = 'fixed';
+            area.style.opacity = '0';
+            document.body.appendChild(area);
+            area.select();
+            document.execCommand('copy');
+            document.body.removeChild(area);
+          }
+          setCopiedKey(key);
+          setTimeout(() => setCopiedKey((current) => (current === key ? null : current)), 1600);
+        } catch (error) {
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        }
+      }, [t]);
+
+      /**
+       * Upload staged files straight to the web product.
+       *
+       * The panel owns no attachment store: each file goes to
+       * `/quick-ask/upload` as raw bytes, the Host relays it to `upload_file`,
+       * and the returned id is what `ref_file_ids` takes on send. A failed file
+       * is reported and skipped — the others still stage.
+       */
+      const uploadFiles = useCallback(async (fileList) => {
+        const files = Array.from(fileList ?? []).filter((file) => file instanceof Blob);
+        if (files.length === 0) return;
+        setUploading((count) => count + files.length);
+        for (const file of files) {
+          try {
+            const name = typeof file.name === 'string' && file.name !== '' ? file.name : 'file';
+            const type = typeof file.type === 'string' && file.type !== '' ? file.type : 'application/octet-stream';
+            const response = await fetch(
+              `${API_PATH}/quick-ask/upload?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`,
+              {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'content-type': type },
+                body: file,
+              },
+            );
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok || !body.ok) throw new Error(body.error || `HTTP ${response.status}`);
+            setAttachments((list) => [...list, { name, fileId: body.fileId }]);
+          } catch (error) {
+            const message = String(error && error.message ? error.message : error);
+            setNotice({ kind: 'bad', text: t('qa.attachFailed', { name: file.name || '?', message }) });
+          } finally {
+            setUploading((count) => Math.max(0, count - 1));
+          }
+        }
+      }, [t]);
+
+      const refresh = useCallback(async () => {
+        try {
+          const response = await fetch(`${API_PATH}/quick-ask/status?sessionId=${encodeURIComponent(sessionId)}`, { credentials: 'same-origin' });
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          setStatus(await response.json());
+        } catch (error) {
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        }
+      }, [sessionId, t]);
+
+      useEffect(() => {
+        refresh();
+      }, [refresh]);
+
+      // Keep the newest turn in view: the transcript scrolls to the bottom as
+      // the answer streams and when a settled exchange arrives.
+      const listRef = useRef(null);
+      const exchangeCount = status !== null && Array.isArray(status.exchanges) ? status.exchanges.length : 0;
+      const liveLength = live === null ? 0 : (live.answer?.length ?? 0) + (live.reasoning?.length ?? 0);
+      useEffect(() => {
+        const node = listRef.current;
+        if (node !== null && node !== undefined) node.scrollTop = node.scrollHeight;
+      }, [exchangeCount, liveLength]);
+
+      /**
+       * Send one question and consume the SSE reply.
+       *
+       * The stream carries the answer fragments as they arrive; a premature
+       * close or error keeps the partial text visible with a notice. The
+       * composer's model chip decides the web request flags.
+       */
+      const send = useCallback(async () => {
+        const typed = draft.trim();
+        const staged = attachments.slice();
+        const prompt = typed !== ''
+          ? typed
+          : (staged.length > 0 ? `请查看附件：${staged.map((item) => item.name).join('、')}` : '');
+        if (prompt === '' || busy || uploading > 0) return;
+        const options = Array.isArray(status?.models) && status.models.length > 0 ? status.models : QUICK_ASK_MODEL_FALLBACK;
+        const selected = options.find((entry) => entry.id === modelId) ?? options[0];
+        setBusy(true);
+        setNotice(null);
+        setLive({ answer: '', reasoning: '', prompt: typed, at: Date.now(), files: staged.map((item) => ({ name: item.name })) });
+        setDraft('');
+        setAttachments([]);
+        try {
+          const response = await fetch(`${API_PATH}/quick-ask/send`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              sessionId,
+              prompt,
+              thinking: selected.thinking === true,
+              search: selected.search === true,
+              refFileIds: staged.map((item) => item.fileId),
+              files: staged.map((item) => ({ name: item.name })),
+            }),
+          });
+          if (!response.ok || response.body === null) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.error || `HTTP ${response.status}`);
+          }
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let index;
+            while ((index = buffer.indexOf('\n\n')) >= 0) {
+              const frame = buffer.slice(0, index);
+              buffer = buffer.slice(index + 2);
+              const line = frame.split('\n').find((row) => row.startsWith('data:'));
+              if (line === undefined) continue;
+              let event;
+              try {
+                event = JSON.parse(line.slice(5).trim());
+              } catch {
+                continue;
+              }
+              if (event.kind === 'answer' || event.kind === 'reasoning') {
+                setLive((prev) => (prev === null ? prev : { ...prev, [event.kind === 'answer' ? 'answer' : 'reasoning']: (prev[event.kind === 'answer' ? 'answer' : 'reasoning'] ?? '') + event.text }));
+              } else if (event.kind === 'error') {
+                setNotice({ kind: 'bad', text: t('qa.streamError', { message: event.message || '?' }) });
+              }
+            }
+          }
+        } catch (error) {
+          // The turn never left: put the staged files back so the user can
+          // retry without re-picking them.
+          if (staged.length > 0) setAttachments(staged);
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        } finally {
+          setBusy(false);
+          setLive(null);
+          await refresh();
+        }
+      }, [sessionId, draft, busy, status, modelId, uploading, attachments, t]);
+      const reset = useCallback(async () => {
+        setBusy(true);
+        setNotice(null);
+        try {
+          const response = await fetch(`${API_PATH}/quick-ask/reset`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+          });
+          const body = await response.json().catch(() => ({}));
+          if (!body.ok) throw new Error(body.error || `HTTP ${response.status}`);
+          await refresh();
+        } catch (error) {
+          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+        } finally {
+          setBusy(false);
+        }
+      }, [sessionId, refresh, t]);
+
+      if (status !== null && status.ready === false) {
+        return h('div', { className: 'dsh-qa-root' }, h('div', { className: 'dsh-qa-hint' }, t('qa.noToken')));
+      }
+
+      const exchanges = status === null ? [] : Array.isArray(status.exchanges) ? status.exchanges : [];
+      const rows = exchanges.slice();
+      if (live !== null) {
+        rows.push({ role: 'user', text: live.prompt ?? '' });
+        rows.push({ role: 'assistant', text: live.answer || live.reasoning || '…', live: true });
+      }
+
+      const metaText = status !== null
+        ? (status.contextChars > 0 ? t('qa.context', { chars: status.contextChars }) : t('qa.contextNone'))
+        : '';
+
+      const options = Array.isArray(status?.models) && status.models.length > 0 ? status.models : QUICK_ASK_MODEL_FALLBACK;
+      const selectedModel = options.find((entry) => entry.id === modelId) ?? options[0];
+
+      return h('div', { className: 'dsh-qa-root' }, [
+        h('div', { key: 'head', className: 'dsh-qa-head' }, [
+          h('div', { key: 'headrow', className: 'dsh-qa-headrow' }, [
+            h('div', { key: 'meta', className: 'dsh-qa-meta' }, metaText),
+            h('button', {
+              key: 'reset',
+              className: 'dsh-qa-ghost',
+              type: 'button',
+              title: t('qa.resetHint'),
+              disabled: busy || (status !== null && !status.hasThread),
+              onClick: reset,
+            }, t('qa.reset')),
+          ]),
+          // The explanation lives in its own card: the title row is the
+          // toggle, so the hide affordance and the box always move together.
+          h('div', { key: 'hint', className: 'dsh-qa-hintcard' }, [
+            h('button', {
+              key: 'bar',
+              className: 'dsh-qa-hintbar',
+              type: 'button',
+              'aria-expanded': hintOpen ? 'true' : 'false',
+              'aria-label': hintOpen ? t('qa.hideHint') : t('qa.showHint'),
+              onClick: toggleHint,
+            }, [
+              h(InfoIcon, { key: 'info' }),
+              h('span', { key: 'label', className: 'dsh-qa-hintlabel' }, t('qa.hintTitle')),
+              h(ChevronIcon, { key: 'chevron', className: 'dsh-qa-hintchev' }),
+            ]),
+            h('div', { key: 'body', className: 'dsh-qa-hintbody', hidden: hintOpen ? undefined : true }, t('qa.hint')),
+          ]),
+        ]),
+        notice === null ? null : h('div', { key: 'notice', className: 'dsh-qa-notice', 'data-kind': notice.kind }, notice.text),
+        h('div', { key: 'list', className: 'dsh-qa-list', ref: listRef },
+          rows.length === 0
+            ? h('div', { key: 'empty', className: 'dsh-qa-empty' }, t('qa.empty'))
+            : rows.map((row, index) => {
+                const rowKey = String(index);
+                const isUser = row.role === 'user';
+                const at = row.at ?? (row.live === true ? live?.at : undefined);
+                const rowFiles = Array.isArray(row.files) ? row.files : [];
+                return h('div', { key: rowKey, className: `dsh-qa-msg ${isUser ? 'dsh-qa-msg-user' : 'dsh-qa-msg-assistant'}` }, [
+                  h('div', { key: 'bubble', className: isUser ? 'dsh-qa-user' : 'dsh-qa-assistant' }, [
+                    isUser
+                      ? (row.text === '' ? null : h('span', { key: 'text', className: 'dsh-qa-usertext' }, row.text))
+                      : h('div', { key: 'md' }, renderMarkdown(row.text)),
+                    isUser && rowFiles.length > 0
+                      ? h('div', { key: 'files', className: 'dsh-qa-files' }, rowFiles.map((file, fileIndex) => h('span', {
+                          key: String(fileIndex),
+                          className: 'dsh-qa-file',
+                          title: typeof file?.name === 'string' ? file.name : '',
+                        }, typeof file?.name === 'string' ? file.name : '')))
+                      : null,
+                  ]),
+                  h('div', { key: 'meta', className: 'dsh-qa-msgmeta' }, [
+                    h('button', {
+                      key: 'copy',
+                      className: 'dsh-qa-copy',
+                      type: 'button',
+                      title: copiedKey === rowKey ? t('qa.copied') : t('qa.copy'),
+                      'aria-label': copiedKey === rowKey ? t('qa.copied') : t('qa.copy'),
+                      onClick: () => copyMessage(rowKey, row.text),
+                    }, copiedKey === rowKey ? h(CheckIcon) : h(CopyIcon)),
+                    h('span', { key: 'time', className: 'dsh-qa-time' }, formatTime(at)),
+                  ]),
+                ]);
+              })),
+        h('div', { key: 'input', className: 'dsh-qa-composer' }, [
+          attachments.length > 0 || uploading > 0
+            ? h('div', { key: 'pending', className: 'dsh-qa-pending' }, [
+                ...attachments.map((item, index) => h('span', { key: `file-${index}`, className: 'dsh-qa-file' }, [
+                  h('span', { key: 'name', className: 'dsh-qa-filename' }, item.name),
+                  h('button', {
+                    key: 'remove',
+                    className: 'dsh-qa-fileremove',
+                    type: 'button',
+                    title: t('qa.removeFile'),
+                    'aria-label': t('qa.removeFile'),
+                    onClick: () => setAttachments((list) => list.filter((_, at) => at !== index)),
+                  }, '×'),
+                ])),
+                uploading > 0 ? h('span', { key: 'uploading', className: 'dsh-qa-uploading' }, t('qa.uploading')) : null,
+              ])
+            : null,
+          h('textarea', {
+            key: 'text',
+            className: 'dsh-qa-textarea',
+            rows: 2,
+            placeholder: t('qa.placeholder'),
+            value: draft,
+            disabled: busy,
+            onChange: (event) => setDraft(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent?.isComposing) {
+                event.preventDefault();
+                send();
+              }
+            },
+          }),
+          h('div', { key: 'bar', className: 'dsh-qa-composerbar' }, [
+            h('div', { key: 'tools', className: 'dsh-qa-composertools' }, [
+              h('button', {
+                key: 'attach',
+                className: 'dsh-qa-attach',
+                type: 'button',
+                title: t('qa.attach'),
+                'aria-label': t('qa.attach'),
+                disabled: busy || uploading > 0,
+                onClick: () => fileInputRef.current?.click(),
+              }, h(PaperclipIcon)),
+              h('input', {
+                key: 'fileinput',
+                ref: fileInputRef,
+                type: 'file',
+                multiple: true,
+                style: { display: 'none' },
+                onChange: (event) => {
+                  const picked = event.target.files;
+                  void uploadFiles(picked);
+                  event.target.value = '';
+                },
+              }),
+            ]),
+            // The shell's permission picker is replaced by the web-model
+            // picker: the quick-ask panel never runs local tools, so the
+            // meaningful choice here is which web route answers.
+            h('div', { key: 'modelwrap', className: 'dsh-qa-modelwrap' }, [
+              h('button', {
+                key: 'model',
+                className: 'dsh-qa-model',
+                type: 'button',
+                'aria-haspopup': 'listbox',
+                'aria-expanded': modelOpen ? 'true' : 'false',
+                title: selectedModel?.description ?? '',
+                onClick: () => setModelOpen((open) => !open),
+              }, [
+                h('span', { key: 'name', className: 'dsh-qa-modelname' }, selectedModel?.name ?? ''),
+                h(ChevronIcon, { key: 'chev', className: 'dsh-qa-modelchev' }),
+              ]),
+              modelOpen
+                ? [
+                    h('div', {
+                      key: 'backdrop',
+                      className: 'dsh-qa-modelbackdrop',
+                      onClick: () => setModelOpen(false),
+                    }),
+                    h('div', { key: 'menu', className: 'dsh-qa-modelmenu', role: 'listbox' },
+                      options.map((entry) => h('button', {
+                        key: entry.id,
+                        className: 'dsh-qa-modelrow',
+                        type: 'button',
+                        role: 'option',
+                        'aria-selected': entry.id === modelId ? 'true' : 'false',
+                        onClick: () => {
+                          setModelId(entry.id);
+                          setModelOpen(false);
+                        },
+                      }, [
+                        h('span', { key: 'n', className: 'dsh-qa-modelrowname' }, entry.name),
+                        h('span', { key: 'd', className: 'dsh-qa-modelrowdesc' }, entry.description),
+                      ]))),
+                  ]
+                : null,
+            ]),
+            h('button', {
+              key: 'send',
+              className: 'dsh-qa-send',
+              type: 'button',
+              'aria-label': t('qa.send'),
+              title: t('qa.send'),
+              disabled: busy || uploading > 0 || (draft.trim() === '' && attachments.length === 0),
+              onClick: send,
+            }, h(SendIcon)),
+          ]),
+        ]),
+      ]);
+    }
+
+    /**
+     * The quick-ask stylesheet.
+     *
+     * Written against the shell's own theme tokens (`--dsw-*`), the same ones
+     * the chat transcript and composer use, so the panel follows the
+     * light/dark switch with no per-theme code. Every token carries a fallback
+     * for compositions that render the plugin outside the themed shell.
+     */
+    const QA_CSS = [
+      '.dsh-qa-entry{box-sizing:border-box;width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;flex:none;padding:0;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;transition:background-color .1s,color .1s}',
+      '.dsh-qa-entry:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-primary,inherit)}',
+      '.dsh-qa-entry:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);outline-offset:-2px}',
+      '.dsh-qa-entry svg{width:15px;height:15px;display:block}',
+      '.dsh-qa-root{box-sizing:border-box;display:flex;flex-direction:column;gap:8px;height:100%;min-height:0;padding:10px 10% 12px;font-size:var(--dsh-content-font-size,14px)}',
+      '.dsh-qa-head{display:flex;flex-direction:column;gap:6px;flex:none}',
+      '.dsh-qa-headrow{display:flex;align-items:center;gap:8px;min-width:0}',
+      '.dsh-qa-meta{flex:1 1 auto;min-width:0;font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-hintcard{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.2));border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.05));overflow:hidden}',
+      '.dsh-qa-hintbar{display:flex;align-items:center;gap:6px;width:100%;padding:6px 8px 6px 10px;border:none;background:transparent;color:var(--dsw-alias-label-secondary,#61666b);font-size:12px;font-family:inherit;text-align:left;cursor:pointer;user-select:none}',
+      '.dsh-qa-hintbar:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.07))}',
+      '.dsh-qa-hintbar:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);outline-offset:-2px}',
+      '.dsh-qa-hintbar svg{width:13px;height:13px;flex:none}',
+      '.dsh-qa-hintlabel{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-hintchev{transition:transform .15s ease}',
+      '.dsh-qa-hintbar[aria-expanded="false"] .dsh-qa-hintchev{transform:rotate(-90deg)}',
+      '.dsh-qa-hintbody{padding:0 10px 8px;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-hintbody[hidden]{display:none}',
+      '.dsh-qa-hint{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#81858c);padding:8px 10px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.2));border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.05))}',
+      '.dsh-qa-ghost{padding:4px 10px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));background:transparent;color:var(--dsw-alias-label-secondary,inherit);font-size:12px;font-family:inherit;cursor:pointer;white-space:nowrap}',
+      '.dsh-qa-ghost:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
+      '.dsh-qa-ghost:disabled{opacity:.45;cursor:default}',
+      '.dsh-qa-notice{font-size:12.5px;line-height:1.55;border-radius:var(--dsw-radius-sm,8px);padding:8px 12px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
+      '.dsh-qa-notice[data-kind="bad"]{color:var(--dsw-alias-label-error,#e03131)}',
+      '.dsh-qa-list{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:8px;overflow-y:auto;padding:2px 2px 2px 0;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}',
+      '.dsh-qa-msg{display:flex;flex-direction:column;gap:2px;min-width:0}',
+      '.dsh-qa-msg-user{align-items:flex-end}',
+      '.dsh-qa-msg-assistant{align-items:flex-start}',
+      '.dsh-qa-user{max-width:86%;padding:7px 11px;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-specific-bubble,#edf3fe);color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.55;white-space:pre-wrap;word-break:break-word}',
+      '.dsh-qa-assistant{max-width:100%;padding:7px 11px;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.07));color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.65;word-break:break-word;overflow-wrap:anywhere}',
+      '.dsh-qa-msgmeta{display:flex;align-items:center;gap:6px;min-height:22px;font-size:11px;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-copy{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:none;border-radius:6px;background:transparent;color:inherit;cursor:pointer;opacity:.75}',
+      '.dsh-qa-copy:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));opacity:1}',
+      '.dsh-qa-copy svg{width:13px;height:13px}',
+      '.dsh-qa-time{font-variant-numeric:tabular-nums}',
+      '.dsh-qa-assistant > :first-child{margin-top:0}',
+      '.dsh-qa-assistant > :last-child{margin-bottom:0}',
+      '.dsh-qa-assistant p{margin:0 0 8px}',
+      '.dsh-qa-assistant h1,.dsh-qa-assistant h2,.dsh-qa-assistant h3,.dsh-qa-assistant h4{margin:10px 0 6px;font-weight:600;line-height:1.35}',
+      '.dsh-qa-assistant h1{font-size:17px}',
+      '.dsh-qa-assistant h2{font-size:15px}',
+      '.dsh-qa-assistant h3{font-size:14px}',
+      '.dsh-qa-assistant h4{font-size:13.5px}',
+      '.dsh-qa-assistant ul,.dsh-qa-assistant ol{margin:0 0 8px;padding-left:20px}',
+      '.dsh-qa-assistant li{margin:2px 0}',
+      '.dsh-qa-assistant blockquote{margin:0 0 8px;padding:2px 10px;border-left:3px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));color:var(--dsw-alias-label-secondary,inherit)}',
+      '.dsh-qa-assistant blockquote p{margin:0 0 4px}',
+      '.dsh-qa-assistant code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px}',
+      '.dsh-qa-assistant :not(pre) > code{padding:1px 5px;border-radius:4px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}',
+      '.dsh-qa-assistant pre{margin:0 0 8px;padding:8px 10px;border-radius:var(--dsw-radius-sm,8px);background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));overflow-x:auto}',
+      '.dsh-qa-assistant pre code{white-space:pre}',
+      '.dsh-qa-assistant a{color:var(--dsw-alias-state-business-primary,#4176e6);text-decoration:none}',
+      '.dsh-qa-assistant a:hover{text-decoration:underline}',
+      '.dsh-qa-assistant hr{margin:8px 0;border:none;border-top:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25))}',
+      '.dsh-qa-assistant table{border-collapse:collapse;margin:0 0 8px;font-size:13px;display:block;overflow-x:auto}',
+      '.dsh-qa-assistant th,.dsh-qa-assistant td{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));padding:4px 8px;text-align:left}',
+      '.dsh-qa-assistant th{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08));font-weight:600}',
+      '.dsh-qa-empty{font-size:12.5px;color:var(--dsw-alias-label-tertiary,#81858c);padding:6px 2px}',
+      '.dsh-qa-composer{position:relative;display:flex;flex-direction:column;gap:6px;padding:8px 10px 8px 14px;border-radius:var(--dsw-radius-panel,28px);background:color-mix(in srgb, var(--dsw-specific-input-major,#fff) 58%, transparent);-webkit-backdrop-filter:blur(20px) saturate(1.7);backdrop-filter:blur(20px) saturate(1.7);border:1px solid color-mix(in srgb, var(--dsw-alias-border-l2,rgba(0,0,0,.12)) 70%, transparent);box-shadow:var(--dsw-elevation-soft,0 4px 16px rgba(0,0,0,.05)),inset 0 1px 0 color-mix(in srgb, var(--dsw-static-neutral-bluish-00,#fff) 60%, transparent)}',
+      '.dsh-qa-textarea{flex:1 1 auto;min-height:38px;max-height:120px;resize:none;padding:2px 2px 0;border:none;background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);font-family:inherit;line-height:1.55;outline:none}',
+      '.dsh-qa-textarea::placeholder{color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-composerbar{display:flex;align-items:center;gap:6px;min-height:28px}',
+      '.dsh-qa-composertools{display:flex;align-items:center;gap:2px;flex:none}',
+      '.dsh-qa-attach{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-tertiary,#81858c);cursor:pointer}',
+      '.dsh-qa-attach:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-secondary,#61666b)}',
+      '.dsh-qa-attach:disabled{opacity:.45;cursor:default}',
+      '.dsh-qa-attach svg{width:15px;height:15px}',
+      '.dsh-qa-pending{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:2px 2px 0}',
+      '.dsh-qa-file{display:inline-flex;align-items:center;gap:4px;max-width:100%;padding:2px 8px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.1));color:var(--dsw-alias-label-secondary,#61666b);font-size:11.5px}',
+      '.dsh-qa-filename{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.dsh-qa-fileremove{border:none;background:transparent;color:inherit;cursor:pointer;padding:0 2px;font-size:12px;line-height:1}',
+      '.dsh-qa-uploading{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-files{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}',
+      '.dsh-qa-usertext{white-space:pre-wrap}',
+      '.dsh-qa-modelwrap{position:relative;min-width:0;display:flex;flex:0 1 auto}',
+      '.dsh-qa-model{display:inline-flex;align-items:center;gap:4px;max-width:100%;min-width:0;height:26px;padding:0 8px;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-tertiary,#81858c);font-size:12px;font-family:inherit;cursor:pointer}',
+      '.dsh-qa-model:hover,.dsh-qa-model[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-secondary,#61666b)}',
+      '.dsh-qa-modelname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.dsh-qa-modelchev{width:12px;height:12px;flex:none;transition:transform .15s ease}',
+      '.dsh-qa-model[aria-expanded="true"] .dsh-qa-modelchev{transform:rotate(180deg)}',
+      '.dsh-qa-modelbackdrop{position:fixed;inset:0;z-index:9}',
+      '.dsh-qa-modelmenu{position:absolute;left:0;bottom:calc(100% + 6px);z-index:10;display:flex;flex-direction:column;min-width:240px;max-width:min(320px,75vw);padding:4px;border-radius:var(--dsw-radius-md,12px);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));background:var(--dsw-specific-menu,rgba(255,255,255,.9));-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);box-shadow:var(--dsw-elevation-panel,0 8px 24px rgba(0,0,0,.12));overflow:hidden}',
+      '.dsh-qa-modelrow{display:flex;flex-direction:column;gap:1px;width:100%;padding:6px 8px;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-primary,inherit);font-family:inherit;text-align:left;cursor:pointer}',
+      '.dsh-qa-modelrow:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
+      '.dsh-qa-modelrow[aria-selected="true"]{background:var(--dsw-alias-state-business-tertiary,rgba(77,107,254,.12))}',
+      '.dsh-qa-modelrowname{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-modelrowdesc{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-send{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;width:30px;height:30px;padding:0;border:none;border-radius:50%;background:var(--dsw-alias-button-primary-fill,#4176e6);color:var(--dsw-alias-label-primary-foreground,#fff);cursor:pointer;margin-left:auto}',
+      '.dsh-qa-send svg{width:16px;height:16px}',
+      '.dsh-qa-send:hover:not(:disabled){opacity:.92}',
+      '.dsh-qa-send:disabled{opacity:.4;cursor:default}',
+      '.dsh-qa-send:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);outline-offset:2px}',
+    ].join('\n');
+
+    /** Inject the panel stylesheet once; cosmetic failures never break the panel. */
+    function injectQuickAskStyles() {
+      try {
+        if (typeof document === 'undefined' || typeof document.createElement !== 'function' || document.head === undefined) return;
+        if (document.querySelector('style[data-plugin-css="dsh-deepseek-web/quick-ask"]') !== null) return;
+        const tag = document.createElement('style');
+        tag.dataset.pluginCss = 'dsh-deepseek-web/quick-ask';
+        tag.textContent = QA_CSS;
+        document.head.appendChild(tag);
+      } catch {
+        /* the fallback inline styles still render a usable panel */
+      }
+    }
+
+    /** The DSH sparkle glyph, drawn with the shell's own outline paths. */
+    function QuickAskIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'p1', d: 'M5.875 3C5.875 6.33333 7.54167 8 10.875 8C7.54167 8 5.875 9.66667 5.875 13C5.875 9.66667 4.20833 8 0.875 8C4.20833 8 5.875 6.33333 5.875 3Z', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 'p2', d: 'M12.375 1.55823C12.375 3.39156 13.2917 4.30823 15.125 4.30823C13.2917 4.30823 12.375 5.22489 12.375 7.05823C12.375 5.22489 11.4583 4.30823 9.625 4.30823C11.4583 4.30823 12.375 3.39156 12.375 1.55823Z', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 'p3', d: 'M12.375 10.4418C12.375 11.7751 13.0417 12.4418 14.375 12.4418C13.0417 12.4418 12.375 13.1084 12.375 14.4418C12.375 13.1084 11.7083 12.4418 10.375 12.4418C11.7083 12.4418 12.375 11.7751 12.375 10.4418Z', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
+
+    /** The DSH chevron, used by the collapsible hint. */
+    function ChevronIcon({ className }) {
+      return h('svg', { className, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'c', d: 'M4 6L7.29289 9.29289C7.68342 9.68342 8.31658 9.68342 8.70711 9.29289L12 6', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
+
+    /** The DSH info glyph, used by the hint card's title row. */
+    function InfoIcon() {
+      return h('svg', { viewBox: '0 0 14 14', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'i1', d: 'M12.5757 7.00012C12.5757 3.92085 10.0794 1.42463 7.00012 1.42456C3.9208 1.42456 1.42456 3.9208 1.42456 7.00012C1.42463 10.0794 3.92085 12.5757 7.00012 12.5757C10.0793 12.5756 12.5756 10.0793 12.5757 7.00012ZM13.8002 7.00012C13.8001 10.7559 10.7559 13.8001 7.00012 13.8002C3.2443 13.8002 0.199291 10.7559 0.199219 7.00012C0.199219 3.24426 3.24426 0.199219 7.00012 0.199219C10.7559 0.199291 13.8002 3.2443 13.8002 7.00012Z', fill: 'currentColor' }),
+        h('path', { key: 'i2', d: 'M7.6127 3.18921V4.55986H6.38735V3.18921H7.6127Z', fill: 'currentColor' }),
+        h('path', { key: 'i3', d: 'M7.6127 5.68921V10.8109H6.38735V5.68921H7.6127Z', fill: 'currentColor' }),
+      ]);
+    }
+
+    /** The DSH send glyph, used by the composer's send button. */
+    function SendIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 's1', d: 'M4.74024 9.11029L1.82882 7.79865C1.75022 7.76323 1.75026 7.65161 1.82889 7.61626L12.9665 2.60943C13.0354 2.57846 13.1125 2.63213 13.1073 2.70749L12.3914 13.1388C12.3864 13.2117 12.3073 13.2548 12.2433 13.2194L6.12677 9.83657', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 's2', d: 'M8.44336 11.0825L6.2832 13.2843C6.22048 13.3482 6.11182 13.3038 6.11182 13.2143V9.86772C6.11182 9.84165 6.122 9.8166 6.1402 9.79793L12.972 2.78748', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
+
+    /** The DSH copy glyph, used by each message's copy button. */
+    function CopyIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('rect', { key: 'c1', x: '1.52075', y: '4.07373', width: '10.3932', height: '10.3932', rx: '2', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 'c2', d: 'M11.9792 1.53296C13.36 1.53296 14.4792 2.65225 14.4792 4.03296V9.42847C14.4792 10.3756 13.9521 11.1987 13.1755 11.6228V10.3298C13.3652 10.0787 13.4792 9.7674 13.4792 9.42847V4.03296C13.4792 3.20453 12.8077 2.53296 11.9792 2.53296H6.58374C6.27966 2.53301 5.99684 2.6235 5.7605 2.77905H4.42358C4.85652 2.03463 5.66056 1.53304 6.58374 1.53296H11.9792Z', fill: 'currentColor' }),
+      ]);
+    }
+
+    /** The DSH check glyph, shown briefly after a copy. */
+    function CheckIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'k', d: 'M2.25 8.5L5.49732 11.7473C5.90519 12.1552 6.57263 12.1344 6.95426 11.7018L13.75 4', stroke: 'currentColor', strokeWidth: 1 }),
+      ]);
+    }
+
+    /** The DSH paperclip glyph, used by the composer's attach button. */
+    function PaperclipIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', {
+          key: 'p',
+          d: 'M12.75 4.5V9.5C12.75 10.7598 12.2496 11.968 11.3588 12.8588C10.468 13.7496 9.25978 14.25 8 14.25C6.74022 14.25 5.53204 13.7496 4.64124 12.8588C3.75045 11.968 3.25 10.7598 3.25 9.5V5C3.25 4.13805 3.59241 3.3114 4.2019 2.7019C4.8114 2.09241 5.63805 1.75 6.5 1.75C7.36195 1.75 8.1886 2.09241 8.7981 2.7019C9.40759 3.3114 9.75 4.13805 9.75 5V9.5C9.75 9.96413 9.56563 10.4092 9.23744 10.7374C8.90925 11.0656 8.46413 11.25 8 11.25C7.53587 11.25 7.09075 11.0656 6.76256 10.7374C6.43437 10.4092 6.25 9.96413 6.25 9.5V5.5',
+          stroke: 'currentColor',
+          strokeWidth: 1,
+        }),
+      ]);
+    }
+
+    // ── markdown ────────────────────────────────────────────────────────────
+    // A deliberately small Markdown subset for the transcript: fenced code,
+    // headings, lists, blockquotes, rules, pipe tables, paragraphs, and the
+    // usual inline marks. It builds React nodes directly (never HTML strings),
+    // so model output cannot inject markup, and it tolerates partial text
+    // while the answer streams (an unclosed fence renders as code).
+
+    /** One Markdown table row split on pipes (outer pipes stripped). */
+    function splitRow(line) {
+      return line.trim().replace(/^\|/u, '').replace(/\|$/u, '').split('|').map((cell) => cell.trim());
+    }
+
+    /** Whether one line opens a block (used to end a paragraph). */
+    function isBlockStart(line) {
+      return /^\s*(```|~~~)/u.test(line)
+        || /^#{1,6}\s/u.test(line)
+        || /^\s*>/u.test(line)
+        || /^\s*([-*+]|\d+[.)])\s+/u.test(line)
+        || /^\s*([-*_])\1{2,}\s*$/u.test(line);
+    }
+
+    /** Inline marks: code, bold, strike, links, italic. */
+    function inlineNodes(text, key) {
+      const nodes = [];
+      let buffer = '';
+      let i = 0;
+      const flush = () => {
+        if (buffer !== '') {
+          nodes.push(buffer);
+          buffer = '';
+        }
+      };
+      while (i < text.length) {
+        if (text[i] === '`') {
+          const end = text.indexOf('`', i + 1);
+          if (end > i + 1) {
+            flush();
+            nodes.push(h('code', { key: `${key}-c${nodes.length}` }, text.slice(i + 1, end)));
+            i = end + 1;
+            continue;
+          }
+        }
+        if (text.startsWith('**', i)) {
+          const end = text.indexOf('**', i + 2);
+          if (end > i + 2) {
+            flush();
+            nodes.push(h('strong', { key: `${key}-b${nodes.length}` }, inlineNodes(text.slice(i + 2, end), `${key}-b`)));
+            i = end + 2;
+            continue;
+          }
+        }
+        if (text.startsWith('~~', i)) {
+          const end = text.indexOf('~~', i + 2);
+          if (end > i + 2) {
+            flush();
+            nodes.push(h('del', { key: `${key}-s${nodes.length}` }, inlineNodes(text.slice(i + 2, end), `${key}-s`)));
+            i = end + 2;
+            continue;
+          }
+        }
+        if (text[i] === '[') {
+          const close = text.indexOf('](', i);
+          const end = close > i ? text.indexOf(')', close + 2) : -1;
+          if (close > i && end > close) {
+            const href = text.slice(close + 2, end).trim();
+            if (/^(https?:|mailto:)/iu.test(href)) {
+              flush();
+              nodes.push(h('a', { key: `${key}-a${nodes.length}`, href, target: '_blank', rel: 'noreferrer noopener' }, text.slice(i + 1, close)));
+              i = end + 1;
+              continue;
+            }
+          }
+        }
+        if (text[i] === '*') {
+          const end = text.indexOf('*', i + 1);
+          if (end > i + 1 && !text.slice(i + 1, end).includes('\n')) {
+            flush();
+            nodes.push(h('em', { key: `${key}-i${nodes.length}` }, inlineNodes(text.slice(i + 1, end), `${key}-i`)));
+            i = end + 1;
+            continue;
+          }
+        }
+        buffer += text[i];
+        i += 1;
+      }
+      flush();
+      return nodes;
+    }
+
+    /**
+     * Render one Markdown document as an element tree.
+     * @param {string} source
+     * @returns {unknown}
+     */
+    function renderMarkdown(source) {
+      const lines = String(source ?? '').replace(/\r\n?/gu, '\n').split('\n');
+      /** @type {unknown[]} */
+      const blocks = [];
+      let i = 0;
+      let key = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        if (line.trim() === '') {
+          i += 1;
+          continue;
+        }
+        const fence = line.match(/^\s*(```+|~~~+)\s*([\w+-]*)\s*$/u);
+        if (fence !== null) {
+          const opener = fence[1];
+          const body = [];
+          i += 1;
+          while (i < lines.length && !lines[i].trim().startsWith(opener)) {
+            body.push(lines[i]);
+            i += 1;
+          }
+          if (i < lines.length) i += 1;
+          blocks.push(h('pre', { key: `code-${key++}`, className: 'dsh-qa-code' }, h('code', {
+            className: fence[2] !== '' ? `language-${fence[2]}` : undefined,
+          }, body.join('\n'))));
+          continue;
+        }
+        const heading = line.match(/^(#{1,6})\s+(.*)$/u);
+        if (heading !== null) {
+          const level = Math.min(heading[1].length, 4);
+          blocks.push(h(`h${level}`, { key: `h-${key++}` }, inlineNodes(heading[2], `h-${key}`)));
+          i += 1;
+          continue;
+        }
+        if (/^\s*([-*_])\1{2,}\s*$/u.test(line)) {
+          blocks.push(h('hr', { key: `hr-${key++}` }));
+          i += 1;
+          continue;
+        }
+        if (/^\s*>/u.test(line)) {
+          const quote = [];
+          while (i < lines.length && /^\s*>/u.test(lines[i])) {
+            quote.push(lines[i].replace(/^\s*>\s?/u, ''));
+            i += 1;
+          }
+          blocks.push(h('blockquote', { key: `q-${key++}` }, renderMarkdown(quote.join('\n'))));
+          continue;
+        }
+        const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/u);
+        if (item !== null) {
+          const ordered = /^\d/u.test(item[2]);
+          const items = [];
+          while (i < lines.length) {
+            const next = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/u);
+            if (next === null || /^\d/u.test(next[2]) !== ordered) break;
+            items.push(h('li', { key: `li-${key}-${items.length}` }, inlineNodes(next[3], `li-${key}`)));
+            i += 1;
+          }
+          blocks.push(h(ordered ? 'ol' : 'ul', { key: `list-${key++}` }, items));
+          continue;
+        }
+        if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/u.test(lines[i + 1])) {
+          const header = splitRow(line);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+            rows.push(splitRow(lines[i]));
+            i += 1;
+          }
+          blocks.push(h('table', { key: `tbl-${key++}` }, [
+            h('thead', { key: 'head' }, h('tr', null, header.map((cell, idx) => h('th', { key: String(idx) }, inlineNodes(cell, `th-${idx}`))))),
+            h('tbody', { key: 'body' }, rows.map((row, ridx) => h('tr', { key: String(ridx) }, row.map((cell, cidx) => h('td', { key: String(cidx) }, inlineNodes(cell, `td-${cidx}`)))))),
+          ]));
+          continue;
+        }
+        const para = [];
+        while (i < lines.length && lines[i].trim() !== '' && !isBlockStart(lines[i]) && !(lines[i].includes('|') && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/u.test(lines[i + 1]))) {
+          para.push(lines[i]);
+          i += 1;
+        }
+        if (para.length === 0) {
+          para.push(line);
+          i += 1;
+        }
+        const children = [];
+        para.forEach((row, idx) => {
+          if (idx > 0) children.push(h('br', { key: `br-${idx}` }));
+          children.push(...inlineNodes(row, `p-${key}-${idx}`));
+        });
+        blocks.push(h('p', { key: `p-${key++}` }, children));
+      }
+      return blocks;
+    }
+
+    const inject = ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight'];
 
     function apply(ctx) {
       // Register the dictionaries so the nav label and every string resolve
@@ -740,6 +1612,81 @@ window.__ModuleLoader__.load({
         label: 'DeepSeek 网页版',
         locale: NS,
       }, DeepSeekWebSettings));
+
+      // ── quick-ask panel ─────────────────────────────────────────────────────
+      // Tab type + body through the public two-stage path (the same one
+      // document preview uses). Services beyond slots/locale are optional: a
+      // composition without the right sidebar leaves the entry button off
+      // instead of breaking the settings page.
+      const sidebarRight = (() => {
+        try {
+          return ctx.sidebarRight;
+        } catch {
+          return undefined;
+        }
+      })();
+      const sidebarRightTabs = (() => {
+        try {
+          return ctx.sidebarRightTabs;
+        } catch {
+          return undefined;
+        }
+      })();
+
+      if (sidebarRightTabs !== undefined && sidebarRight !== undefined) {
+        injectQuickAskStyles();
+        const QA_TAB_ID = 'dsh-deepseek-web/quick-ask';
+        const QA_TAB_KIND = 'deepseek-web-quick-ask';
+        ctx.effect(() => sidebarRightTabs.register({
+          id: QA_TAB_ID,
+          kind: QA_TAB_KIND,
+          title: () => {
+            const lang = String((typeof document !== 'undefined' && document.documentElement?.lang) ?? '');
+            const dictionary = lang.toLowerCase().startsWith('en') ? dictionaries.en : dictionaries.zh;
+            return dictionary['qa.tab.title'];
+          },
+        }), 'dsh-deepseek-web: quick-ask tab type');
+        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+          name: 'sidebar.right.pane.tab',
+          key: QA_TAB_ID,
+          locale: NS,
+        }, QuickAskPanel), 'dsh-deepseek-web: quick-ask tab body');
+
+        // The entry: a small persistent button next to the header's
+        // more-actions button, opening (and revealing) the panel tab.
+        ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+          name: 'conversation.session.header.utilities',
+          id: 'deepseek-web-quick-ask',
+          order: 10,
+          locale: NS,
+        }, () => {
+          const open = () => {
+            try {
+              sidebarRight.openTab(QA_TAB_KIND, { preferNewPane: true });
+            } catch (error) {
+              console.warn('[dsh-deepseek-web] could not open the quick-ask panel:', error);
+            }
+          };
+          return h('button', {
+            type: 'button',
+            className: 'dsh-qa-entry',
+            title: t9n('qa.entry.label'),
+            'aria-label': t9n('qa.entry.label'),
+            onClick: open,
+          }, h(QuickAskIcon));
+        }));
+      }
+    }
+
+    /** Locale lookup for components outside the settings page (no hook state). */
+    function t9n(key) {
+      try {
+        const lang = String(document.documentElement?.lang ?? '');
+        const dictionary = lang.toLowerCase().startsWith('en') ? dictionaries.en : dictionaries.zh;
+        return dictionary[key] ?? key;
+      } catch {
+        return key;
+      }
     }
 
     exports.apply = apply;

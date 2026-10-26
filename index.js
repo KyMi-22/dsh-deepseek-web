@@ -32,9 +32,10 @@ import {
   stateFile,
 } from './src/store.js';
 import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
-import { readJsonBody, sendJson } from './src/http.js';
+import { readJsonBody, readRawBody, sendJson } from './src/http.js';
 import { readFile } from 'node:fs/promises';
 import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
+import { QuickAsk } from './src/quick-ask.js';
 
 export { isToolAllowedInWebSession } from './src/tool-guard.js';
 
@@ -50,8 +51,25 @@ export const API_PREFIX = '/dsh-deepseek-web/api';
 /** The model rows the settings page renders; built once, it is constant data. */
 const MODEL_SUMMARY = MODELS.map((entry) => ({ id: entry.id, name: entry.name, description: entry.description }));
 
+/**
+ * The model rows the quick-ask panel's composer menu renders.
+ *
+ * Carries the web request flags (`thinking`/`search`) too, so the panel can
+ * pick a route without duplicating the model table on the browser side.
+ */
+const QUICK_ASK_MODELS = MODELS.map((entry) => ({
+  id: entry.id,
+  name: entry.name,
+  description: entry.description,
+  thinking: entry.thinking,
+  search: entry.search,
+}));
+
 /** How many per-conversation failures one sync report carries. */
 const MAX_REPORTED_ERRORS = 5;
+
+/** Hard cap for one file handed to the web upload endpoint (bytes). */
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 
 /**
  * Ask the harness to recompose the plugin tree.
@@ -253,6 +271,26 @@ export async function apply(ctx, config = {}) {
     }
   };
 
+  // Document uploads read the verbatim bytes out of the same attachment store.
+  // `readFileStream` yields bounded chunks; the upload endpoint needs one
+  // buffer, so they are joined here under a hard size cap.
+  adapter.deps.readFileBytes = async (ref) => {
+    const attachments = ctx.get('attachments');
+    if (typeof attachments?.readFileStream !== 'function') {
+      throw new Error('deepseek-web: no attachment service is mounted');
+    }
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of attachments.readFileStream(ref)) {
+      total += chunk.length;
+      if (total > MAX_UPLOAD_BYTES) {
+        throw new Error(`deepseek-web: file is larger than the ${MAX_UPLOAD_BYTES}-byte upload limit`);
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  };
+
   // Both registrations are fiber-owned: their handles unwind with this plugin.
   ctx.llm.registerAdapter([PROVIDER], adapter);
   ctx.llm.registerConfigurableProviders([
@@ -390,11 +428,19 @@ export async function apply(ctx, config = {}) {
       // A conversation this plugin CREATED for a new DSH session already has a
       // bound DSH session. Importing it again would produce a second, empty copy
       // of the same conversation, so those ids are excluded before selection.
-      const boundChatIds = new Set(
-        Object.values(store.state.bindings)
+      // Quick-ask threads are the same kind of machinery (they belong to a DSH
+      // session's side panel, not to the sidebar): the ledger ids cover the
+      // window before a thread's `SideBar：` rename lands, and the title tag
+      // (checked in `selectImportBatch`) covers threads the ledger no longer
+      // knows — a refresh mints a NEW web id that the tag still marks.
+      const boundChatIds = new Set([
+        ...Object.values(store.state.bindings)
           .map((binding) => binding?.chatSessionId)
           .filter((id) => typeof id === 'string' && id !== ''),
-      );
+        ...Object.values(store.state.quickAsk ?? {})
+          .map((thread) => thread?.chatSessionId)
+          .filter((id) => typeof id === 'string' && id !== ''),
+      ]);
       const inWindow = selectImportBatch(sessions, since);
       const batch = selectImportBatch(sessions, since, boundChatIds);
       report.windowStart = since;
@@ -631,6 +677,16 @@ export async function apply(ctx, config = {}) {
   }
 
   // ── settings route ────────────────────────────────────────────────────────
+  // Quick-ask controller: one instance per mount, sharing the credential and
+  // the state store with the adapter. The persistence service is resolved on
+  // use (like the workspace registry) because it may mount after this plugin.
+  const quickAsk = new QuickAsk({
+    api,
+    store,
+    persistence: () => ctx.get('sessionPersistence'),
+    warn,
+  });
+
   const webServer = ctx.get('webServer');
   if (webServer?.register !== undefined) {
     ctx.effect(() =>
@@ -829,6 +885,107 @@ export async function apply(ctx, config = {}) {
               } catch (error) {
                 sendJson(res, 200, { ok: false, detail: String(error?.message ?? error) });
               }
+              return;
+            }
+            // ── quick-ask panel routes ───────────────────────────────────────
+            if (req.method === 'GET' && route === '/quick-ask/status') {
+              const sessionId = url.searchParams.get('sessionId') ?? '';
+              if (sessionId === '') {
+                sendJson(res, 400, { ok: false, error: 'missing-session' });
+                return;
+              }
+              sendJson(res, 200, { ...(await quickAsk.status(sessionId)), models: QUICK_ASK_MODELS });
+              return;
+            }
+            if (req.method === 'POST' && route === '/quick-ask/reset') {
+              const body = await readJsonBody(req);
+              const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+              if (sessionId === '') {
+                sendJson(res, 400, { ok: false, error: 'missing-session' });
+                return;
+              }
+              if (!api.ready) {
+                sendJson(res, 409, { ok: false, error: 'no-token' });
+                return;
+              }
+              try {
+                const thread = await quickAsk.refreshThread(sessionId);
+                sendJson(res, 200, { ok: true, exchanges: thread.exchanges.map((row) => ({ ...row })) });
+              } catch (error) {
+                sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+              }
+              return;
+            }
+            if (req.method === 'POST' && route === '/quick-ask/upload') {
+              // Raw bytes, filename and media type in the query, because the
+              // browser already holds the File object. The body cap is enforced
+              // while reading.
+              const fileName = url.searchParams.get('name') ?? '';
+              const mediaType = url.searchParams.get('type') ?? '';
+              if (!api.ready) {
+                sendJson(res, 409, { ok: false, error: 'no-token' });
+                return;
+              }
+              let bytes;
+              try {
+                bytes = await readRawBody(req, MAX_UPLOAD_BYTES);
+              } catch (error) {
+                if (error?.code === 'TOO_LARGE') {
+                  sendJson(res, 413, { ok: false, error: 'too-large', detail: `上限 ${MAX_UPLOAD_BYTES} 字节` });
+                  return;
+                }
+                throw error;
+              }
+              if (bytes.length === 0) {
+                sendJson(res, 400, { ok: false, error: 'empty-file' });
+                return;
+              }
+              try {
+                const fileId = await quickAsk.uploadFile({
+                  bytes,
+                  fileName,
+                  mediaType,
+                });
+                sendJson(res, 200, { ok: true, fileId, name: fileName });
+              } catch (error) {
+                sendJson(res, 502, { ok: false, error: String(error?.message ?? error) });
+              }
+              return;
+            }
+            if (req.method === 'POST' && route === '/quick-ask/send') {
+              const body = await readJsonBody(req);
+              const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+              const prompt = typeof body.prompt === 'string' ? body.prompt : '';
+              if (sessionId === '' || prompt.trim() === '') {
+                sendJson(res, 400, { ok: false, error: 'missing-session-or-prompt' });
+                return;
+              }
+              if (!api.ready) {
+                sendJson(res, 409, { ok: false, error: 'no-token' });
+                return;
+              }
+              // The generation is cancelled by the request aborting; forward it.
+              const abort = new AbortController();
+              req.on('close', () => abort.abort());
+              res.writeHead(200, {
+                'content-type': 'text/event-stream; charset=utf-8',
+                'cache-control': 'no-store',
+                connection: 'keep-alive',
+              });
+              try {
+                for await (const event of quickAsk.stream(sessionId, prompt, {
+                  thinking: body.thinking === true,
+                  search: body.search === true,
+                  refFileIds: Array.isArray(body.refFileIds) ? body.refFileIds : [],
+                  files: Array.isArray(body.files) ? body.files : [],
+                  signal: abort.signal,
+                })) {
+                  res.write(`data: ${JSON.stringify(event)}\n\n`);
+                }
+              } catch (error) {
+                res.write(`data: ${JSON.stringify({ kind: 'error', message: String(error?.message ?? error) })}\n\n`);
+              }
+              res.end();
               return;
             }
             sendJson(res, 404, { ok: false, error: 'not-found' });
