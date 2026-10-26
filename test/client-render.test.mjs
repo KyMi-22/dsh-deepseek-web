@@ -347,4 +347,43 @@ assert.equal(typeof Page, 'function', 'registered value is a component');
   assert.equal(stateValues[5], false, 'clicking the bar collapses the hint');
 }
 
+// ── quick-ask: composer (glass box, model picker, send) ───────────────────
+{
+  const panelReg = registrations.find((row) => row.options.name === 'sidebar.right.pane.tab');
+  const status = {
+    ok: true,
+    hasThread: true,
+    ready: true,
+    streaming: false,
+    contextChars: 0,
+    exchanges: [],
+    models: [
+      { id: 'deepseek-web-chat', name: 'DeepSeek 网页版', description: '普通对话', thinking: false, search: false },
+      { id: 'deepseek-web-reasoner', name: 'DeepSeek 网页版 · 深度思考', description: '展示推理过程', thinking: true, search: false },
+    ],
+  };
+  const { tree, values } = render(panelReg.Component, { sessionId: 's1' }, [
+    status, '', false, null, null, true, 'zh', 'deepseek-web-chat', true,
+  ]);
+  const elements = [];
+  for (const node of walk(tree)) {
+    if (node !== null && typeof node === 'object' && node.type !== undefined) elements.push(node);
+  }
+  assert.ok(elements.some((node) => node.props?.className === 'dsh-qa-composer'), 'the composer renders');
+  const textarea = elements.find((node) => node.type === 'textarea' && node.props?.className === 'dsh-qa-textarea');
+  assert.ok(textarea, 'the textarea renders inside the composer');
+  assert.ok(textarea.props.placeholder.includes('问点什么'), 'our own input hint is kept');
+  const modelButton = elements.find((node) => node.type === 'button' && node.props?.className === 'dsh-qa-model');
+  assert.ok(modelButton, 'the model picker replaces the permission picker');
+  assert.equal(modelButton.props['aria-expanded'], 'true');
+  const rows = elements.filter((node) => node.type === 'button' && node.props?.className === 'dsh-qa-modelrow');
+  assert.equal(rows.length, 2, 'the menu lists the status models');
+  rows[1].props.onClick();
+  assert.equal(values[7], 'deepseek-web-reasoner', 'picking a row selects that model');
+  assert.equal(values[8], false, 'picking a row closes the menu');
+  const send = elements.find((node) => node.type === 'button' && node.props?.className === 'dsh-qa-send');
+  assert.ok(send, 'the send button renders');
+  assert.equal(send.props['aria-label'], '发送', 'the send button is labelled');
+}
+
 console.log('\nclient-render.test.mjs: all assertions passed');

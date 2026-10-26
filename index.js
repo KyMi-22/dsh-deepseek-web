@@ -51,6 +51,20 @@ export const API_PREFIX = '/dsh-deepseek-web/api';
 /** The model rows the settings page renders; built once, it is constant data. */
 const MODEL_SUMMARY = MODELS.map((entry) => ({ id: entry.id, name: entry.name, description: entry.description }));
 
+/**
+ * The model rows the quick-ask panel's composer menu renders.
+ *
+ * Carries the web request flags (`thinking`/`search`) too, so the panel can
+ * pick a route without duplicating the model table on the browser side.
+ */
+const QUICK_ASK_MODELS = MODELS.map((entry) => ({
+  id: entry.id,
+  name: entry.name,
+  description: entry.description,
+  thinking: entry.thinking,
+  search: entry.search,
+}));
+
 /** How many per-conversation failures one sync report carries. */
 const MAX_REPORTED_ERRORS = 5;
 
@@ -857,7 +871,7 @@ export async function apply(ctx, config = {}) {
                 sendJson(res, 400, { ok: false, error: 'missing-session' });
                 return;
               }
-              sendJson(res, 200, await quickAsk.status(sessionId));
+              sendJson(res, 200, { ...(await quickAsk.status(sessionId)), models: QUICK_ASK_MODELS });
               return;
             }
             if (req.method === 'POST' && route === '/quick-ask/reset') {

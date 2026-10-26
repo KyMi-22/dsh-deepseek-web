@@ -764,6 +764,20 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The composer's model choices, mirroring the host's `MODELS` table.
+     *
+     * The status route ships the same rows (with their thinking/search flags);
+     * this fallback keeps the menu usable in the first frames, before the
+     * first status response arrives.
+     */
+    const QUICK_ASK_MODEL_FALLBACK = [
+      { id: 'deepseek-web-chat', name: 'DeepSeek 网页版', description: '普通对话', thinking: false, search: false },
+      { id: 'deepseek-web-reasoner', name: 'DeepSeek 网页版 · 深度思考', description: '展示推理过程', thinking: true, search: false },
+      { id: 'deepseek-web-search', name: 'DeepSeek 网页版 · 智能搜索', description: '联网查证并给出引用', thinking: false, search: true },
+      { id: 'deepseek-web-search-think', name: 'DeepSeek 网页版 · 搜索 + 深度思考', description: '联网搜索后推理', thinking: true, search: true },
+    ];
+
+    /**
      * The quick-ask panel body: a throwaway Q&A thread about the current
      * conversation, answered on the web model. Renders the persisted
      * transcript, streams the in-flight reply, and never writes anything back
@@ -805,6 +819,9 @@ window.__ModuleLoader__.load({
           }
         })(),
       );
+      // The composer's model menu replaces the shell's permission picker.
+      const [modelId, setModelId] = useState(QUICK_ASK_MODEL_FALLBACK[0].id);
+      const [modelOpen, setModelOpen] = useState(false);
       const t = useCallback(
         (key, values) => {
           const dictionary = dictionaries[localeId] ?? dictionaries.zh;
@@ -841,11 +858,14 @@ window.__ModuleLoader__.load({
        * Send one question and consume the SSE reply.
        *
        * The stream carries the answer fragments as they arrive; a premature
-       * close or error keeps the partial text visible with a notice.
+       * close or error keeps the partial text visible with a notice. The
+       * composer's model chip decides the web request flags.
        */
       const send = useCallback(async () => {
         const prompt = draft.trim();
         if (prompt === '' || busy) return;
+        const options = Array.isArray(status?.models) && status.models.length > 0 ? status.models : QUICK_ASK_MODEL_FALLBACK;
+        const selected = options.find((entry) => entry.id === modelId) ?? options[0];
         setBusy(true);
         setNotice(null);
         setLive({ answer: '', reasoning: '', prompt });
@@ -855,7 +875,12 @@ window.__ModuleLoader__.load({
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId, prompt }),
+            body: JSON.stringify({
+              sessionId,
+              prompt,
+              thinking: selected.thinking === true,
+              search: selected.search === true,
+            }),
           });
           if (!response.ok || response.body === null) {
             const body = await response.json().catch(() => ({}));
@@ -894,8 +919,7 @@ window.__ModuleLoader__.load({
           setLive(null);
           await refresh();
         }
-      }, [sessionId, draft, busy, t]);
-
+      }, [sessionId, draft, busy, status, modelId, t]);
       const reset = useCallback(async () => {
         setBusy(true);
         setNotice(null);
@@ -930,6 +954,9 @@ window.__ModuleLoader__.load({
       const metaText = status !== null
         ? (status.contextChars > 0 ? t('qa.context', { chars: status.contextChars }) : t('qa.contextNone'))
         : '';
+
+      const options = Array.isArray(status?.models) && status.models.length > 0 ? status.models : QUICK_ASK_MODEL_FALLBACK;
+      const selectedModel = options.find((entry) => entry.id === modelId) ?? options[0];
 
       return h('div', { className: 'dsh-qa-root' }, [
         h('div', { key: 'head', className: 'dsh-qa-head' }, [
@@ -971,7 +998,7 @@ window.__ModuleLoader__.load({
                 className: row.role === 'user' ? 'dsh-qa-user' : 'dsh-qa-assistant',
                 'data-live': row.live === true ? 'true' : undefined,
               }, row.role === 'user' ? row.text : renderMarkdown(row.text)))),
-        h('div', { key: 'input', className: 'dsh-qa-inputrow' }, [
+        h('div', { key: 'input', className: 'dsh-qa-composer' }, [
           h('textarea', {
             key: 'text',
             className: 'dsh-qa-textarea',
@@ -987,13 +1014,58 @@ window.__ModuleLoader__.load({
               }
             },
           }),
-          h('button', {
-            key: 'send',
-            className: 'dsh-qa-send',
-            type: 'button',
-            disabled: busy || draft.trim() === '',
-            onClick: send,
-          }, t('qa.send')),
+          h('div', { key: 'bar', className: 'dsh-qa-composerbar' }, [
+            // The shell's permission picker is replaced by the web-model
+            // picker: the quick-ask panel never runs local tools, so the
+            // meaningful choice here is which web route answers.
+            h('div', { key: 'modelwrap', className: 'dsh-qa-modelwrap' }, [
+              h('button', {
+                key: 'model',
+                className: 'dsh-qa-model',
+                type: 'button',
+                'aria-haspopup': 'listbox',
+                'aria-expanded': modelOpen ? 'true' : 'false',
+                title: selectedModel?.description ?? '',
+                onClick: () => setModelOpen((open) => !open),
+              }, [
+                h('span', { key: 'name', className: 'dsh-qa-modelname' }, selectedModel?.name ?? ''),
+                h(ChevronIcon, { key: 'chev', className: 'dsh-qa-modelchev' }),
+              ]),
+              modelOpen
+                ? [
+                    h('div', {
+                      key: 'backdrop',
+                      className: 'dsh-qa-modelbackdrop',
+                      onClick: () => setModelOpen(false),
+                    }),
+                    h('div', { key: 'menu', className: 'dsh-qa-modelmenu', role: 'listbox' },
+                      options.map((entry) => h('button', {
+                        key: entry.id,
+                        className: 'dsh-qa-modelrow',
+                        type: 'button',
+                        role: 'option',
+                        'aria-selected': entry.id === modelId ? 'true' : 'false',
+                        onClick: () => {
+                          setModelId(entry.id);
+                          setModelOpen(false);
+                        },
+                      }, [
+                        h('span', { key: 'n', className: 'dsh-qa-modelrowname' }, entry.name),
+                        h('span', { key: 'd', className: 'dsh-qa-modelrowdesc' }, entry.description),
+                      ]))),
+                  ]
+                : null,
+            ]),
+            h('button', {
+              key: 'send',
+              className: 'dsh-qa-send',
+              type: 'button',
+              'aria-label': t('qa.send'),
+              title: t('qa.send'),
+              disabled: busy || draft.trim() === '',
+              onClick: send,
+            }, h(SendIcon)),
+          ]),
         ]),
       ]);
     }
@@ -1058,12 +1130,28 @@ window.__ModuleLoader__.load({
       '.dsh-qa-assistant th,.dsh-qa-assistant td{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));padding:4px 8px;text-align:left}',
       '.dsh-qa-assistant th{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08));font-weight:600}',
       '.dsh-qa-empty{font-size:12.5px;color:var(--dsw-alias-label-tertiary,#81858c);padding:6px 2px}',
-      '.dsh-qa-inputrow{display:flex;gap:8px;align-items:flex-end;flex:none}',
-      '.dsh-qa-textarea{flex:1 1 auto;min-height:40px;max-height:120px;resize:none;padding:8px 10px;border-radius:var(--dsw-radius-lg,16px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);font-family:inherit;line-height:1.5;outline:none}',
-      '.dsh-qa-textarea:focus{border-color:var(--dsw-alias-state-business-primary,#4176e6)}',
-      '.dsh-qa-send{padding:0 16px;height:36px;border-radius:var(--dsw-radius-lg,16px);border:none;background:var(--dsw-alias-button-primary-fill,#4176e6);color:var(--dsw-alias-label-primary-foreground,#fff);font-size:13px;font-weight:600;font-family:inherit;cursor:pointer;white-space:nowrap}',
-      '.dsh-qa-send:hover:not(:disabled){opacity:.9}',
-      '.dsh-qa-send:disabled{opacity:.45;cursor:default}',
+      '.dsh-qa-composer{position:relative;display:flex;flex-direction:column;gap:6px;padding:8px 10px 8px 14px;border-radius:var(--dsw-radius-panel,28px);background:color-mix(in srgb, var(--dsw-specific-input-major,#fff) 58%, transparent);-webkit-backdrop-filter:blur(20px) saturate(1.7);backdrop-filter:blur(20px) saturate(1.7);border:1px solid color-mix(in srgb, var(--dsw-alias-border-l2,rgba(0,0,0,.12)) 70%, transparent);box-shadow:var(--dsw-elevation-soft,0 4px 16px rgba(0,0,0,.05)),inset 0 1px 0 color-mix(in srgb, var(--dsw-static-neutral-bluish-00,#fff) 60%, transparent)}',
+      '.dsh-qa-textarea{flex:1 1 auto;min-height:38px;max-height:120px;resize:none;padding:2px 2px 0;border:none;background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);font-family:inherit;line-height:1.55;outline:none}',
+      '.dsh-qa-textarea::placeholder{color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-composerbar{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:28px}',
+      '.dsh-qa-modelwrap{position:relative;min-width:0;display:flex}',
+      '.dsh-qa-model{display:inline-flex;align-items:center;gap:4px;max-width:100%;min-width:0;height:26px;padding:0 8px;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-tertiary,#81858c);font-size:12px;font-family:inherit;cursor:pointer}',
+      '.dsh-qa-model:hover,.dsh-qa-model[aria-expanded="true"]{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-secondary,#61666b)}',
+      '.dsh-qa-modelname{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.dsh-qa-modelchev{width:12px;height:12px;flex:none;transition:transform .15s ease}',
+      '.dsh-qa-model[aria-expanded="true"] .dsh-qa-modelchev{transform:rotate(180deg)}',
+      '.dsh-qa-modelbackdrop{position:fixed;inset:0;z-index:9}',
+      '.dsh-qa-modelmenu{position:absolute;left:0;bottom:calc(100% + 6px);z-index:10;display:flex;flex-direction:column;min-width:240px;max-width:min(320px,75vw);padding:4px;border-radius:var(--dsw-radius-md,12px);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));background:var(--dsw-specific-menu,rgba(255,255,255,.9));-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);box-shadow:var(--dsw-elevation-panel,0 8px 24px rgba(0,0,0,.12));overflow:hidden}',
+      '.dsh-qa-modelrow{display:flex;flex-direction:column;gap:1px;width:100%;padding:6px 8px;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-primary,inherit);font-family:inherit;text-align:left;cursor:pointer}',
+      '.dsh-qa-modelrow:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
+      '.dsh-qa-modelrow[aria-selected="true"]{background:var(--dsw-alias-state-business-tertiary,rgba(77,107,254,.12))}',
+      '.dsh-qa-modelrowname{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-modelrowdesc{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-send{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;width:30px;height:30px;padding:0;border:none;border-radius:50%;background:var(--dsw-alias-button-primary-fill,#4176e6);color:var(--dsw-alias-label-primary-foreground,#fff);cursor:pointer}',
+      '.dsh-qa-send svg{width:16px;height:16px}',
+      '.dsh-qa-send:hover:not(:disabled){opacity:.92}',
+      '.dsh-qa-send:disabled{opacity:.4;cursor:default}',
+      '.dsh-qa-send:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);outline-offset:2px}',
     ].join('\n');
 
     /** Inject the panel stylesheet once; cosmetic failures never break the panel. */
@@ -1102,6 +1190,14 @@ window.__ModuleLoader__.load({
         h('path', { key: 'i1', d: 'M12.5757 7.00012C12.5757 3.92085 10.0794 1.42463 7.00012 1.42456C3.9208 1.42456 1.42456 3.9208 1.42456 7.00012C1.42463 10.0794 3.92085 12.5757 7.00012 12.5757C10.0793 12.5756 12.5756 10.0793 12.5757 7.00012ZM13.8002 7.00012C13.8001 10.7559 10.7559 13.8001 7.00012 13.8002C3.2443 13.8002 0.199291 10.7559 0.199219 7.00012C0.199219 3.24426 3.24426 0.199219 7.00012 0.199219C10.7559 0.199291 13.8002 3.2443 13.8002 7.00012Z', fill: 'currentColor' }),
         h('path', { key: 'i2', d: 'M7.6127 3.18921V4.55986H6.38735V3.18921H7.6127Z', fill: 'currentColor' }),
         h('path', { key: 'i3', d: 'M7.6127 5.68921V10.8109H6.38735V5.68921H7.6127Z', fill: 'currentColor' }),
+      ]);
+    }
+
+    /** The DSH send glyph, used by the composer's send button. */
+    function SendIcon() {
+      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 's1', d: 'M4.74024 9.11029L1.82882 7.79865C1.75022 7.76323 1.75026 7.65161 1.82889 7.61626L12.9665 2.60943C13.0354 2.57846 13.1125 2.63213 13.1073 2.70749L12.3914 13.1388C12.3864 13.2117 12.3073 13.2548 12.2433 13.2194L6.12677 9.83657', stroke: 'currentColor', strokeWidth: 1 }),
+        h('path', { key: 's2', d: 'M8.44336 11.0825L6.2832 13.2843C6.22048 13.3482 6.11182 13.3038 6.11182 13.2143V9.86772C6.11182 9.84165 6.122 9.8166 6.1402 9.79793L12.972 2.78748', stroke: 'currentColor', strokeWidth: 1 }),
       ]);
     }
 
