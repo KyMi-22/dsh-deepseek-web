@@ -136,6 +136,8 @@ ctx.on('session/event', (session, event) => {
 
 文档走同一条链路，差别只有三处：字节来自 `readFileStream`（逐块拼接，20 MB 上限）、媒体类型由扩展名推断（`mediaTypeForName`）、上传头部的 `x-model-type` 用 `file`（图片用 `vision`）。`FileBlock` 的引用只有 `{attachmentId, name}`，没有媒体类型——这是附件存储「文件原样、类型无关」的设计，所以类型在适配器侧补。
 
+**解析结果 `FAILED` 自动重试一次**：解析跑在网页端的异步队列里，偶发的 `FAILED` 不代表文件本身有问题（实测 PNG/WebP/GIF 与 18.9 MiB 大图都能通过）。`uploadFile` 捕获 `PARSE_FAILED` 后重新解 PoW、重新上传、再等一次解析；第二次仍失败才抛错，并带上文件名、媒体类型、字节数与原始状态/审核结果。错误码从 `BIZ` 独立为 `PARSE_FAILED`，重试只针对这一类，业务拒绝（`BIZ`）不重试。
+
 两个容易踩的坑：
 
 - **附件引用必须原样传递**。`ImageBlock.attachment` 里的 `bytes/width/height` 不是装饰信息：本地附件存储读取时会重新探测存储对象，逐字段核对引用（`mediaType`、`bytes`、`width`、`height`），缺一个字段就是 `ATTACHMENT_CORRUPT`。0.2.0 曾把引用裁剪成 `{attachmentId, mediaType, name}`，导致每条带图消息在上传前就被拒。

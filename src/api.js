@@ -394,11 +394,12 @@ export class DeepSeekWebApi {
    * The upload lands as `PENDING` and the server parses it asynchronously; a
    * completion referencing a still-parsing id is refused with HTTP 422. This
    * call therefore polls `fetch_files` until the status leaves `PENDING` —
-   * `SUCCESS` returns the id, anything else is an error. The wait is bounded
-   * and every poll is one small GET.
+   * `SUCCESS` returns the id, anything else is an error.
    *
-   * Every failure here happens before the completion POST, so callers may treat
-   * it as "nothing was submitted" and retry the whole turn.
+   * A settled `FAILED` parse is retried once with a fresh upload: the parse
+   * runs on an asynchronous server-side queue, and a one-off failure there is
+   * not a statement about the file. Every failure here happens before the
+   * completion POST, so callers may treat it as "nothing was submitted".
    *
    * @param {{
    *   bytes: Uint8Array,
@@ -411,6 +412,41 @@ export class DeepSeekWebApi {
    * @returns {Promise<string>} the uploaded file's id.
    */
   async uploadFile(request) {
+    try {
+      return await this.uploadOnce(request);
+    } catch (error) {
+      if (error?.code !== 'PARSE_FAILED') throw error;
+      try {
+        return await this.uploadOnce(request);
+      } catch (second) {
+        const cause = second instanceof Error ? second : new Error(String(second));
+        const detail = `${request.fileName ?? 'file'}, ${request.mediaType ?? 'unknown type'}, ${request.bytes?.byteLength ?? 0} bytes`;
+        throw new DeepSeekWebError(
+          `deepseek-web: file parse failed after a retry (${cause.message}; ${detail})`,
+          'PARSE_FAILED',
+          { cause, submitted: false },
+        );
+      }
+    }
+  }
+
+  /**
+   * One upload attempt: PoW, multipart POST, envelope check, parse wait.
+   *
+   * Kept separate from {@link uploadFile} so the parse-failure retry re-solves
+   * the PoW and mints a NEW file id instead of polling the dead one.
+   *
+   * @param {{
+   *   bytes: Uint8Array,
+   *   mediaType: string,
+   *   fileName: string,
+   *   modelType?: 'vision' | 'file',
+   *   thinking?: boolean,
+   *   signal?: AbortSignal,
+   * }} request
+   * @returns {Promise<string>}
+   */
+  async uploadOnce(request) {
     if (!this.ready) {
       throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL', { submitted: false });
     }
@@ -494,10 +530,11 @@ export class DeepSeekWebApi {
   /**
    * Poll one uploaded file until its parse leaves `PENDING`.
    *
-   * `SUCCESS` resolves; any other settled status (`FAIL` and friends) throws,
-   * because a completion referencing it would be refused. The budget is a fixed
-   * number of polls with a fixed gap — generous enough for large screenshots,
-   * bounded enough that a stuck parse cannot hang a turn for minutes.
+   * `SUCCESS` resolves; any other settled status (`FAILED` and friends) throws
+   * a `PARSE_FAILED` error, because a completion referencing it would be
+   * refused. The budget is a fixed number of polls with a fixed gap —
+   * generous enough for large screenshots, bounded enough that a stuck parse
+   * cannot hang a turn for minutes.
    *
    * @param {string} fileId
    * @param {{ signal?: AbortSignal }} [options]
@@ -508,7 +545,7 @@ export class DeepSeekWebApi {
     let last = '';
     while (Date.now() < deadline) {
       if (signal?.aborted === true) {
-        throw new DeepSeekWebError('deepseek-web: image parse wait aborted', 'ABORTED', { submitted: false });
+        throw new DeepSeekWebError('deepseek-web: file parse wait aborted', 'ABORTED', { submitted: false });
       }
       let status;
       try {
@@ -521,13 +558,14 @@ export class DeepSeekWebApi {
       if (status.status === 'SUCCESS') return;
       if (status.status !== 'PENDING' && status.status !== 'PARSING') {
         throw new DeepSeekWebError(
-          `deepseek-web: image parse did not succeed (status ${status.status}, audit ${status.auditResult || 'unknown'})`,
-          'BIZ',
+          `deepseek-web: file parse did not succeed (status ${status.status}, audit ${status.auditResult || 'unknown'})`,
+          'PARSE_FAILED',
+          { submitted: false },
         );
       }
       await new Promise((resolve) => setTimeout(resolve, FILE_PARSE_POLL_MS));
     }
-    throw new DeepSeekWebError(`deepseek-web: image parse timed out (last status ${last || 'unknown'})`, 'TIMEOUT');
+    throw new DeepSeekWebError(`deepseek-web: file parse timed out (last status ${last || 'unknown'})`, 'TIMEOUT');
   }
 
   /**
