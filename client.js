@@ -163,6 +163,7 @@ window.__ModuleLoader__.load({
         'qa.busy': '上一条回复还在进行中',
         'qa.showHint': '显示说明',
         'qa.hideHint': '隐藏说明',
+        'qa.hintTitle': '快捷侧问说明',
       },
       en: {
         'nav': 'DeepSeek Web',
@@ -258,6 +259,7 @@ window.__ModuleLoader__.load({
         'qa.busy': 'A reply is still streaming',
         'qa.showHint': 'Show explanation',
         'qa.hideHint': 'Hide explanation',
+        'qa.hintTitle': 'About quick ask',
       },
     };
 
@@ -941,17 +943,24 @@ window.__ModuleLoader__.load({
               disabled: busy || (status !== null && !status.hasThread),
               onClick: reset,
             }, t('qa.reset')),
+          ]),
+          // The explanation lives in its own card: the title row is the
+          // toggle, so the hide affordance and the box always move together.
+          h('div', { key: 'hint', className: 'dsh-qa-hintcard' }, [
             h('button', {
-              key: 'toggle',
-              className: 'dsh-qa-toggle',
+              key: 'bar',
+              className: 'dsh-qa-hintbar',
               type: 'button',
               'aria-expanded': hintOpen ? 'true' : 'false',
               'aria-label': hintOpen ? t('qa.hideHint') : t('qa.showHint'),
-              title: hintOpen ? t('qa.hideHint') : t('qa.showHint'),
               onClick: toggleHint,
-            }, h(ChevronIcon)),
+            }, [
+              h(InfoIcon, { key: 'info' }),
+              h('span', { key: 'label', className: 'dsh-qa-hintlabel' }, t('qa.hintTitle')),
+              h(ChevronIcon, { key: 'chevron', className: 'dsh-qa-hintchev' }),
+            ]),
+            h('div', { key: 'body', className: 'dsh-qa-hintbody', hidden: hintOpen ? undefined : true }, t('qa.hint')),
           ]),
-          h('div', { key: 'hint', className: 'dsh-qa-hint', hidden: hintOpen ? undefined : true }, t('qa.hint')),
         ]),
         notice === null ? null : h('div', { key: 'notice', className: 'dsh-qa-notice', 'data-kind': notice.kind }, notice.text),
         h('div', { key: 'list', className: 'dsh-qa-list', ref: listRef },
@@ -961,7 +970,7 @@ window.__ModuleLoader__.load({
                 key: String(index),
                 className: row.role === 'user' ? 'dsh-qa-user' : 'dsh-qa-assistant',
                 'data-live': row.live === true ? 'true' : undefined,
-              }, row.text))),
+              }, row.role === 'user' ? row.text : renderMarkdown(row.text)))),
         h('div', { key: 'input', className: 'dsh-qa-inputrow' }, [
           h('textarea', {
             key: 'text',
@@ -1006,12 +1015,17 @@ window.__ModuleLoader__.load({
       '.dsh-qa-head{display:flex;flex-direction:column;gap:6px;flex:none}',
       '.dsh-qa-headrow{display:flex;align-items:center;gap:8px;min-width:0}',
       '.dsh-qa-meta{flex:1 1 auto;min-width:0;font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-      '.dsh-qa-hint{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#81858c);padding:0 2px}',
-      '.dsh-qa-hint[hidden]{display:none}',
-      '.dsh-qa-toggle{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:none;padding:0;border:none;border-radius:var(--dsw-radius-sm,8px);background:transparent;color:var(--dsw-alias-label-tertiary,#81858c);cursor:pointer}',
-      '.dsh-qa-toggle:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09));color:var(--dsw-alias-label-secondary,inherit)}',
-      '.dsh-qa-toggle svg{width:13px;height:13px;transition:transform .15s ease}',
-      '.dsh-qa-toggle[aria-expanded="false"] svg{transform:rotate(-90deg)}',
+      '.dsh-qa-hintcard{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.2));border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.05));overflow:hidden}',
+      '.dsh-qa-hintbar{display:flex;align-items:center;gap:6px;width:100%;padding:6px 8px 6px 10px;border:none;background:transparent;color:var(--dsw-alias-label-secondary,#61666b);font-size:12px;font-family:inherit;text-align:left;cursor:pointer;user-select:none}',
+      '.dsh-qa-hintbar:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.07))}',
+      '.dsh-qa-hintbar:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4176e6);outline-offset:-2px}',
+      '.dsh-qa-hintbar svg{width:13px;height:13px;flex:none}',
+      '.dsh-qa-hintlabel{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-qa-hintchev{transition:transform .15s ease}',
+      '.dsh-qa-hintbar[aria-expanded="false"] .dsh-qa-hintchev{transform:rotate(-90deg)}',
+      '.dsh-qa-hintbody{padding:0 10px 8px;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-hintbody[hidden]{display:none}',
+      '.dsh-qa-hint{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#81858c);padding:8px 10px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.2));border-radius:var(--dsw-radius-md,12px);background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.05))}',
       '.dsh-qa-ghost{padding:4px 10px;border-radius:var(--dsw-radius-sm,8px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));background:transparent;color:var(--dsw-alias-label-secondary,inherit);font-size:12px;font-family:inherit;cursor:pointer;white-space:nowrap}',
       '.dsh-qa-ghost:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.09))}',
       '.dsh-qa-ghost:disabled{opacity:.45;cursor:default}',
@@ -1019,8 +1033,30 @@ window.__ModuleLoader__.load({
       '.dsh-qa-notice[data-kind="bad"]{color:var(--dsw-alias-label-error,#e03131)}',
       '.dsh-qa-list{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px;overflow-y:auto;padding:2px 2px 2px 0;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2)}',
       '.dsh-qa-user{align-self:flex-end;max-width:86%;padding:8px 12px;border-radius:var(--dsw-radius-lg,16px);background:var(--dsw-specific-bubble,#edf3fe);color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.55;white-space:pre-wrap;word-break:break-word}',
-      '.dsh-qa-assistant{align-self:flex-start;max-width:100%;padding:0 2px;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.6;white-space:pre-wrap;word-break:break-word}',
+      '.dsh-qa-assistant{align-self:flex-start;max-width:100%;padding:8px 12px;border-radius:var(--dsw-radius-lg,16px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.2));background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.07));color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);line-height:1.65;word-break:break-word;overflow-wrap:anywhere}',
       '.dsh-qa-assistant[data-live="true"]{color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-qa-assistant > :first-child{margin-top:0}',
+      '.dsh-qa-assistant > :last-child{margin-bottom:0}',
+      '.dsh-qa-assistant p{margin:0 0 8px}',
+      '.dsh-qa-assistant h1,.dsh-qa-assistant h2,.dsh-qa-assistant h3,.dsh-qa-assistant h4{margin:10px 0 6px;font-weight:600;line-height:1.35}',
+      '.dsh-qa-assistant h1{font-size:17px}',
+      '.dsh-qa-assistant h2{font-size:15px}',
+      '.dsh-qa-assistant h3{font-size:14px}',
+      '.dsh-qa-assistant h4{font-size:13.5px}',
+      '.dsh-qa-assistant ul,.dsh-qa-assistant ol{margin:0 0 8px;padding-left:20px}',
+      '.dsh-qa-assistant li{margin:2px 0}',
+      '.dsh-qa-assistant blockquote{margin:0 0 8px;padding:2px 10px;border-left:3px solid var(--dsw-alias-border-l3,rgba(128,128,128,.35));color:var(--dsw-alias-label-secondary,inherit)}',
+      '.dsh-qa-assistant blockquote p{margin:0 0 4px}',
+      '.dsh-qa-assistant code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px}',
+      '.dsh-qa-assistant :not(pre) > code{padding:1px 5px;border-radius:4px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}',
+      '.dsh-qa-assistant pre{margin:0 0 8px;padding:8px 10px;border-radius:var(--dsw-radius-sm,8px);background:var(--dsw-alias-markdown-code-block,rgba(128,128,128,.12));overflow-x:auto}',
+      '.dsh-qa-assistant pre code{white-space:pre}',
+      '.dsh-qa-assistant a{color:var(--dsw-alias-state-business-primary,#4176e6);text-decoration:none}',
+      '.dsh-qa-assistant a:hover{text-decoration:underline}',
+      '.dsh-qa-assistant hr{margin:8px 0;border:none;border-top:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25))}',
+      '.dsh-qa-assistant table{border-collapse:collapse;margin:0 0 8px;font-size:13px;display:block;overflow-x:auto}',
+      '.dsh-qa-assistant th,.dsh-qa-assistant td{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));padding:4px 8px;text-align:left}',
+      '.dsh-qa-assistant th{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.08));font-weight:600}',
       '.dsh-qa-empty{font-size:12.5px;color:var(--dsw-alias-label-tertiary,#81858c);padding:6px 2px}',
       '.dsh-qa-inputrow{display:flex;gap:8px;align-items:flex-end;flex:none}',
       '.dsh-qa-textarea{flex:1 1 auto;min-height:40px;max-height:120px;resize:none;padding:8px 10px;border-radius:var(--dsw-radius-lg,16px);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:var(--dsh-content-font-size,14px);font-family:inherit;line-height:1.5;outline:none}',
@@ -1054,10 +1090,207 @@ window.__ModuleLoader__.load({
     }
 
     /** The DSH chevron, used by the collapsible hint. */
-    function ChevronIcon() {
-      return h('svg', { viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
+    function ChevronIcon({ className }) {
+      return h('svg', { className, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' }, [
         h('path', { key: 'c', d: 'M4 6L7.29289 9.29289C7.68342 9.68342 8.31658 9.68342 8.70711 9.29289L12 6', stroke: 'currentColor', strokeWidth: 1 }),
       ]);
+    }
+
+    /** The DSH info glyph, used by the hint card's title row. */
+    function InfoIcon() {
+      return h('svg', { viewBox: '0 0 14 14', fill: 'none', 'aria-hidden': 'true' }, [
+        h('path', { key: 'i1', d: 'M12.5757 7.00012C12.5757 3.92085 10.0794 1.42463 7.00012 1.42456C3.9208 1.42456 1.42456 3.9208 1.42456 7.00012C1.42463 10.0794 3.92085 12.5757 7.00012 12.5757C10.0793 12.5756 12.5756 10.0793 12.5757 7.00012ZM13.8002 7.00012C13.8001 10.7559 10.7559 13.8001 7.00012 13.8002C3.2443 13.8002 0.199291 10.7559 0.199219 7.00012C0.199219 3.24426 3.24426 0.199219 7.00012 0.199219C10.7559 0.199291 13.8002 3.2443 13.8002 7.00012Z', fill: 'currentColor' }),
+        h('path', { key: 'i2', d: 'M7.6127 3.18921V4.55986H6.38735V3.18921H7.6127Z', fill: 'currentColor' }),
+        h('path', { key: 'i3', d: 'M7.6127 5.68921V10.8109H6.38735V5.68921H7.6127Z', fill: 'currentColor' }),
+      ]);
+    }
+
+    // ── markdown ────────────────────────────────────────────────────────────
+    // A deliberately small Markdown subset for the transcript: fenced code,
+    // headings, lists, blockquotes, rules, pipe tables, paragraphs, and the
+    // usual inline marks. It builds React nodes directly (never HTML strings),
+    // so model output cannot inject markup, and it tolerates partial text
+    // while the answer streams (an unclosed fence renders as code).
+
+    /** One Markdown table row split on pipes (outer pipes stripped). */
+    function splitRow(line) {
+      return line.trim().replace(/^\|/u, '').replace(/\|$/u, '').split('|').map((cell) => cell.trim());
+    }
+
+    /** Whether one line opens a block (used to end a paragraph). */
+    function isBlockStart(line) {
+      return /^\s*(```|~~~)/u.test(line)
+        || /^#{1,6}\s/u.test(line)
+        || /^\s*>/u.test(line)
+        || /^\s*([-*+]|\d+[.)])\s+/u.test(line)
+        || /^\s*([-*_])\1{2,}\s*$/u.test(line);
+    }
+
+    /** Inline marks: code, bold, strike, links, italic. */
+    function inlineNodes(text, key) {
+      const nodes = [];
+      let buffer = '';
+      let i = 0;
+      const flush = () => {
+        if (buffer !== '') {
+          nodes.push(buffer);
+          buffer = '';
+        }
+      };
+      while (i < text.length) {
+        if (text[i] === '`') {
+          const end = text.indexOf('`', i + 1);
+          if (end > i + 1) {
+            flush();
+            nodes.push(h('code', { key: `${key}-c${nodes.length}` }, text.slice(i + 1, end)));
+            i = end + 1;
+            continue;
+          }
+        }
+        if (text.startsWith('**', i)) {
+          const end = text.indexOf('**', i + 2);
+          if (end > i + 2) {
+            flush();
+            nodes.push(h('strong', { key: `${key}-b${nodes.length}` }, inlineNodes(text.slice(i + 2, end), `${key}-b`)));
+            i = end + 2;
+            continue;
+          }
+        }
+        if (text.startsWith('~~', i)) {
+          const end = text.indexOf('~~', i + 2);
+          if (end > i + 2) {
+            flush();
+            nodes.push(h('del', { key: `${key}-s${nodes.length}` }, inlineNodes(text.slice(i + 2, end), `${key}-s`)));
+            i = end + 2;
+            continue;
+          }
+        }
+        if (text[i] === '[') {
+          const close = text.indexOf('](', i);
+          const end = close > i ? text.indexOf(')', close + 2) : -1;
+          if (close > i && end > close) {
+            const href = text.slice(close + 2, end).trim();
+            if (/^(https?:|mailto:)/iu.test(href)) {
+              flush();
+              nodes.push(h('a', { key: `${key}-a${nodes.length}`, href, target: '_blank', rel: 'noreferrer noopener' }, text.slice(i + 1, close)));
+              i = end + 1;
+              continue;
+            }
+          }
+        }
+        if (text[i] === '*') {
+          const end = text.indexOf('*', i + 1);
+          if (end > i + 1 && !text.slice(i + 1, end).includes('\n')) {
+            flush();
+            nodes.push(h('em', { key: `${key}-i${nodes.length}` }, inlineNodes(text.slice(i + 1, end), `${key}-i`)));
+            i = end + 1;
+            continue;
+          }
+        }
+        buffer += text[i];
+        i += 1;
+      }
+      flush();
+      return nodes;
+    }
+
+    /**
+     * Render one Markdown document as an element tree.
+     * @param {string} source
+     * @returns {unknown}
+     */
+    function renderMarkdown(source) {
+      const lines = String(source ?? '').replace(/\r\n?/gu, '\n').split('\n');
+      /** @type {unknown[]} */
+      const blocks = [];
+      let i = 0;
+      let key = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        if (line.trim() === '') {
+          i += 1;
+          continue;
+        }
+        const fence = line.match(/^\s*(```+|~~~+)\s*([\w+-]*)\s*$/u);
+        if (fence !== null) {
+          const opener = fence[1];
+          const body = [];
+          i += 1;
+          while (i < lines.length && !lines[i].trim().startsWith(opener)) {
+            body.push(lines[i]);
+            i += 1;
+          }
+          if (i < lines.length) i += 1;
+          blocks.push(h('pre', { key: `code-${key++}`, className: 'dsh-qa-code' }, h('code', {
+            className: fence[2] !== '' ? `language-${fence[2]}` : undefined,
+          }, body.join('\n'))));
+          continue;
+        }
+        const heading = line.match(/^(#{1,6})\s+(.*)$/u);
+        if (heading !== null) {
+          const level = Math.min(heading[1].length, 4);
+          blocks.push(h(`h${level}`, { key: `h-${key++}` }, inlineNodes(heading[2], `h-${key}`)));
+          i += 1;
+          continue;
+        }
+        if (/^\s*([-*_])\1{2,}\s*$/u.test(line)) {
+          blocks.push(h('hr', { key: `hr-${key++}` }));
+          i += 1;
+          continue;
+        }
+        if (/^\s*>/u.test(line)) {
+          const quote = [];
+          while (i < lines.length && /^\s*>/u.test(lines[i])) {
+            quote.push(lines[i].replace(/^\s*>\s?/u, ''));
+            i += 1;
+          }
+          blocks.push(h('blockquote', { key: `q-${key++}` }, renderMarkdown(quote.join('\n'))));
+          continue;
+        }
+        const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/u);
+        if (item !== null) {
+          const ordered = /^\d/u.test(item[2]);
+          const items = [];
+          while (i < lines.length) {
+            const next = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/u);
+            if (next === null || /^\d/u.test(next[2]) !== ordered) break;
+            items.push(h('li', { key: `li-${key}-${items.length}` }, inlineNodes(next[3], `li-${key}`)));
+            i += 1;
+          }
+          blocks.push(h(ordered ? 'ol' : 'ul', { key: `list-${key++}` }, items));
+          continue;
+        }
+        if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/u.test(lines[i + 1])) {
+          const header = splitRow(line);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') {
+            rows.push(splitRow(lines[i]));
+            i += 1;
+          }
+          blocks.push(h('table', { key: `tbl-${key++}` }, [
+            h('thead', { key: 'head' }, h('tr', null, header.map((cell, idx) => h('th', { key: String(idx) }, inlineNodes(cell, `th-${idx}`))))),
+            h('tbody', { key: 'body' }, rows.map((row, ridx) => h('tr', { key: String(ridx) }, row.map((cell, cidx) => h('td', { key: String(cidx) }, inlineNodes(cell, `td-${cidx}`)))))),
+          ]));
+          continue;
+        }
+        const para = [];
+        while (i < lines.length && lines[i].trim() !== '' && !isBlockStart(lines[i]) && !(lines[i].includes('|') && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/u.test(lines[i + 1]))) {
+          para.push(lines[i]);
+          i += 1;
+        }
+        if (para.length === 0) {
+          para.push(line);
+          i += 1;
+        }
+        const children = [];
+        para.forEach((row, idx) => {
+          if (idx > 0) children.push(h('br', { key: `br-${idx}` }));
+          children.push(...inlineNodes(row, `p-${key}-${idx}`));
+        });
+        blocks.push(h('p', { key: `p-${key++}` }, children));
+      }
+      return blocks;
     }
 
     const inject = ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight'];

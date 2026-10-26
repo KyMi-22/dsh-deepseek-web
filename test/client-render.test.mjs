@@ -300,4 +300,51 @@ assert.equal(typeof Page, 'function', 'registered value is a component');
   assert.ok(tree !== null && typeof tree === 'object', 'the panel renders');
 }
 
+// ── quick-ask: markdown replies and the hint card ──────────────────────────
+{
+  const panelReg = registrations.find((row) => row.options.name === 'sidebar.right.pane.tab');
+  const { tree } = render(panelReg.Component, { sessionId: 's1' }, [
+    {
+      ok: true,
+      hasThread: true,
+      ready: true,
+      streaming: false,
+      contextChars: 1200,
+      exchanges: [
+        { role: 'user', text: '怎么用 **强调**？' },
+        { role: 'assistant', text: '答案：\n\n**重点**\n\n- 第一点\n- 第二点\n\n```js\nconst a = 1;\n```\n\n[链接](https://example.com)' },
+      ],
+    },
+    '',
+    false,
+    null,
+    null,
+    true,
+    'zh',
+  ]);
+  const elements = [];
+  for (const node of walk(tree)) {
+    if (node !== null && typeof node === 'object' && node.type !== undefined) elements.push(node);
+  }
+  const tags = elements.map((node) => node.type);
+  assert.ok(tags.includes('strong'), 'bold renders as <strong>');
+  assert.ok(tags.includes('pre'), 'a fenced block renders as <pre>');
+  assert.ok(tags.includes('code'), 'code elements exist');
+  assert.ok(tags.includes('ul') && tags.includes('li'), 'lists render as <ul>/<li>');
+  assert.ok(tags.includes('a'), 'links render as <a>');
+  const text = textOf(tree);
+  // User text is literal: its asterisks are not swallowed by the renderer.
+  assert.ok(text.includes('怎么用 **强调**？'), 'user text is not markdown-rendered');
+  assert.ok(text.includes('第一点'), 'list content reaches the page');
+  // The hint card: a bounded box whose title row is the toggle.
+  assert.ok(text.includes('快捷侧问说明'), 'the hint card title renders');
+  const hintBar = elements.find((node) => node.type === 'button' && node.props?.className === 'dsh-qa-hintbar');
+  assert.ok(hintBar, 'the hint bar exists');
+  assert.equal(hintBar.props['aria-expanded'], 'true', 'expanded by default');
+  const hintBody = elements.find((node) => node.type === 'div' && node.props?.className === 'dsh-qa-hintbody');
+  assert.ok(hintBody, 'the hint body exists');
+  hintBar.props.onClick();
+  assert.equal(stateValues[5], false, 'clicking the bar collapses the hint');
+}
+
 console.log('\nclient-render.test.mjs: all assertions passed');
