@@ -212,10 +212,14 @@ assert.equal(typeof Page, 'function', 'registered value is a component');
       imported: 5,
       lastSyncAt: Date.now() - 120000,
       autoSyncSeconds: 300,
+      version: '0.5.0',
     },
     '',
     '',
     null,
+    'zh',
+    { current: '0.5.0', latest: { version: '0.4.1', releaseUrl: 'https://example.com/r' }, updateAvailable: false, error: null, installing: null, canInstall: true },
+    '',
   ]);
   const text = textOf(tree);
   console.log('loaded state text:', JSON.stringify(text.slice(0, 220)));
@@ -234,6 +238,13 @@ assert.equal(typeof Page, 'function', 'registered value is a component');
   // The auto-sync cadence is visible, so a user can tell why the sidebar lags.
   assert.ok(text.includes('自动同步'), 'the auto-sync row renders');
   assert.ok(text.includes('每 5 分钟'), 'the interval is shown in minutes');
+  // The update section: current version, a check button, and a "latest" line
+  // once the Host has answered a check.
+  assert.ok(text.includes('更新'), 'update section renders');
+  assert.ok(text.includes('v0.5.0'), 'the installed version renders');
+  assert.ok(text.includes('v0.4.1'), 'the latest version renders after a check');
+  assert.ok(text.includes('已是最新版本'), 'an equal-or-older release reads as up to date');
+  assert.ok(text.includes('检查更新'), 'the check button renders');
 }
 
 // ── quick-ask: without the sidebar services only the settings page registers ─

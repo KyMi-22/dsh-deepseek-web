@@ -119,6 +119,22 @@ window.__ModuleLoader__.load({
         'sync.autoIntervalOff': '已关闭（仅手动）',
         'models.title': '模型',
         'models.hint': '在输入框的模型选择器里选「DeepSeek 网页版」即可使用。',
+        'update.title': '更新',
+        'update.hint': '从 GitHub Release 检查新版本。发现新版时会下载安装包并交给插件管理器安装，完成后页面自动刷新；部分情况下需要重启 DSH。',
+        'update.current': '当前版本',
+        'update.latest': '最新版本',
+        'update.check': '检查更新',
+        'update.checking': '检查中…',
+        'update.install': '下载并安装',
+        'update.downloading': '下载中…',
+        'update.releaseLink': '打开 Release 页面',
+        'update.none': '已是最新版本（v{version}）。',
+        'update.available': '发现新版本 v{version}。',
+        'update.installing': '正在安装 v{version}，页面将在约 20 秒后自动刷新。',
+        'update.manual': '安装包已下载到 {path}。当前组合没有插件管理器，请到「设置 → 插件 → 添加插件」用这个路径安装。',
+        'update.ahead': '当前是开发版（v{current}），比最新发布版 v{latest} 新。',
+        'update.rollback': '装回发布版',
+        'update.error': '更新失败：{message}',
         'limits.title': '能力说明',
         'limits.body': '网页端接口只接受一段文本 prompt，没有函数调用通道，所以这个模型不会发起工具调用；为保证「不写本地文件」，这些会话里的写入类工具也被额外拦截。',
         'loading': '正在读取…',
@@ -219,6 +235,22 @@ window.__ModuleLoader__.load({
         'sync.autoIntervalOff': 'off (manual only)',
         'models.title': 'Models',
         'models.hint': 'Pick "DeepSeek Web" in the composer model selector.',
+        'update.title': 'Updates',
+        'update.hint': 'Check GitHub Releases for a newer version. When one is found the package is downloaded and handed to the plugin manager; the page reloads afterwards. Some installs need a DSH restart.',
+        'update.current': 'Installed',
+        'update.latest': 'Latest',
+        'update.check': 'Check for updates',
+        'update.checking': 'Checking…',
+        'update.install': 'Download and install',
+        'update.downloading': 'Downloading…',
+        'update.releaseLink': 'Open the release page',
+        'update.none': 'You are on the latest version (v{version}).',
+        'update.available': 'Version v{version} is available.',
+        'update.installing': 'Installing v{version}; this page reloads in about 20 seconds.',
+        'update.manual': 'The package was downloaded to {path}. This composition has no plugin manager, so install it from Settings → Plugins → Add plugin with that path.',
+        'update.ahead': 'This is a development build (v{current}), newer than the latest release v{latest}.',
+        'update.rollback': 'Install the release',
+        'update.error': 'Update failed: {message}',
         'limits.title': 'Capabilities',
         'limits.body': 'The web endpoint accepts one text prompt and has no function-calling channel, so this model never issues tool calls; file-writing tools are also blocked inside these sessions so nothing is written locally.',
         'loading': 'Loading…',
@@ -397,6 +429,9 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('');
       const [notice, setNotice] = useState(null);
       const [localeId, setLocaleId] = useState('zh');
+      /** The update section's own state: last check result, in-flight action. */
+      const [update, setUpdate] = useState(null);
+      const [updateBusy, setUpdateBusy] = useState('');
 
       const t = useCallback(
         (key, values) => {
@@ -416,6 +451,20 @@ window.__ModuleLoader__.load({
           /* keep the default */
         }
       }, []);
+
+      /** Read the updater's current view (also used for the version display). */
+      const refreshUpdate = useCallback(async () => {
+        try {
+          const response = await fetch(API_PATH + '/update/status', { credentials: 'same-origin' });
+          if (response.ok) setUpdate(await response.json());
+        } catch {
+          /* the version line simply stays empty */
+        }
+      }, []);
+
+      useEffect(() => {
+        refreshUpdate();
+      }, [refreshUpdate]);
 
       const refresh = useCallback(async () => {
         try {
@@ -590,6 +639,84 @@ window.__ModuleLoader__.load({
         }
       }, [refresh, t]);
 
+      /**
+       * Ask the Host to compare this version with the newest release.
+       *
+       * The check is a network call from the Host, not from the page: GitHub's
+       * API is reachable from there even when the browser is offline to it.
+       */
+      const checkUpdate = useCallback(async () => {
+        setUpdateBusy('check');
+        try {
+          const response = await fetch(API_PATH + '/update/check', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          const body = await response.json().catch(() => ({}));
+          if (body && typeof body === 'object' && 'current' in body) setUpdate(body);
+        } catch (error) {
+          setUpdate((current) => ({
+            ...(current ?? {}),
+            error: String(error && error.message ? error.message : error),
+          }));
+        } finally {
+          setUpdateBusy('');
+        }
+      }, []);
+
+      /**
+       * Download the release and let the Host install it.
+       *
+       * After the response the plugin swaps itself out: this page keeps its old
+       * bundle until it reloads, so the page reloads on a timer instead of
+       * trusting a socket that is about to disappear.
+       */
+      const installUpdate = useCallback(async () => {
+        setUpdateBusy('install');
+        try {
+          const response = await fetch(API_PATH + '/update/install', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok || body.ok !== true) {
+            setUpdate((current) => ({
+              ...(current ?? {}),
+              error: body.error || `HTTP ${response.status}`,
+            }));
+            setUpdateBusy('');
+            return;
+          }
+          setUpdate((current) => ({
+            ...(current ?? {}),
+            installing: body.version,
+            downloadedPath: body.path,
+            canInstall: body.canInstall !== false,
+          }));
+          // Give the install a head start, then come back on the new bundle.
+          // If the install needs a restart the page simply shows the old
+          // version again until DSH restarts.
+          setTimeout(() => {
+            try {
+              window.location.reload();
+            } catch {
+              /* a failed reload leaves the notice on screen */
+            }
+          }, body.canInstall === false ? 60_000 : 20_000);
+        } catch (error) {
+          setUpdate((current) => ({
+            ...(current ?? {}),
+            error: String(error && error.message ? error.message : error),
+          }));
+        } finally {
+          setUpdateBusy('');
+        }
+      }, []);
+
       const verify = useCallback(async () => {
         setBusy('verify');
         setNotice(null);
@@ -760,6 +887,74 @@ window.__ModuleLoader__.load({
             h('div', { key: 'lt' }, t('limits.title')),
             h('div', { key: 'lb', style: { marginTop: '6px', opacity: 0.72 } }, t('limits.body')),
           ]),
+        ]),
+
+        h('div', { key: 'update', style: styles.section }, [
+          h('div', { key: 't', style: styles.title }, t('update.title')),
+          h('div', { key: 'hint', style: styles.hint }, t('update.hint')),
+          h('div', { key: 'kv', style: styles.kv }, [
+            h(Row, { key: 'current', name: t('update.current') }, 'v' + (update?.current || status.version || '—')),
+            update?.latest?.version
+              ? h(Row, { key: 'latest', name: t('update.latest') }, 'v' + update.latest.version)
+              : null,
+          ]),
+          h('div', { key: 'row', style: styles.row }, [
+            h('button', {
+              key: 'check',
+              style: styles.button,
+              type: 'button',
+              disabled: updateBusy !== '' || (update?.installing !== null && update?.installing !== undefined),
+              onClick: checkUpdate,
+            }, updateBusy === 'check' ? t('update.checking') : t('update.check')),
+            update?.updateAvailable
+              ? h('a', {
+                  key: 'release',
+                  style: { fontSize: '12.5px', color: 'inherit', opacity: 0.75, textDecoration: 'underline' },
+                  href: update.latest.releaseUrl,
+                  target: '_blank',
+                  rel: 'noreferrer',
+                }, t('update.releaseLink'))
+              : null,
+            update?.updateAvailable
+              ? h('button', {
+                  key: 'install',
+                  style: styles.buttonPrimary,
+                  type: 'button',
+                  disabled: updateBusy !== '' || (update?.installing !== null && update?.installing !== undefined),
+                  onClick: installUpdate,
+                }, updateBusy === 'install' ? t('update.downloading') : t('update.install'))
+              : null,
+            update?.rollbackTo
+              ? h('button', {
+                  key: 'rollback',
+                  style: styles.button,
+                  type: 'button',
+                  disabled: updateBusy !== '' || (update?.installing !== null && update?.installing !== undefined),
+                  onClick: installUpdate,
+                }, updateBusy === 'install' ? t('update.downloading') : t('update.rollback'))
+              : null,
+          ]),
+          update?.rollbackTo
+            ? h('div', { key: 'ahead', style: styles.notice },
+                t('update.ahead', { current: update.current || status.version, latest: update.latest.version }))
+            : null,
+          update?.error
+            ? h('div', { key: 'err', style: { ...styles.notice, ...styles.bad } }, t('update.error', { message: update.error }))
+            : null,
+          update !== null && !update.error && Boolean(update.latest?.version) && !update.updateAvailable
+            ? h('div', { key: 'none', style: styles.notice }, t('update.none', { version: update.current || status.version }))
+            : null,
+          update?.updateAvailable && (update?.installing === null || update?.installing === undefined)
+            ? h('div', { key: 'avail', style: styles.notice }, t('update.available', { version: update.latest.version }))
+            : null,
+          update?.installing !== null && update?.installing !== undefined
+            ? h('div', {
+                key: 'installing',
+                style: styles.notice,
+              }, update.canInstall === false
+                ? t('update.manual', { path: update.downloadedPath || '' })
+                : t('update.installing', { version: update.installing }))
+            : null,
         ]),
 
         notice === null
