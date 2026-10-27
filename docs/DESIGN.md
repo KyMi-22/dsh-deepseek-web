@@ -33,6 +33,7 @@ DSH 会话 ──► deepseek-web provider ──► chat.deepseek.com
 | `src/tool-guard.js` | 网页版会话的工具白名单 |
 | `src/quick-ask.js` | 快捷侧问：压缩背景、每会话一条网页线程、SSE 泵 |
 | `src/quick-ask-tag.js` | 侧问线程命名与导入排除规则（无依赖叶子模块） |
+| `src/update.js` | 自更新：语义版本比较、Release 查询、下载与摘要校验 |
 
 ## 为什么是「工作区」
 
@@ -214,3 +215,14 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 - **附件**：回形针按钮打开多选文件选择器；选中的文件以原始字节 POST 到 `/quick-ask/upload`（文件名与媒体类型在 query，`readRawBody` 边读边限 20 MB），Host 调 `uploadFile`（`vision`/`file` 按媒体类型）上传到网页端并返回 id。发送时 id 进 `ref_file_ids`、文件名进 `quickAsk` 记录（气泡内展示为文件条）。只附文件不打字时 prompt 自动写成「请查看附件：…」，保证文本非空；发送失败会把暂存附件放回去，便于重试。
 - **数据面**：`/quick-ask/status`（面板状态 + 模型选项）、`/quick-ask/upload`（原始字节上传）、`/quick-ask/reset`（换线程）、`/quick-ask/send`（SSE 流式回复，请求断开即中止生成）。问答记录只进 `quickAsk` 账本，**不写会话日志**——这是整个功能的存在理由。
 - **失败语义**：创建线程（PoW、建会话、发背景）失败时面板报错、不落线程记录，可整轮重试；回复流中断则保留已到手的片段，父消息标记不动，避免重试分叉出两条回答。
+
+## 自更新
+
+设置页的「更新」一节只做三件事：查版本、下载包、把包交给插件管理器。**安装不是本插件做的**——`ctx.get('pluginManager').installBundle(tgz)` 拥有 profile、pnpm 与重组，插件只负责把文件准备好。
+
+- **版本比较**：`src/update.js` 的 `parseVersion` / `compareVersions` 按数字三元组比较（`0.10.0 > 0.9.0`），tag 的 `v` 前缀与 `-rc` 后缀不参与比较。
+- **查询**：`GET https://api.github.com/repos/<repo>/releases/latest`。网络策略上有取舍——`api.github.com` 在多数网络可直连，但 release 资源由 `github.com` / `objects.githubusercontent.com` 提供，部分网络会重置连接。
+- **下载**：配置了 `updateProxy` 时走 `curl -x`（Node 的 fetch 只在进程启动时读一次代理环境变量，运行期改不了），否则用 fetch 流式写入。文件先写 `.part`，校验 GitHub 提供的 `sha256` 摘要与字节数一致后才改名；任何一步失败都删掉半成品，不会留下一个「看起来能装」的文件。
+- **安装**：下载完成后先回应页面，再 `setTimeout` 触发 `installBundle(path, { enabled: true })`。安装会替换本插件文件并触发重组，本 fiber 随即销毁——所以页面拿到的是「已下载、正在安装」，随后定时刷新（20 秒；没有插件管理器时 60 秒并提示手动安装）。装失败时插件管理器恢复 profile 清单，旧版本继续运行。
+- **开发版装回发布版**：当前版本高于最新 Release 时（`compareVersions` 返回 -1），`updatePayload` 给出 `rollbackTo`，页面显示「装回发布版」并复用同一条下载+安装链路。这既是开发版的自救入口，也是验证安装链路的途径。
+- **没有插件管理器时**：只下载，页面给出路径，让用户在「设置 → 插件」里手动装。`capabilities` 与 `/update/status` 的 `canInstall` 都反映这一点。

@@ -27,6 +27,7 @@ import { DeepSeekWebApi } from './src/api.js';
 import { DeepSeekWebAdapter, MODELS, PROVIDER } from './src/adapter.js';
 import {
   conversationDir,
+  dataDir,
   ensureConversationDir,
   StateStore,
   stateFile,
@@ -34,8 +35,10 @@ import {
 import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
 import { readJsonBody, readRawBody, sendJson } from './src/http.js';
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
 import { QuickAsk } from './src/quick-ask.js';
+import { compareVersions, currentVersion, DEFAULT_RELEASE_REPO, downloadRelease, latestRelease } from './src/update.js';
 
 export { isToolAllowedInWebSession } from './src/tool-guard.js';
 
@@ -676,6 +679,77 @@ export async function apply(ctx, config = {}) {
     });
   }
 
+  // ── self-update ───────────────────────────────────────────────────────────
+  // The update section only looks things up and downloads; installation is the
+  // plugin manager's job (`installBundle`), because it owns the profile, pnpm
+  // and the recompos-ition that swaps this very plugin out.
+  const updateConfig = {
+    repo: typeof config.updateRepo === 'string' && config.updateRepo.trim() !== ''
+      ? config.updateRepo.trim()
+      : DEFAULT_RELEASE_REPO,
+    proxy: typeof config.updateProxy === 'string' ? config.updateProxy.trim() : '',
+  };
+  /** The installed version, read once from this package's manifest. */
+  const pluginVersion = await currentVersion().catch(() => '');
+  /** The last successful check, and the last failure, kept for the page. */
+  let updateCheck = { at: 0, latest: null, error: null };
+  /** The version being downloaded/installed; the page polls while it is set. */
+  let updateInstall = null;
+
+  /** The shape both the check and the status routes answer with. */
+  function updatePayload() {
+    const latest = updateCheck.latest;
+    const comparison = latest === null ? null : compareVersions(latest.version, pluginVersion);
+    return {
+      current: pluginVersion,
+      checkedAt: updateCheck.at,
+      latest: latest === null ? null : {
+        version: latest.version,
+        releaseUrl: latest.releaseUrl,
+        publishedAt: latest.publishedAt,
+        assetName: latest.asset?.name ?? '',
+        assetSize: latest.asset?.size ?? 0,
+      },
+      updateAvailable: comparison === 1,
+      // A development build is ahead of the newest release: offering the
+      // published version is a rollback, not an update.
+      rollbackTo: comparison === -1 ? latest.version : null,
+      error: updateCheck.error,
+      installing: updateInstall,
+      canInstall: ctx.get('pluginManager')?.installBundle !== undefined,
+    };
+  }
+
+  /**
+   * Install a verified tgz through the plugin manager.
+   *
+   * Runs AFTER the HTTP response: installing swaps this plugin's files and
+   * recomposes the tree, which disposes this fiber mid-call. The manager's own
+   * promise keeps running because it lives on its own fiber.
+   */
+  async function installDownloaded(file) {
+    const manager = ctx.get('pluginManager');
+    if (typeof manager?.installBundle !== 'function') {
+      updateCheck.error = 'no-plugin-manager';
+      updateInstall = null;
+      return;
+    }
+    try {
+      const result = await manager.installBundle(file, { enabled: true });
+      if (result?.application === 'restart-required') {
+        info('deepseek-web: update installed; restart DSH to load it');
+      } else if (result?.error !== undefined) {
+        warn(`deepseek-web: update install failed: ${String(result.error?.message ?? result.error)}`);
+      } else {
+        info('deepseek-web: update installed and applied');
+      }
+    } catch (error) {
+      warn(`deepseek-web: update install threw: ${String(error)}`);
+    } finally {
+      updateInstall = null;
+    }
+  }
+
   // ── settings route ────────────────────────────────────────────────────────
   // Quick-ask controller: one instance per mount, sharing the credential and
   // the state store with the adapter. The persistence service is resolved on
@@ -749,6 +823,7 @@ export async function apply(ctx, config = {}) {
                 lastWorkspaceError: store.state.lastWorkspaceError,
                 lastReport: store.state.lastReport,
                 lastSyncError: store.state.lastSyncError,
+                version: pluginVersion,
               });
               return;
             }
@@ -987,6 +1062,61 @@ export async function apply(ctx, config = {}) {
               }
               res.end();
               return;
+            }
+            // ── self-update routes ──────────────────────────────────────────
+            if (req.method === 'GET' && route === '/update/status') {
+              sendJson(res, 200, updatePayload());
+              return;
+            }
+            if (req.method === 'POST' && route === '/update/check') {
+              try {
+                const release = await latestRelease({ repo: updateConfig.repo, proxy: updateConfig.proxy });
+                updateCheck = { at: Date.now(), latest: release, error: null };
+              } catch (error) {
+                updateCheck = { at: Date.now(), latest: null, error: String(error?.message ?? error) };
+              }
+              sendJson(res, 200, updatePayload());
+              return;
+            }
+            if (req.method === 'POST' && route === '/update/install') {
+              if (updateCheck.latest === null) {
+                sendJson(res, 409, { ok: false, error: 'not-checked' });
+                return;
+              }
+              if (updateInstall !== null) {
+                sendJson(res, 409, { ok: false, error: 'already-installing', version: updateInstall });
+                return;
+              }
+              const target = updateCheck.latest;
+              updateInstall = target.version;
+              try {
+                // The download happens while this plugin still serves requests;
+                // the install is fired only after the response reaches the page.
+                const downloaded = await downloadRelease(target.asset, {
+                  dir: join(dataDir(), 'updates'),
+                  proxy: updateConfig.proxy,
+                  signal: AbortSignal.timeout(10 * 60_000),
+                });
+                sendJson(res, 200, {
+                  ok: true,
+                  version: target.version,
+                  path: downloaded.path,
+                  bytes: downloaded.bytes,
+                  sha256: downloaded.sha256,
+                  canInstall: ctx.get('pluginManager')?.installBundle !== undefined,
+                });
+                // Install after the response flushed. `installBundle` replaces
+                // this plugin's files and recomposes the tree, so by the time
+                // it finishes this fiber is gone — that is expected.
+                setTimeout(() => {
+                  void installDownloaded(downloaded.path);
+                }, 500);
+                return;
+              } catch (error) {
+                updateInstall = null;
+                sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+                return;
+              }
             }
             sendJson(res, 404, { ok: false, error: 'not-found' });
           } catch (error) {
