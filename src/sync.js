@@ -370,6 +370,330 @@ export function buildSeedEvents(messages, meta) {
 }
 
 /**
+ * The tail state of a stored session log: which turn/step is still open and the
+ * highest turn number seen.
+ *
+ * A turn that never closed is the visible trace of an append that died between
+ * `turn/start` and `turn/end` (a torn process, a failed flush). The next append
+ * has to close it before it can number a new turn, otherwise the log carries two
+ * open turns and the transcript projection has no single current step.
+ *
+ * @param {ReadonlyArray<object>} events
+ * @returns {{ lastTurn: number, openTurn: number | null, openStep: number | null }}
+ */
+function logTailState(events) {
+  let lastTurn = 0;
+  /** @type {number | null} */
+  let openTurn = null;
+  /** @type {number | null} */
+  let openStep = null;
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue;
+    if (event.type === 'turn/start') {
+      const turn = Number(event.data?.turn);
+      lastTurn = Number.isFinite(turn) ? Math.max(lastTurn, turn) : lastTurn + 1;
+      openTurn = lastTurn;
+      openStep = null;
+    } else if (event.type === 'step/start') {
+      openStep = Number(event.data?.step) || 1;
+    } else if (event.type === 'step/end') {
+      openStep = null;
+    } else if (event.type === 'turn/end') {
+      openTurn = null;
+      openStep = null;
+    }
+  }
+  return { lastTurn, openTurn, openStep };
+}
+
+/**
+ * Turn the part of a web conversation that arrived after `afterMessageId` into
+ * session events that can be APPENDED to its imported session.
+ *
+ * Only complete exchanges are appended. A trailing user message with no answer
+ * yet (the web product is still generating, or the answer failed) is left for a
+ * later pass: appending it alone would leave a turn with no assistant message,
+ * and a later append cannot safely reopen that turn. Consecutive user messages
+ * stop the plan for the same reason — the earlier question has no answer in the
+ * log, so skipping it would silently drop content.
+ *
+ * `afterMessageId` must be present in `messages`; an absent anchor means the
+ * history is truncated or renumbered, and appending from a guess could duplicate
+ * turns that are already in the session. The caller should fall back to a full
+ * re-import in that case, not append.
+ *
+ * Unlike {@link buildSeedEvents}, this never emits the one-per-session events
+ * (`system/message`, `request/header`, `request/context`, `session/title`): the
+ * imported session already carries them, and a second one would either be
+ * rejected by the log validator or overwrite the epoch used by resume.
+ *
+ * @param {ReadonlyArray<object>} messages - the web conversation's full history.
+ * @param {{
+ *   afterMessageId?: number | null,
+ *   startTurn?: number,
+ *   baseSeq?: number,
+ *   provider?: string,
+ *   model?: string,
+ * }} [options]
+ * @returns {{
+ *   ok: boolean,
+ *   reason: 'no-anchor' | 'anchor-missing' | null,
+ *   events: Array<object>,
+ *   nextMessageId: number | null,
+ *   turns: number,
+ * }}
+ */
+export function planAppend(messages, options = {}) {
+  const { afterMessageId, startTurn = 1, baseSeq = 0, provider, model } = options;
+  const fail = (reason) => ({ ok: false, reason, events: [], nextMessageId: null, turns: 0 });
+
+  if (!Array.isArray(messages)) return fail('no-anchor');
+  if (afterMessageId === null || afterMessageId === undefined) return fail('no-anchor');
+  const anchor = Number(afterMessageId);
+  if (!Number.isFinite(anchor)) return fail('no-anchor');
+  const anchorIndex = messages.findIndex((message) => Number(message?.message_id) === anchor);
+  if (anchorIndex === -1) return fail('anchor-missing');
+
+  /** @type {Array<object>} */
+  const events = [];
+  let seq = baseSeq;
+  let turn = startTurn;
+  /** The last web message id accounted for by the plan. */
+  let nextMessageId = anchor;
+
+  const push = (type, time, data, surfaceOp) => {
+    /** @type {Record<string, unknown>} */
+    const event = { type, seq: seq++, time, data };
+    if (surfaceOp !== undefined) event.surfaceOp = surfaceOp;
+    events.push(event);
+  };
+
+  for (let index = anchorIndex + 1; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message === null || typeof message !== 'object') continue;
+    if (String(message.role ?? '').toUpperCase() !== 'USER') continue;
+    const text = userTextOf(message);
+    if (text === '') continue;
+
+    const answer = messages[index + 1];
+    if (answer === null || answer === undefined || typeof answer !== 'object') break;
+    if (String(answer.role ?? '').toUpperCase() !== 'ASSISTANT') break;
+    const reasoning = fragmentText(answer, THINK);
+    const reply = fragmentText(answer, RESPONSE);
+    if (reasoning === '' && reply === '') break;
+
+    const askedAt = toMillis(message.inserted_at);
+    const answeredAt = toMillis(answer.inserted_at);
+    push('turn/start', askedAt, { turn });
+    push('step/start', askedAt, { turn, step: 1 });
+    // `user/message` carries the UserMessage itself, not a {turn, step, message}
+    // wrapper: the event map declares it as the message, and the storage
+    // validator rejects any slot whose `source` is not on the event data.
+    push('user/message', askedAt, {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+    }, 'append');
+
+    /** @type {Array<object>} */
+    const content = [];
+    if (reasoning !== '') content.push({ type: 'reasoning', text: reasoning });
+    if (reply !== '') content.push({ type: 'text', text: reply });
+    push('assistant/message', answeredAt, {
+      turn,
+      step: 1,
+      message: {
+        id: randomUUID(),
+        role: 'assistant',
+        content,
+        source: { kind: 'model', provider, model },
+      },
+      stream: [],
+    }, 'append');
+    push('step/end', answeredAt, { turn, step: 1 });
+    push('turn/end', answeredAt, { turn, reason: { kind: 'completed' } });
+
+    nextMessageId = Number(answer.message_id);
+    turn += 1;
+    index += 1;
+  }
+
+  return { ok: true, reason: null, events, nextMessageId, turns: turn - startTurn };
+}
+
+/**
+ * Append a web conversation's new exchanges to the session it was imported into.
+ *
+ * The import path seeds a session and releases it, so the session is persisted
+ * but no longer live. `sessionPersistence.open(id, 'write')` is the one public
+ * door onto that log: it takes single-writer ownership, which is also the
+ * concurrency gate — a session the user is looking at (or a resume in flight)
+ * already owns its writer and this call fails with `AlreadyOwned`, in which case
+ * the next sync pass retries.
+ *
+ * Appends are not routed through the agent lifecycle, so derived projections
+ * (title, preview) can lag until the session is read again. The log itself is
+ * the source of truth, and a turn appended here renders exactly like a live one
+ * because it uses the same event vocabulary.
+ *
+ * @param {{
+ *   persistence?: {
+ *     open?: (id: string, access: 'read' | 'write', options?: { signal?: AbortSignal }) =>
+ *       Promise<{
+ *         read: (offset?: number, length?: number, options?: { signal?: AbortSignal }) =>
+ *           Promise<{ events: ReadonlyArray<object> }>,
+ *         append: (events: ReadonlyArray<object>, options?: { signal?: AbortSignal }) => Promise<void>,
+ *         flush: (options?: { signal?: AbortSignal }) => Promise<void>,
+ *         close: () => Promise<void>,
+ *       }>,
+ *   },
+ *   sessionId: string,
+ *   messages: ReadonlyArray<object>,
+ *   afterMessageId: number | null | undefined,
+ *   provider?: string,
+ *   model?: string,
+ *   warn?: (message: string) => void,
+ * }} options
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   reason: string | null,
+ *   appended: number,
+ *   nextMessageId: number | null,
+ *   events: Array<object>,
+ *   error: unknown,
+ * }>}
+ *   `reason` is one of `no-persistence`, `no-session`, `busy`, `missing`,
+ *   `open-failed`, `empty-log`, `no-anchor`, `anchor-missing`, `corrupt-order`,
+ *   `failed`, or `null` on success. `busy` is transient; the rest are
+ *   actionable.
+ */
+export async function appendConversationTurns(options) {
+  const { persistence, sessionId, messages, afterMessageId, provider, model, warn } = options;
+  const fail = (reason, error = null) => ({
+    ok: false,
+    reason,
+    appended: 0,
+    nextMessageId: null,
+    events: [],
+    error,
+  });
+
+  if (typeof persistence?.open !== 'function') return fail('no-persistence');
+  if (typeof sessionId !== 'string' || sessionId === '') return fail('no-session');
+
+  let handle;
+  try {
+    handle = await persistence.open(sessionId, 'write');
+  } catch (error) {
+    const name = String(error?.name ?? '');
+    const reason = name.includes('AlreadyOwned')
+      ? 'busy'
+      : name.includes('NotFound')
+        ? 'missing'
+        : 'open-failed';
+    return fail(reason, error);
+  }
+
+  try {
+    const read = await handle.read(0, undefined);
+    const existing = Array.isArray(read?.events) ? read.events : [];
+    if (existing.length === 0) return fail('empty-log');
+
+    // A linear session's turn numbers only grow. A duplicate or a regression
+    // means something else wrote turns into this log — a live agent whose
+    // cached boundary was bypassed, or an older broken build. Appending on top
+    // would compound the damage; the caller re-imports instead.
+    let previousTurn = 0;
+    for (const event of existing) {
+      if (event?.type !== 'turn/start') continue;
+      const turn = Number(event.data?.turn);
+      if (!Number.isFinite(turn) || turn <= previousTurn) return fail('corrupt-order');
+      previousTurn = turn;
+    }
+
+    const lastSeq = existing.reduce((max, event) => {
+      const seq = Number(event?.seq);
+      return Number.isFinite(seq) ? Math.max(max, seq) : max;
+    }, -1);
+    const tail = logTailState(existing);
+
+    let seq = lastSeq + 1;
+    /** @type {Array<object>} */
+    const closers = [];
+    const closeAt = Date.now();
+    if (tail.openTurn !== null) {
+      if (tail.openStep !== null) {
+        closers.push({ type: 'step/end', seq: seq++, time: closeAt, data: { turn: tail.openTurn, step: tail.openStep } });
+      }
+      closers.push({
+        type: 'turn/end',
+        seq: seq++,
+        time: closeAt,
+        data: { turn: tail.openTurn, reason: { kind: 'interrupted' } },
+      });
+    }
+
+    const plan = planAppend(messages, {
+      afterMessageId,
+      startTurn: tail.lastTurn + 1,
+      baseSeq: seq,
+      provider,
+      model,
+    });
+    if (!plan.ok) return fail(plan.reason);
+
+    const events = [...closers, ...plan.events];
+    if (events.length === 0) {
+      return {
+        ok: true,
+        reason: 'no-new-messages',
+        appended: 0,
+        nextMessageId: Number.isFinite(Number(afterMessageId)) ? Number(afterMessageId) : null,
+        events,
+        error: null,
+      };
+    }
+
+    await handle.append(events);
+    await handle.flush();
+    // A write handle reads its own appends and validates every stored record.
+    // Doing that here turns a malformed event shape into a reported append
+    // failure instead of a log that the NEXT open refuses as corrupt.
+    await handle.read(0, undefined);
+    if (plan.events.length === 0) {
+      // The only work was closing a torn turn; report it as a repair, not as
+      // content that arrived.
+      return {
+        ok: true,
+        reason: 'repaired',
+        appended: 0,
+        nextMessageId: Number.isFinite(Number(afterMessageId)) ? Number(afterMessageId) : null,
+        events,
+        error: null,
+      };
+    }
+    return {
+      ok: true,
+      reason: null,
+      appended: plan.turns,
+      nextMessageId: plan.nextMessageId,
+      events,
+      error: null,
+    };
+  } catch (error) {
+    warn?.(`deepseek-web: appending to session ${sessionId} failed: ${String(error)}`);
+    return fail('failed', error);
+  } finally {
+    try {
+      await handle.close();
+    } catch (error) {
+      warn?.(`deepseek-web: closing the write handle for ${sessionId} failed: ${String(error)}`);
+    }
+  }
+}
+
+/**
  * The last message id of a web conversation, which is the parent a new turn
  * must attach to.
  *

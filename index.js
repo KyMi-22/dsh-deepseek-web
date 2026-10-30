@@ -29,12 +29,13 @@ import {
   conversationDir,
   dataDir,
   ensureConversationDir,
+  sessionDirFor,
   StateStore,
   stateFile,
 } from './src/store.js';
-import { attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
+import { appendConversationTurns, attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
 import { readJsonBody, readRawBody, sendJson } from './src/http.js';
-import { readFile } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isToolAllowedInWebSession, toolRejectionMessage } from './src/tool-guard.js';
 import { QuickAsk } from './src/quick-ask.js';
@@ -373,6 +374,214 @@ export async function apply(ctx, config = {}) {
     );
     return run;
   }
+
+  /**
+   * Serializes append work. A periodic pass and the live-session pass can see
+   * the same conversation at the same time; both would read the anchor before
+   * either wrote it and append the same exchange twice.
+   */
+  let appendQueue = Promise.resolve();
+  function enqueueAppend(task) {
+    const run = appendQueue.then(task, task);
+    appendQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Record the newest web timestamp a pass has seen, without a summary. */
+  function markSeen(known, messages) {
+    const last = messages[messages.length - 1];
+    const at = Number(last?.inserted_at);
+    if (Number.isFinite(at) && at > 0) known.updatedAt = at;
+  }
+
+  /** Drop a ledger row whose stored session no longer exists; the importer recreates it. */
+  async function dropOrphan(chatSessionId, known) {
+    if (store.state.imported[chatSessionId] !== known) return;
+    delete store.state.imported[chatSessionId];
+    delete store.state.bindings[known.dshSessionId];
+    store.state.lastSyncError = 'append target missing; the conversation will be re-imported';
+    warn(`deepseek-web: imported session ${known.dshSessionId} is gone; dropping the ledger row so ${chatSessionId} can be re-imported`);
+    try {
+      await store.flush();
+    } catch {
+      /* the store reports its own write failure */
+    }
+  }
+
+  /**
+   * Replace a session whose turn numbers regressed with a fresh import.
+   *
+   * A log like that is already broken (turns out of order), so appending is not
+   * an option. Archive it first — deletion alone leaves the runtime listing it —
+   * then remove the files and the ledger row; the next pass imports the web
+   * conversation from scratch. Mirrors the undo ordering: archive while the
+   * files still exist, and never delete when archiving failed.
+   */
+  async function repairCorrupt(chatSessionId, known) {
+    if (store.state.imported[chatSessionId] !== known) return;
+    const registry = workspaceRegistry();
+    if (typeof registry?.archiveSession !== 'function') {
+      store.state.lastSyncError = 'corrupt session log; archive is unavailable, so the files were kept';
+      warn(`deepseek-web: session ${known.dshSessionId} has out-of-order turns but archiveSession is unavailable; not deleting it`);
+      return;
+    }
+    try {
+      await registry.archiveSession(known.dshSessionId, { stopActivity: true });
+    } catch (error) {
+      store.state.lastSyncError = `corrupt session log; archive failed: ${String(error?.message ?? error)}`;
+      warn(`deepseek-web: could not archive the corrupt session ${known.dshSessionId}; keeping its files`);
+      return;
+    }
+    try {
+      await rm(sessionDirFor(known.dshSessionId, directory), { recursive: true, force: true });
+    } catch (error) {
+      store.state.lastSyncError = `corrupt session log; remove failed: ${String(error?.message ?? error)}`;
+      warn(`deepseek-web: could not remove the corrupt session ${known.dshSessionId}: ${String(error)}`);
+      return;
+    }
+    delete store.state.imported[chatSessionId];
+    delete store.state.bindings[known.dshSessionId];
+    store.state.lastSyncError = 'corrupt session log; re-importing the conversation';
+    warn(`deepseek-web: session ${known.dshSessionId} had out-of-order turns; removed it so ${chatSessionId} is re-imported`);
+    try {
+      await store.flush();
+    } catch {
+      /* the store reports its own write failure */
+    }
+    // The row is gone; pull the conversation back instead of leaving a hole
+    // until the next scheduled pass.
+    const timer = setTimeout(() => {
+      void syncNow({ limit: 5, reason: 'repair' });
+    }, 500);
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+
+  /**
+   * Append the web-side turns that arrived after `binding.parentMessageId`.
+   *
+   * Only a CLOSED session can be appended: a live agent caches its turn
+   * boundary at mount, so inserting turns underneath it makes its next turn
+   * reuse a number already in the log. The caller invokes this from the
+   * periodic pass or immediately after `agent/disposed`.
+   *
+   * @param {string} chatSessionId
+   * @param {{ dshSessionId: string, updatedAt?: number, messageCount?: number }} known
+   * @param {{ summary?: { updatedAt: number } | null, forceCheck?: boolean }} [options]
+   *   `forceCheck` opens the log even when the anchor is already at the tail, so
+   *   a close-time pass can detect a corrupt turn sequence without new content.
+   * @returns {Promise<{
+   *   status: 'appended'|'none'|'busy'|'skipped'|'failed'|'missing'|'corrupt',
+   *   appended: number,
+   *   reason: string | null,
+   * }>}
+   */
+  async function appendOne(chatSessionId, known, options = {}) {
+    const { summary = null, forceCheck = false } = options;
+    // A caller that already has the list summary can skip the history fetch
+    // when nothing moved.
+    if (summary !== null && !(Number(summary.updatedAt) > Number(known.updatedAt ?? 0))) {
+      return { status: 'none', appended: 0, reason: 'unchanged' };
+    }
+    const binding = store.binding(known.dshSessionId);
+    if (binding === undefined || binding.chatSessionId !== chatSessionId) {
+      return { status: 'skipped', appended: 0, reason: 'no-binding' };
+    }
+
+    let history;
+    try {
+      history = await api.getHistory(chatSessionId);
+    } catch (error) {
+      store.state.lastSyncError = `append history: ${String(error?.message ?? error)}`;
+      return { status: 'failed', appended: 0, reason: 'history' };
+    }
+    if (history === null || !Array.isArray(history.messages)) {
+      if (summary !== null) known.updatedAt = summary.updatedAt;
+      else markSeen(known, history?.messages ?? []);
+      return { status: 'skipped', appended: 0, reason: 'no-history' };
+    }
+
+    const lastId = lastMessageId(history.messages);
+    if (!forceCheck && Number.isFinite(Number(binding.parentMessageId)) && Number(binding.parentMessageId) === lastId) {
+      if (summary !== null) known.updatedAt = summary.updatedAt;
+      else markSeen(known, history.messages);
+      known.messageCount = history.messages.length;
+      return { status: 'none', appended: 0, reason: null };
+    }
+
+    const result = await appendConversationTurns({
+      persistence: ctx.get('sessionPersistence'),
+      sessionId: known.dshSessionId,
+      messages: history.messages,
+      afterMessageId: binding.parentMessageId,
+      provider: PROVIDER,
+      model: MODELS[0].id,
+      warn,
+    });
+
+    if (!result.ok) {
+      if (result.reason === 'busy') {
+        return { status: 'busy', appended: 0, reason: result.reason };
+      }
+      if (result.reason === 'failed' || result.reason === 'open-failed') {
+        store.state.lastSyncError = `append failed: ${String(result.error?.message ?? result.error)}`;
+        return { status: 'failed', appended: 0, reason: result.reason };
+      }
+      if (result.reason === 'missing') return { status: 'missing', appended: 0, reason: 'missing' };
+      if (result.reason === 'corrupt-order') return { status: 'corrupt', appended: 0, reason: 'corrupt-order' };
+      if (summary !== null) known.updatedAt = summary.updatedAt;
+      store.state.lastSyncError = `append skipped: ${result.reason}`;
+      warn(`deepseek-web: append to ${chatSessionId} skipped (${result.reason})`);
+      return { status: 'skipped', appended: 0, reason: result.reason };
+    }
+
+    known.messageCount = history.messages.length;
+    if (summary !== null) known.updatedAt = summary.updatedAt;
+    else markSeen(known, history.messages);
+    if (result.appended > 0) {
+      if (Number.isFinite(Number(result.nextMessageId))) {
+        store.setBinding(known.dshSessionId, {
+          ...binding,
+          parentMessageId: Number(result.nextMessageId),
+          parentSyncedAt: Date.now(),
+        });
+      }
+      // The log is durable before the anchor moves; flush the anchor now to
+      // shrink the window where a crash would re-append the same turn.
+      try {
+        await store.flush();
+      } catch {
+        /* the store reports its own write failure */
+      }
+    }
+    return { status: result.appended > 0 ? 'appended' : 'none', appended: result.appended, reason: result.reason };
+  }
+
+  /**
+   * Append for one conversation as soon as its agent is torn down.
+   *
+   * An open session owns its write handle, and — more importantly — the agent
+   * loop caches its turn boundary when it mounts. Appending into that live log
+   * desynchronizes the loop's cached `lastTurn`, so its next turn reuses a
+   * number already in the log. Waiting for `agent/disposed` is the safe point:
+   * the loop is gone, the log is closed, and the next open rebuilds the turn
+   * boundary from the appended events.
+   */
+  async function appendAfterDispose(sessionId) {
+    if (!api.ready || pendingUndos > 0) return;
+    let known;
+    for (const entry of Object.values(store.state.imported)) {
+      if (String(entry?.dshSessionId) === sessionId) { known = entry; break; }
+    }
+    if (known === undefined) return;
+    const chatSessionId = known.chatSessionId;
+    const outcome = await enqueueAppend(() => appendOne(chatSessionId, known, { forceCheck: true }));
+    if (outcome.status === 'missing') await dropOrphan(chatSessionId, known);
+    else if (outcome.status === 'corrupt') await repairCorrupt(chatSessionId, known);
+  }
+
   function syncNow(options = {}) {
     if (pendingUndos > 0) {
       // An undo is tearing the import down; starting a pass now would recreate
@@ -395,6 +604,11 @@ export async function apply(ctx, config = {}) {
       imported: 0,
       skipped: 0,
       failed: 0,
+      // Incremental append: turns added to already-imported conversations.
+      appended: 0,
+      appendSkipped: 0,
+      appendFailed: 0,
+      appendBusy: 0,
       attached: 0,
       attachFailed: 0,
       errors: [],
@@ -474,6 +688,8 @@ export async function apply(ctx, config = {}) {
       report.sessionCwd = sessionCwd;
       await checkpoint();
       let importedNow = 0;
+      /** Conversations imported by THIS pass; their writer may still be closing. */
+      const importedChatIds = new Set();
       for (const summary of batch) {
         const known = store.state.imported[summary.id];
         if (known !== undefined) {
@@ -541,10 +757,47 @@ export async function apply(ctx, config = {}) {
             // Provenance: this one was pulled FROM the web, so undo may delete it.
             origin: 'imported',
           });
+          importedChatIds.add(summary.id);
           report.imported++;
         } catch (error) {
           report.failed++;
           warn(`deepseek-web: importing ${summary.id} failed: ${String(error)}`);
+        }
+      }
+
+      // ── incremental append ──────────────────────────────────────────────
+      // `batch` above only carries conversations with no binding yet, so an
+      // already-imported conversation can never show up in it. Web-side turns
+      // added after the import are picked up here instead: for every ledger row
+      // whose web summary moved past the version recorded last pass, append the
+      // unseen exchanges to the existing session. The session is persisted but
+      // not live, so this is a storage-level append, not a second import.
+      //
+      // `busy` means the session currently has a writer (the user opened it, or
+      // DSH is resuming it); that is normal and transient, so the row keeps its
+      // old version and the next pass retries. Other failures also keep the row
+      // pending, except the ones that no retry can fix (a missing anchor, a
+      // deleted session); those advance the version so the pass does not refetch
+      // the same history forever.
+      if (appendImports) {
+        const byChatId = new Map(sessions.map((summary) => [summary.id, summary]));
+        for (const [chatSessionId, known] of Object.entries(store.state.imported)) {
+          if (importedChatIds.has(chatSessionId)) continue;
+          const summary = byChatId.get(chatSessionId);
+          if (summary === undefined) continue;
+          if (!(Number(summary.updatedAt) > Number(known.updatedAt ?? 0))) continue;
+          const outcome = await enqueueAppend(() => appendOne(chatSessionId, known, { summary }));
+          if (outcome.status === 'appended') report.appended += outcome.appended;
+          else if (outcome.status === 'busy') report.appendBusy += 1;
+          else if (outcome.status === 'failed') report.appendFailed += 1;
+          else if (outcome.status === 'skipped') report.appendSkipped += 1;
+          else if (outcome.status === 'missing') {
+            await dropOrphan(chatSessionId, known);
+            report.appendSkipped += 1;
+          } else if (outcome.status === 'corrupt') {
+            await repairCorrupt(chatSessionId, known);
+            report.appendSkipped += 1;
+          }
         }
       }
 
@@ -569,7 +822,9 @@ export async function apply(ctx, config = {}) {
       }
 
       store.state.lastSyncAt = Date.now();
-      if (report.failed === 0) store.state.lastSyncError = null;
+      if (report.failed === 0 && report.appendFailed === 0 && report.appendSkipped === 0) {
+        store.state.lastSyncError = null;
+      }
       // A manual or automatic pass proves the user wants the import, so it lifts
       // any pause an undo left behind.
       store.state.syncPausedUntil = 0;
@@ -638,6 +893,40 @@ export async function apply(ctx, config = {}) {
     };
   });
 
+  // Append the web-side turns as soon as an imported conversation is closed.
+  //
+  // This is the only safe moment for a session that was open: the loop caches
+  // its turn boundary when it mounts, so appending underneath a live agent
+  // makes its next turn reuse a number already in the log. The event fires
+  // before session detachment, so wait a beat for the write handle to close;
+  // if it is still held, the periodic pass picks it up.
+  ctx.effect(() => {
+    let stopped = false;
+    const timers = new Set();
+    const off = ctx.on('agent/disposed', (payload) => {
+      if (stopped) return;
+      // The scoped emission carries `{ agent }`; accept a bare agent too so a
+      // vocabulary change cannot silently disable the close-time pass.
+      const agent = payload?.agent ?? payload;
+      const sessionId = agent?.id;
+      if (sessionId === undefined || sessionId === null) return;
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        if (stopped) return;
+        void appendAfterDispose(String(sessionId)).catch((error) => {
+          warn(`deepseek-web: append after dispose failed: ${String(error)}`);
+        });
+      }, 250);
+      if (typeof timer.unref === 'function') timer.unref();
+      timers.add(timer);
+    });
+    return () => {
+      stopped = true;
+      if (typeof off === 'function') off();
+      for (const timer of timers) clearTimeout(timer);
+    };
+  });
+
   // Background sync. It is deliberately slow and serial: the settings page can
   // always force a pass, and a list request on a metronome is the one pattern
   // that says "this is a script". The default mean is five minutes, and each
@@ -651,6 +940,14 @@ export async function apply(ctx, config = {}) {
   // hundreds of conversations the user has no interest in seeing in the sidebar.
   const syncWindow = config.syncWindow ?? 7;
   const intervalSeconds = Number(config.syncIntervalSeconds ?? 300);
+  /**
+   * Whether a pass appends web-side turns to conversations it already imported.
+   *
+   * On by default: a snapshot import goes stale the moment the user continues
+   * the conversation on the web product. `false` restores the old snapshot
+   * behaviour without losing the ledger.
+   */
+  const appendImports = config.appendImports !== false;
   /** Whether the timer is actually armed; reported so the page cannot claim otherwise. */
   const autoSyncEnabled = Number.isFinite(intervalSeconds) && intervalSeconds > 0 && config.autoSync !== false;
   if (autoSyncEnabled) {
@@ -813,6 +1110,7 @@ export async function apply(ctx, config = {}) {
                 imported: Object.keys(store.state.imported).length,
                 lastSyncAt: store.state.lastSyncAt,
                 autoSyncSeconds: autoSyncEnabled ? intervalSeconds : 0,
+                appendImports,
                 syncWindow,
                 windowStart: resolveSyncWindowStart(syncWindow),
                 capabilities: {

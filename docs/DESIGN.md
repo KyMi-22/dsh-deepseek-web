@@ -24,7 +24,7 @@ DSH 会话 ──► deepseek-web provider ──► chat.deepseek.com
 | `client.js` | 浏览器半边：设置页 + 快捷侧问面板（右栏 tab 与入口按钮） |
 | `src/api.js` | `/api/v0` 客户端：分页、历史、建会话、图片上传、SSE 解析、错误分类 |
 | `src/adapter.js` | provider 适配：message → prompt，图片引用收集，SSE → `StreamChunk` |
-| `src/sync.js` | 网页对话 → 种子会话；工作区；撤销 |
+| `src/sync.js` | 网页对话 → 种子会话；增量追加；工作区；撤销 |
 | `src/store.js` | 插件状态（token、绑定、账本、侧问线程），原子写入 |
 | `src/pow.js` | `DeepSeekHashV1` 求解器 |
 | `src/pow-async.js` | 求解放到 worker 线程，带进程内回退 |
@@ -76,6 +76,36 @@ turn/start → step/start → user/message → request/header → request/contex
 **来源不明就保留**。`origin` 之前写入的账本无法证明来源，按不可删除处理：删掉用户写的对话不可逆，留一个文件只是不整洁。
 
 **归档失败也不删**。归档失败说明可能还在活动，此时删文件会把文件从运行中的会话底下抽走，也毁掉重试归档唯一需要的副本。
+
+## 增量追加
+
+导入只发生一次，网页对话却会继续变长。已经导入的会话有一个稳定的 DSH 会话 id 和一个 `binding.parentMessageId` 锚点，所以「网页端又聊了几句」不需要重新导入——把锚点之后**完整的一问一答**追加到原会话日志即可。
+
+**为什么不用「重新导入一份」**：那会得到第二条同名会话，用户要自己删掉旧的；工作区位置、置顶、打开状态、DSH 侧的续聊记录都会丢。
+
+**写入口**：`sessionPersistence.open(id, 'write')` 返回的 `SessionHandle` 是唯一写门：`read` 全量事件、`append` 一段连续 seq、`flush` 落盘、`close` 释放。第一条事件的 `seq` 必须等于日志的 next-seq，跳号会被拒，所以从 `max(已有 seq) + 1` 开始。
+
+**打开着的会话不能追加，这是硬限制**：写句柄被 live 会话占着只是表层。更关键的是 live agent 在挂载时把 turn 边界缓存进自己的 `phase`（`sessionProjections.stateOf(session, 'turnBoundary').lastTurn`），之后只随自己的 `turn/start` 前进。外部往日志里追加 turn 6–11 后，它的下一次 `turn/start` 仍然是 6——实测 turn 6 落在 turn 11 之后，inbox 的 `agent/inbox/spliced` 与运行时上下文也插进了同一段日志。这不是显示问题，是把正在使用的会话写坏。缩短轮询间隔解决不了，只能等会话关闭。
+
+所以追加的时机是 **`agent/disposed`**：agent 已退出、写句柄已释放，下一次打开时 agent 从追加后的日志重新计算 turn 边界。事件在 session 解绑之前发出，所以延迟 250ms 再抢写锁；仍被占着就留给 5 分钟全局同步。打开期间的网页端新轮次，要等用户离开会话再回来才出现。
+
+**并发**：`agent/disposed` 触发的追加和周期同步可能同时看到同一轮，append 工作走同一个队列串行化；写锁本身仍可能被外部占用（返回 `busy`，下一轮再试）。
+
+**只追加完整问答**：网页端可能正在生成，或上一问生成失败。只有 user 后面紧跟一个有内容的 assistant 时才算一轮；否则停在这一问，等下一轮。跳过它会导致后面的问答失去前文，硬写半轮又会让日志里出现没有回答的问题——所以宁可这轮不追加。
+
+**锚点只在写成功后前移**：日志落盘后先把 `binding.parentMessageId` 更新到最后一个 answer 的 `message_id`，并 flush `state.json`。两者之间仍有一个极小的崩溃窗口（日志已写、锚点未写），重启后下一轮会把同一轮再追加一次。没有把网页 message id 写进事件里，是因为事件结构由 Host 校验，加字段会被日志读取器拒绝——这个窗口用「先落日志、再落锚点」的顺序压到最小，而不是用自定义字段消掉。
+
+**对不上就跳过**：历史里找不到锚点（网页端删过消息、历史被截断、旧账本缺锚点）时不猜，返回 `anchor-missing`；该行标记为已处理，避免每轮重复拉取。网页端删掉的消息不会反向删除 DSH 历史——追加只增不减。
+
+**会话文件不见了**：`open` 返回 `missing` 说明账本指向的会话被删了。这时删掉账本行与绑定，下一轮同步会把它当作未导入的对话重新导入；留着只会让这条对话永远跳过。
+
+**turn 乱序就当坏日志**：读日志时校验 `turn/start` 严格递增。编号回退或重复说明有外部写入绕过了 agent 的边界缓存（旧版本在 live 会话上追加过就会留下这种日志），继续追加只会写得更坏。这时先归档、再删文件、丢掉账本行，下一轮按网页历史重新导入；归档失败就保留文件——与撤销同一套顺序。
+
+**写后自检**：`append` 本身不校验事件形状，损坏要到下一次 `open` 才暴露。追加并 flush 后，同一个写句柄会再 `read` 一次——句柄读取会校验存储记录，形状错误当轮就变成 `appendFailed`。（这个自检没有回滚能力；它把「静默写坏」变成「当场报错」。事件形状本身由 `planAppend` 的测试钉住。）
+
+**投影**：追加不经过 agent 生命周期，标题、预览这类派生投影要等会话下次被读取时才可能刷新；日志本身是完整的，重新打开就能看到新增轮次。
+
+**turn 编号与断 turn**：`planAppend` 从现有日志的 `max(turn)+1` 开始编号。若尾部有一个没关的 turn（上一次追加死在 `turn/start` 之后），先补 `step/end` + `turn/end {interrupted}` 再开新 turn；与 resume 的 `interruptedTurnClosers` 同一套语义。
 
 ## 只发用户那句话
 
