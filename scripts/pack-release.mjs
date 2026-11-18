@@ -25,8 +25,14 @@ if (typeof manifest.name !== 'string' || typeof manifest.version !== 'string') {
 if (/[\s/\\]/u.test(manifest.name)) throw new Error(`unsafe package name: ${manifest.name}`);
 
 await mkdir(dist, { recursive: true });
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const output = execFileSync(npm, ['pack', '--pack-destination', dist], {
+const npmCli = process.env.npm_execpath;
+const command = npmCli === undefined
+  ? (process.platform === 'win32' ? 'npm.cmd' : 'npm')
+  : process.execPath;
+const args = npmCli === undefined
+  ? ['pack', '--pack-destination', dist]
+  : [npmCli, 'pack', '--pack-destination', dist];
+const output = execFileSync(command, args, {
   cwd: root,
   encoding: 'utf8',
   stdio: ['ignore', 'pipe', 'inherit'],

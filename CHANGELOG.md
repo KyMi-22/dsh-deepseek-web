@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.1 — 2026-11-18
+
+0.6.0 的正确性、兼容性与风控加固。
+
+- **导入只取完整轮次**：网页端仍在生成时，历史末尾的 USER、WIP/INCOMPLETE/TIMEOUT/CONTENT_FILTER 的 ASSISTANT 不再被种子化；`trimIncompleteTail` 会退到最后一个 FINISHED 的完整回答，锚点也取该回答。旧的“锚点是提问”的绑定把迟到的回答作为续接 turn 追加，不再丢答案。
+- **追加也只看完整回答**：`planAppend` 对普通轮次和 legacy answer-only 都要求 `status` 为 FINISHED（缺省兼容测试/旧 payload）；WIP 回答等到下一次同步再写，锚点不前进。
+- **对话文件上传恢复**：当前 DSH 0.2.x 会在 adapter 之前把 `FileBlock` 投影成含本地只读路径的句柄文本。插件改为从活会话的原始 `deriveMessages()` 恢复当前消息的附件引用，上传后把 prompt 替换成用户原文或 `请查看附件：…`；恢复失败时 fail closed，绝不把本地路径发给网页端。只上传最新消息的附件，历史附件不再每轮重复上传。
+- **纯图片消息**：`newestHumanMessage` 接受只带图片/文件、没有文字的最新人类消息；会生成附件名兜底 prompt，不再忽略或复用上一问。
+- **导入会话保护**：网页端出现未追加的新轮次时不再静默推进 parent。完整可追加的轮次提示“离开并重开”，未完成/终态/锚点丢失/读取失败分别给出可操作错误，避免把后续回答甩在锚点之前。
+- **风控与浏览器形态**：发送当前网页客户端版本、bundle id、浏览器 UA、真实时区、UUID device id；拉取并携带 `x-hif-leim` / `x-hif-dliq` 短时效 token；普通请求加轻微随机间隔并遵守 `x-fetch-after-sec` / `Retry-After`；captcha/WAF challenge 识别为 `CHALLENGE_REQUIRED`，不自动绕过。设置页“检测当前凭证”会顺带显示账号禁言状态。
+- **自更新安全**：release 查询加超时和大小上限；仓库/资产名/下载 host 白名单；下载 cap 100 MB；强制 `sha256` digest 和大小校验；curl 加 `--proto =https`、重定向上限、UA；`.part` 失败清理保留。
+- **发布链路**：新增 `npm run release:pack`（tgz + `.sha256`）和 tag 驱动的 GitHub Release workflow（版本/tag 一致、检查/测试、打包、上传资产）。
+- **状态恢复**：`state.json` 损坏时备份为 `state.json.corrupt-<时间戳>`；schemaVersion 1；非对象 map 归一化；旧 `dsh-web-*` device id 迁移为 UUID v4。
+- **其他**：撤销等待 append 队列；quick-ask 先记录线程再发 primer，失败不会留下未跟踪的网页对话；刷新背景失败保留旧线程；面板支持停止生成、失败/中止后恢复草稿与附件、关闭面板 abort；`inject` 不再强制侧栏服务；设置页显示追加统计；`attachSessions` 跳过已在工作区的会话；每轮只写一次 binding；401/403 标记凭证失效；REMOTE_FAILED/EMPTY_RESPONSE 不再当成功。
+- 测试新增 `api-security`、`store-state` 等；离线套件 18 个。
+
 ## 0.6.0 — 2026-10-31
 
 导入不再是一次性快照：网页端后来新增的轮次会追加进原来的 DSH 会话。

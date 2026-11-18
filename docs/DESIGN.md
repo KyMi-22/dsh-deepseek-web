@@ -91,11 +91,15 @@ turn/start → step/start → user/message → request/header → request/contex
 
 **并发**：`agent/disposed` 触发的追加和周期同步可能同时看到同一轮，append 工作走同一个队列串行化；写锁本身仍可能被外部占用（返回 `busy`，下一轮再试）。
 
-**只追加完整问答**：网页端可能正在生成，或上一问生成失败。只有 user 后面紧跟一个有内容的 assistant 时才算一轮；否则停在这一问，等下一轮。跳过它会导致后面的问答失去前文，硬写半轮又会让日志里出现没有回答的问题——所以宁可这轮不追加。
+**只追加完整问答**：网页端可能正在生成，或上一问生成失败。只有 user 后面紧跟一个 `status` 为 `FINISHED`（或缺省，兼容旧 payload/测试）且有 RESPONSE/THINK 的 assistant 时才算一轮；否则停在这一问，等下一轮。跳过它会导致后面的问答失去前文，硬写半轮又会让日志里出现没有回答的问题——所以宁可这轮不追加。`WIP` 回答在下一轮同步仍是同一个 message id，settle 后会作为完整轮次追加。
+
+**导入时也只取完整轮次**：`trimIncompleteTail` 从历史尾部向前丢弃 USER、WIP/INCOMPLETE/TIMEOUT/CONTENT_FILTER 的 ASSISTANT，直到最后一个 FINISHED 的完整回答；种子和 `binding.parentMessageId` 都取这个回答。旧版本把尾部提问也种子化、锚点落在提问上的绑定，会把迟到的回答作为 **assistant-only continuation turn** 追加（`turn/start → step/start → assistant/message → step/end → turn/end`），不重复提问。
+
+**导入会话打开时遇到网页端新轮次**：`refreshParent` 用 `planAppend` 判断——有可追加的完整轮次时返回 `IMPORT_PENDING`，提示离开/重开让 `agent/disposed` 追加；尾部未完成返回 `IMPORT_UNFINISHED`，终态失败返回 `IMPORT_TERMINAL`，锚点丢失/不存在返回 `IMPORT_ANCHOR_MISSING`/`IMPORT_NO_ANCHOR`，读取失败返回 `IMPORT_UNVERIFIED`。这些情况都不会推进 parent，避免把新回答甩在锚点之前。
 
 **锚点只在写成功后前移**：日志落盘后先把 `binding.parentMessageId` 更新到最后一个 answer 的 `message_id`，并 flush `state.json`。两者之间仍有一个极小的崩溃窗口（日志已写、锚点未写），重启后下一轮会把同一轮再追加一次。没有把网页 message id 写进事件里，是因为事件结构由 Host 校验，加字段会被日志读取器拒绝——这个窗口用「先落日志、再落锚点」的顺序压到最小，而不是用自定义字段消掉。
 
-**对不上就跳过**：历史里找不到锚点（网页端删过消息、历史被截断、旧账本缺锚点）时不猜，返回 `anchor-missing`；该行标记为已处理，避免每轮重复拉取。网页端删掉的消息不会反向删除 DSH 历史——追加只增不减。
+**对不上就跳过**：历史里找不到锚点（网页端删过消息、历史被截断、旧账本缺锚点）时不猜，返回 `anchor-missing`；该行标记为已处理，避免每轮重复拉取。网页端删掉的消息不会反向删除 DSH 历史——追加只增不减。**注意**：这会让该会话永久停在旧锚点；设置页的同步报告会显示 `appendSkipped`，需要撤销导入后重新同步来恢复。
 
 **会话文件不见了**：`open` 返回 `missing` 说明账本指向的会话被删了。这时删掉账本行与绑定，下一轮同步会把它当作未导入的对话重新导入；留着只会让这条对话永远跳过。
 
@@ -167,6 +171,15 @@ ctx.on('session/event', (session, event) => {
 
 文档走同一条链路，差别只有三处：字节来自 `readFileStream`（逐块拼接，20 MB 上限）、媒体类型由扩展名推断（`mediaTypeForName`）、上传头部的 `x-model-type` 用 `file`（图片用 `vision`）。`FileBlock` 的引用只有 `{attachmentId, name}`，没有媒体类型——这是附件存储「文件原样、类型无关」的设计，所以类型在适配器侧补。
 
+**DSH 0.2.x 的 file-handle 投影**：宿主在把请求交给 adapter 之前，会把每个 `FileBlock` 替换成一段文本句柄，其中包含本地只读路径、文件名、大小和 sha256。adapter 因此看不到 `FileBlock`，直接转发 prompt 会把本地路径发给网页端。现在的路径是：
+
+1. `hasProjectedFileHandle` 识别两种句柄形式（有可读路径 / “cannot access a readable path”）；
+2. 从活会话的 `sessions.get(id).deriveMessages()` 取回**投影前**的原始消息；
+3. `projectUserMessage` 只保留用户文字和 FileBlock 引用，丢掉句柄文本；
+4. 只上传**最新一条**人类消息的附件；恢复失败时返回 `FILE_RECOVERY`，不发送任何内容。
+
+这依赖宿主 `deriveMessages()` 仍返回原始 block（0.2.2-rc.3 已验证）；若未来宿主改变契约，插件会 fail closed，而不会静默泄露路径。快捷侧问面板的附件走浏览器原始字节上传，不经过这条路径。
+
 **解析结果 `FAILED` 自动重试一次**：解析跑在网页端的异步队列里，偶发的 `FAILED` 不代表文件本身有问题（实测 PNG/WebP/GIF 与 18.9 MiB 大图都能通过）。`uploadFile` 捕获 `PARSE_FAILED` 后重新解 PoW、重新上传、再等一次解析；第二次仍失败才抛错，并带上文件名、媒体类型、字节数与原始状态/审核结果。错误码从 `BIZ` 独立为 `PARSE_FAILED`，重试只针对这一类，业务拒绝（`BIZ`）不重试。
 
 两个容易踩的坑：
@@ -176,6 +189,19 @@ ctx.on('session/event', (session, event) => {
 - **解析未完成就发送会被拒**（HTTP 422），所以等到 `SUCCESS` 才继续；等待上限 60 秒，轮询间隔 1.2 秒。全部失败都发生在 completion 之前，整轮可以安全重试。
 
 网页端对图片自行计量（上传响应带 `token_usage`），DSH 侧把保留出现的图片计为「模型可见、成本未知」（`imageRequestPricing` 返回 `visualTokens: 0`），不从像素估算。
+
+## 网页端风控兼容
+
+网页产品在 2.8.0 客户端里增加了几个非常规信号：
+
+- `x-client-version` / `x-client-bundle-id`：旧版本号（`20241120`、`com.deepseek.chat-web-prod`）会被当作异常客户端；现在跟当前 web 客户端一致。
+- `x-device-id` 要求 UUID v4，`x-device-model` 随请求发送；旧的 `dsh-web-*` id 会在 `state.json` 载入时迁移。
+- `x-hif-leim` / `x-hif-dliq`：从两个短时效查询端点获取，`x-hif-ttl` 控制刷新。插件在每次普通请求前懒刷新，失败静默降级并退避 60 秒；一个端点 DNS 不可用不影响另一个。
+- 请求节流：普通请求之间加约 320ms + 随机抖动；`x-fetch-after-sec` / `Retry-After` 会推迟下一次请求，超过 10 秒的暂停转成 `RATE_LIMITED`，不静默挂住调用方。
+- WAF/captcha：`x-amzn-waf-action: captcha|challenge` 或 `cf-mitigated: challenge` 映射为 `CHALLENGE_REQUIRED`，不自动绕过，提示用户在浏览器完成验证。
+- 账号状态：设置页的「检测当前凭证」会额外读一次 `/api/v0/chat/status`，把禁言/受限状态显示出来。
+
+这些措施只降低误判概率，不改变“非官方接口自动化”的本质。接口、PoW、风控规则都可能变化；账号可能被限流/验证/限制。插件不承诺账号安全，用户应遵守服务条款，避免批量/高频调用。
 
 ## token
 
@@ -229,6 +255,8 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 
 网页版对话本来也不会发起工具调用（接口没有通道），所以拒绝未知工具没有代价。
 
+**边界要说清楚**：白名单严格保证“不会直接调用 `write`/`edit`/`pwsh`/`plugin_manager` 这类写工具”，但仍允许 `read`、`web_fetch`、`send_message`、`ask_user_question`、`job_kill` 等只读/交互工具。`read` + `web_fetch` 理论上可以把本地文件内容拼进 URL 外发；`send_message` 可以委托另一个有写权限的 agent。真正的安全边界是“网页接口没有工具调用通道”，白名单只是第二道防线；不要把它宣传成“绝对只读”。
+
 ## 快捷侧问
 
 「用内置模型聊到一半，切网页模型问个小问题」的老办法有两个代价：网页端得到一个只有一句的孤立对话，DSH 原对话的上下文又被这轮往返撑长。快捷侧问把这两个问题一起解掉：问答发生在一个**独立的右栏面板**里，背景是原对话的**压缩摘要**，原对话的日志一个字节都不动。
@@ -251,8 +279,9 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 设置页的「更新」一节只做三件事：查版本、下载包、把包交给插件管理器。**安装不是本插件做的**——`ctx.get('pluginManager').installBundle(tgz)` 拥有 profile、pnpm 与重组，插件只负责把文件准备好。
 
 - **版本比较**：`src/update.js` 的 `parseVersion` / `compareVersions` 按数字三元组比较（`0.10.0 > 0.9.0`），tag 的 `v` 前缀与 `-rc` 后缀不参与比较。
-- **查询**：`GET https://api.github.com/repos/<repo>/releases/latest`。网络策略上有取舍——`api.github.com` 在多数网络可直连，但 release 资源由 `github.com` / `objects.githubusercontent.com` 提供，部分网络会重置连接。
-- **下载**：配置了 `updateProxy` 时走 `curl -x`（Node 的 fetch 只在进程启动时读一次代理环境变量，运行期改不了），否则用 fetch 流式写入。文件先写 `.part`，校验 GitHub 提供的 `sha256` 摘要与字节数一致后才改名；任何一步失败都删掉半成品，不会留下一个「看起来能装」的文件。
+- **查询**：`GET https://api.github.com/repos/<repo>/releases/latest`。repo 必须是 `owner/name`，查询有 60 秒 deadline 和 2 MB 上限；`api.github.com` 在多数网络可直连，但 release 资源由 `github.com` / `objects.githubusercontent.com` 提供，部分网络会重置连接。
+- **下载**：配置了 `updateProxy` 时走 `curl -x`（Node 的 fetch 只在进程启动时读一次代理环境变量，运行期改不了），否则用 fetch 流式写入。资产名必须是安全的 `.tgz` basename；初始 URL 和重定向后的 URL 都必须在 GitHub host 白名单内；下载上限 100 MB；文件先写 `.part`，**必须**有 GitHub 提供的 `sha256` 摘要（缺失直接拒绝），摘要和声明字节数一致后才改名；任何一步失败都删掉半成品，不会留下一个「看起来能装」的文件。curl 侧额外加 `--proto =https`、`--max-redirs`、`--max-filesize`。
+- **发布链路**：维护者用 `npm run release:pack` 生成 tgz + `.sha256`；`.github/workflows/release.yml` 在 `v<version>` tag 上校验 package 版本、跑检查/测试、重新打包并上传两个 Release 资产。
 - **安装**：下载完成后先回应页面，再 `setTimeout` 触发 `installBundle(path, { enabled: true })`。安装会替换本插件文件并触发重组，本 fiber 随即销毁——所以页面拿到的是「已下载、正在安装」，随后定时刷新（20 秒；没有插件管理器时 60 秒并提示手动安装）。装失败时插件管理器恢复 profile 清单，旧版本继续运行。
 - **开发版装回发布版**：当前版本高于最新 Release 时（`compareVersions` 返回 -1），`updatePayload` 给出 `rollbackTo`，页面显示「装回发布版」并复用同一条下载+安装链路。这既是开发版的自救入口，也是验证安装链路的途径。
 - **没有插件管理器时**：只下载，页面给出路径，让用户在「设置 → 插件」里手动装。`capabilities` 与 `/update/status` 的 `canInstall` 都反映这一点。
