@@ -146,6 +146,28 @@ import { compareVersions, downloadRelease, latestRelease, parseVersion } from '.
       /too large/u,
       'an oversized declared body is refused',
     );
+    await assert.rejects(
+      () => downloadRelease({ ...asset }, {
+        dir,
+        fetchImpl: async () => new Response(null, {
+          status: 302,
+          headers: { location: 'https://evil.example/x.tgz' },
+        }),
+      }),
+      /disallowed host/u,
+      'a redirect to an arbitrary host is refused before its body is read',
+    );
+    await assert.rejects(
+      () => downloadRelease({ ...asset }, {
+        dir,
+        fetchImpl: async () => new Response(null, {
+          status: 302,
+          headers: { location: 'https://github.com/KyMi-22/dsh-deepseek-web/releases/download/v0.6.1/dsh-deepseek-web-0.6.1.tgz' },
+        }),
+      }),
+      /download answered HTTP 302|redirect/u,
+      'a redirect loop is refused',
+    );
     const leftovers = await stat(join(dir, `${asset.name}.part`)).catch(() => null);
     assert.equal(leftovers, null, 'no .part file is left behind');
   } finally {
