@@ -295,10 +295,29 @@ assert.equal(
   assert.equal(api.calls.completions.length, 1, 'the image-only turn reaches the web');
   assert.equal(api.calls.completions[0].prompt, '请查看附件：图片', 'the fallback names the attachment, not the previous question');
   assert.deepEqual(api.calls.completions[0].refFileIds, ['file-1'], 'the image id rides on the completion');
-  assert.equal(api.calls.uploads.length, 1);
+  assert.equal(api.calls.uploads?.length, 1);
 }
 
-// ── only the newest message's images are uploaded ─────────────────────────
+// ── an image-only turn after a text exchange does not repeat the old question
+{
+  const { adapter, api } = makeAdapter([ANSWER('图片收到')], {
+    readImage: async (ref) => ({ ref, data: new Uint8Array([1]) }),
+  });
+  const messages = [
+    userMessage('m1', '上一问'),
+    { id: 'm2', role: 'assistant', content: [{ type: 'text', text: '上一答' }], source: { kind: 'model', provider: 'x', model: 'y' } },
+    {
+      id: 'm3', role: 'user', source: { kind: 'user' },
+      content: [{ type: 'image', attachment: { attachmentId: 'att-after-text', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } }],
+    },
+  ];
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat', messages, sessionId: 'sess-image-after-text',
+  })) { /* drain */ }
+  assert.equal(api.calls.completions[0].prompt, '请查看附件：图片', 'the old question is not reused');
+}
+
+
 {
   const { adapter, api } = makeAdapter([ANSWER('好')], {
     readImage: async (ref) => ({ ref, data: new Uint8Array([1]) }),

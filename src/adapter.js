@@ -222,10 +222,14 @@ function documentFileName(name, mediaType) {
  */
 function attachmentPrompt(refs) {
   const names = refs.map((ref) => {
-    if (typeof ref?.name === 'string' && ref.name !== '') return ref.name;
-    return typeof ref?.mediaType === 'string' && ref.mediaType.startsWith('image/') ? '图片' : '附件';
+    const raw = typeof ref?.name === 'string' && ref.name !== ''
+      ? ref.name
+      : (typeof ref?.mediaType === 'string' && ref.mediaType.startsWith('image/') ? '图片' : '附件');
+    const safe = raw.replace(/[\\/]/gu, '_').replace(/[\u0000-\u001f\u007f]/gu, '').trim();
+    return safe.length > 120 ? `${safe.slice(0, 120)}…` : safe;
   });
-  return `请查看附件：${names.join('、')}`;
+  const text = `请查看附件：${names.join('、')}`;
+  return text.length > 400 ? `${text.slice(0, 400)}…` : text;
 }
 
 /**
@@ -896,7 +900,16 @@ export class DeepSeekWebAdapter {
       prompt = attachmentPrompt([...refs, ...documents]);
     }
     if (prompt.trim() === '') {
-      yield { type: 'finish', reason: { kind: 'stop' } };
+      // A malformed attachment block (no usable id/name) must not be marked as
+      // sent and then silently stop: release the dedup memo and report it.
+      this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: { message: 'deepseek-web: the newest message has no usable text or attachment', code: 'EMPTY_PROMPT' },
+        },
+      };
       return;
     }
 
