@@ -663,9 +663,23 @@ export class DeepSeekWebAdapter {
           const planned = planAppend(history.messages, {
             afterMessageId: binding.parentMessageId,
           });
-          const pendingImport = planned.ok && planned.turns > 0
-            ? 'appendable'
-            : planned.reason === 'anchor-missing' ? 'anchor-missing' : 'unfinished';
+          let pendingImport;
+          if (!planned.ok) {
+            pendingImport = planned.reason === 'anchor-missing'
+              ? 'anchor-missing'
+              : planned.reason === 'no-anchor' ? 'no-anchor' : 'terminal';
+          } else if (planned.turns > 0) {
+            pendingImport = 'appendable';
+          } else {
+            // No settled turn can be appended. A trailing question or WIP
+            // reply may still settle; a terminal failure never will.
+            const last = history.messages[history.messages.length - 1];
+            const status = typeof last?.status === 'string' ? last.status.toUpperCase() : '';
+            const inProgress = String(last?.role ?? '').toUpperCase() === 'USER'
+              || status === 'WIP'
+              || status === '';
+            pendingImport = inProgress ? 'unfinished' : 'terminal';
+          }
           return { ...binding, pendingImport, parentSyncedAt: syncedAt };
         }
         // A local web conversation has no import ledger; continue from the tail.
@@ -794,6 +808,14 @@ export class DeepSeekWebAdapter {
           'anchor-missing': {
             code: 'IMPORT_ANCHOR_MISSING',
             message: 'deepseek-web: 网页端历史已变化，找不到上次同步的位置；请在设置页撤销导入后重新同步',
+          },
+          terminal: {
+            code: 'IMPORT_TERMINAL',
+            message: 'deepseek-web: 网页端最后一条回复以失败/超时状态结束，追加无法修复；请在设置页撤销导入后重新同步',
+          },
+          'no-anchor': {
+            code: 'IMPORT_NO_ANCHOR',
+            message: 'deepseek-web: 本会话没有可用的网页端锚点；请在设置页撤销导入后重新同步',
           },
         }[binding.pendingImport] ?? {
           code: 'IMPORT_PENDING',
