@@ -376,7 +376,7 @@ $DSH_HOME/
 
 **Q：网页端继续聊了，DSH 里没出现？**
 
-打开着的会话不能就地追加（会和 agent 缓存的 turn 编号冲突）：先离开这个会话让它关闭，插件会在关闭时立即追加，重新打开就能看到；或者等下一轮全局同步（默认 5 分钟）。看设置页的同步报告：`appendBusy` 表示写句柄还被占着、会在关闭后再试；`appendFailed` / `appendSkipped` 会带具体原因。也确认配置里没有把 `appendImports` 设成 `false`。
+打开着的会话不能就地追加（会和 agent 缓存的 turn 编号冲突）：先离开这个会话让它关闭，插件会在关闭时立即追加，重新打开就能看到；或者等下一轮全局同步（默认 5 分钟）。看设置页的同步报告：`appendBusy` 表示写句柄还被占着、会在关闭后再试；`appendSkipped` 会带具体原因。**如果网页端的失败/超时回答夹在中间，追加会一直 blocked（报告里有 `appendSkipped` 和 `lastSyncError`），这时需要撤销导入后重新同步**；也确认配置里没有把 `appendImports` 设成 `false`。
 
 **Q：提示 token 无效？**
 

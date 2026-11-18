@@ -5,7 +5,7 @@
 0.6.0 的正确性、兼容性与风控加固。
 
 - **导入只取完整轮次**：网页端仍在生成时，历史末尾的 USER、WIP/INCOMPLETE/TIMEOUT/CONTENT_FILTER 的 ASSISTANT 不再被种子化；`trimIncompleteTail` 会退到最后一个 FINISHED 的完整回答，锚点也取该回答。旧的“锚点是提问”的绑定把迟到的回答作为续接 turn 追加，不再丢答案。
-- **追加也只看完整回答**：`planAppend` 对普通轮次和 legacy answer-only 都要求 `status` 为 FINISHED（缺省兼容测试/旧 payload）；WIP 回答等到下一次同步再写，锚点不前进。
+- **追加也只看完整回答**：`planAppend` 对普通轮次和 legacy answer-only 都要求 `status` 为 FINISHED（缺省兼容测试/旧 payload）；WIP 回答等到下一次同步再写，锚点不前进。如果失败/超时回答夹在中间，计划会返回 `blocked`/`blockedAt`，追加不会推进 `updatedAt`，同步报告记 `appendSkipped` 和 `lastSyncError`，不再静默冻结。
 - **对话文件上传恢复**：当前 DSH 0.2.x 会在 adapter 之前把 `FileBlock` 投影成含本地只读路径的句柄文本。插件改为从活会话的原始 `deriveMessages()` 恢复当前消息的附件引用，上传后把 prompt 替换成用户原文或 `请查看附件：…`；恢复失败时 fail closed，绝不把本地路径发给网页端。只上传最新消息的附件，历史附件不再每轮重复上传。
 - **纯图片消息**：`newestHumanMessage` 接受只带图片/文件、没有文字的最新人类消息；会生成附件名兜底 prompt，不再忽略或复用上一问。
 - **导入会话保护**：网页端出现未追加的新轮次时不再静默推进 parent。完整可追加的轮次提示“离开并重开”，未完成/终态/锚点丢失/读取失败分别给出可操作错误，避免把后续回答甩在锚点之前。
