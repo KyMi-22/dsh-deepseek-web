@@ -461,6 +461,14 @@ export class DeepSeekWebApi {
         { status: 429, submitted: false },
       );
     }
+    const replyType = String(response.headers?.get?.('content-type') ?? '');
+    if (replyType.toLowerCase().includes('text/html')) {
+      throw new DeepSeekWebError(
+        `deepseek-web: ${path} returned an HTML page instead of JSON, likely a risk-control/challenge page`,
+        'CHALLENGE_REQUIRED',
+        { status: response.status, submitted: false },
+      );
+    }
     const text = await response.text();
     let json;
     try {
