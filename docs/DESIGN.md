@@ -263,7 +263,7 @@ $env:DEEPSEEK_WEB_TOKEN = '<token>'
 
 - **入口**：会话头部 `conversation.session.header.utilities` 席位里的常驻按钮（三点按钮旁边）。菜单项本身（`session-log-export` 的「更多操作」）没有扩展席位，塞不进去。
 - **面板**：`ctx.sidebarRightTabs.register` + `sidebar.right.pane.tab` 正文注册，走文档预览同款的公开两级路径；`ctx.sidebarRight.openTab(kind, { preferNewPane: true })` 打开并展开右栏。右栏布局本就按会话隔离，侧问线程与面板天然同生命周期。
-- **线程**：每个 DSH 会话**一条**网页对话，首次提问时创建并把压缩背景作为第一条消息发过去（`parent_message_id` 续链）。线程记录落在 `state.json` 的 `quickAsk`，重开面板可续聊。「刷新背景」丢弃当前线程、用最新压缩重建——旧网页对话不删（已属网页产品），只是不再引用。
+- **线程**：每个 DSH 会话**一条**网页对话，首次提问时创建并把压缩背景作为第一条消息发过去（`parent_message_id` 续链）。**线程记录在 primer 之前写入 `state.json`**：primer 失败时行仍在，导入排除的 `boundChatIds` 能覆盖改名尚未落地的窗口；失败行标记 `primerFailed`、`contextSent=''`，不会留下未跟踪的网页对话。「刷新背景」丢弃当前线程、用最新压缩重建——旧网页对话不删（已属网页产品），只是不再引用；刷新失败时保留刚创建的行（避免孤儿），并在面板错误里说明。
 - **命名与导入排除**：线程创建后立即把网页对话重命名为 `SideBar：<对应 DSH 对话名>`（`session/title` 事件的最后一个值；无标题时回退 `SideBar：快捷侧问`）。网页端拒绝给空对话改名，所以「无背景的裸线程」会在第一条回答落定后补改。导入规则（`selectImportBatch`）拒绝带该前缀的对话——其中也接受旧版本的 `[SideBar]` / `[快捷侧问]` 拼写。第二道保险是 `quickAsk` 账本里的网页对话 id 并入 `boundChatIds`，覆盖改名尚未落地的窗口。
 - **压缩**：规则压缩，零成本、确定性。读 `sessionPersistence` 的只读句柄取会话日志，过滤出人类输入（`source.kind === 'user'`，剔除 harness 注入的运行时上下文）与助手回答（丢推理块和工具流量），从最新往回装进 12000 字符预算，每轮截 1600 字符，被裁掉的轮数以一行标注。
 - **视觉**：面板与入口按钮使用宿主主题变量（`--dsw-specific-bubble`、`--dsw-radius-lg`、`--dsw-alias-*`），随明暗主题自动切换；入口图标是宿主自带的 Sparkle 轮廓路径（与三点按钮同尺寸、同 hover 底色）。顶部说明是一张独立卡片，标题行即折叠开关；偏好存 `localStorage`。对话列（表头、消息、输入框）统一收在面板宽度 80% 的居中列里，两侧各留 10% 留白（`padding-inline: 10%`）。
