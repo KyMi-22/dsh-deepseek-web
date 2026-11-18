@@ -187,6 +187,15 @@ export const SEED_MAX_TOKENS = 8192;
 /** Context window recorded in the seeded request context. */
 export const SEED_CONTEXT_WINDOW = 1_000_000;
 
+/** Build the content blocks of one assistant message. */
+function assistantContent(reasoning, reply) {
+  /** @type {Array<object>} */
+  const content = [];
+  if (reasoning !== '') content.push({ type: 'reasoning', text: reasoning });
+  if (reply !== '') content.push({ type: 'text', text: reply });
+  return content;
+}
+
 /** Concatenate one fragment type across a message. */
 function fragmentText(message, type) {
   const fragments = Array.isArray(message.fragments) ? message.fragments : [];
@@ -207,6 +216,30 @@ function userTextOf(message) {
     else if (fragment?.type === 'FILE' && typeof fragment.content === 'string') parts.push(`[文件] ${fragment.content}`);
   }
   return parts.join('\n').trim();
+}
+
+/**
+ * Drop a trailing question that never got an answer.
+ *
+ * A web conversation can be imported while the product is still generating:
+ * the history then ends in one or more USER messages with no ASSISTANT reply.
+ * Seeding those questions is unsafe, because the later answer cannot be
+ * appended into the already-closed turn, and the anchor would point at the
+ * question itself. Trimming them makes the import a snapshot of the last
+ * complete exchange; the next sync appends the question and its answer as one
+ * complete turn.
+ *
+ * @param {ReadonlyArray<object>} messages
+ * @returns {Array<object>}
+ */
+export function trimIncompleteTail(messages) {
+  const kept = Array.isArray(messages) ? messages.slice() : [];
+  while (kept.length > 0) {
+    const last = kept[kept.length - 1];
+    if (String(last?.role ?? '').toUpperCase() !== 'USER') break;
+    kept.pop();
+  }
+  return kept;
 }
 
 /** Convert seconds-since-epoch to milliseconds. */
@@ -417,6 +450,12 @@ function logTailState(events) {
  * stop the plan for the same reason — the earlier question has no answer in the
  * log, so skipping it would silently drop content.
  *
+ * A legacy import can still have its anchor on a USER message: versions before
+ * 0.6.1 seeded that trailing question. When the answer arrives, the only safe
+ * representation is a continuation turn containing the assistant message alone;
+ * the question is already in the imported turn. New imports avoid this case by
+ * trimming the incomplete tail before seeding.
+ *
  * `afterMessageId` must be present in `messages`; an absent anchor means the
  * history is truncated or renumbered, and appending from a guess could duplicate
  * turns that are already in the session. The caller should fall back to a full
@@ -468,9 +507,48 @@ export function planAppend(messages, options = {}) {
     events.push(event);
   };
 
+  /** Whether the anchor is a question seeded by an older plugin version. */
+  const anchorIsQuestion = String(messages[anchorIndex]?.role ?? '').toUpperCase() === 'USER';
+
+  /** Append one assistant message as a turn of its own (legacy answer-only case). */
+  const pushAnswerOnlyTurn = (message, reasoning, reply) => {
+    const answeredAt = toMillis(message.inserted_at);
+    const content = assistantContent(reasoning, reply);
+    push('turn/start', answeredAt, { turn });
+    push('step/start', answeredAt, { turn, step: 1 });
+    push('assistant/message', answeredAt, {
+      turn,
+      step: 1,
+      message: {
+        id: randomUUID(),
+        role: 'assistant',
+        content,
+        source: { kind: 'model', provider, model },
+      },
+      stream: [],
+    }, 'append');
+    push('step/end', answeredAt, { turn, step: 1 });
+    push('turn/end', answeredAt, { turn, reason: { kind: 'completed' } });
+    nextMessageId = Number(message.message_id);
+    turn += 1;
+  };
+
   for (let index = anchorIndex + 1; index < messages.length; index += 1) {
     const message = messages[index];
     if (message === null || typeof message !== 'object') continue;
+
+    // Legacy: the anchor is a USER message that already sits in the imported
+    // log without an answer. The answer cannot be inserted into that closed
+    // turn, so record it as a continuation turn instead of dropping it.
+    if (index === anchorIndex + 1 && anchorIsQuestion
+      && String(message.role ?? '').toUpperCase() === 'ASSISTANT') {
+      const reasoning = fragmentText(message, THINK);
+      const reply = fragmentText(message, RESPONSE);
+      if (reasoning === '' && reply === '') break;
+      pushAnswerOnlyTurn(message, reasoning, reply);
+      continue;
+    }
+
     if (String(message.role ?? '').toUpperCase() !== 'USER') continue;
     const text = userTextOf(message);
     if (text === '') continue;
@@ -497,9 +575,7 @@ export function planAppend(messages, options = {}) {
     }, 'append');
 
     /** @type {Array<object>} */
-    const content = [];
-    if (reasoning !== '') content.push({ type: 'reasoning', text: reasoning });
-    if (reply !== '') content.push({ type: 'text', text: reply });
+    const content = assistantContent(reasoning, reply);
     push('assistant/message', answeredAt, {
       turn,
       step: 1,

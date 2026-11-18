@@ -13,7 +13,7 @@
 //   node test/append.test.mjs
 
 import assert from 'node:assert';
-import { appendConversationTurns, planAppend } from '../src/sync.js';
+import { appendConversationTurns, planAppend, trimIncompleteTail } from '../src/sync.js';
 
 const META = { provider: 'deepseek-web', model: 'deepseek-web-chat' };
 
@@ -346,6 +346,55 @@ function exchange(id, text, reply, reasoning = '') {
   assert.equal(readBackBroke.reason, 'failed');
   assert.equal(readBackPersistence.calls.reads, 2, 'the failure came from the validation read, not the priming read');
   assert.equal(readBackPersistence.calls.closed, 1);
+}
+
+// ── legacy anchor on a question: the late answer is not lost ──────────────
+{
+  // 0.6.0 could seed a trailing question and anchor the binding on it. The
+  // answer arrives later; it cannot join the closed imported turn, so it is
+  // appended as a continuation turn and the anchor advances past it.
+  const messages = [
+    ...exchange(1, 'q1', 'a1'),
+    messagesUser(3, 'q2'),
+    {
+      message_id: 4,
+      parent_id: 3,
+      role: 'ASSISTANT',
+      inserted_at: 1792592804,
+      fragments: [{ id: 40, type: 'RESPONSE', content: 'a2' }],
+    },
+    ...exchange(5, 'q3', 'a3'),
+  ];
+  const plan = planAppend(messages, { afterMessageId: 3, startTurn: 2, ...META });
+  assert.equal(plan.ok, true);
+  assert.equal(plan.turns, 2, 'the answer-only turn plus the later complete exchange');
+  assert.equal(plan.nextMessageId, 6, 'the anchor moves past both answers');
+  assert.deepEqual(
+    plan.events.filter((event) => event.type === 'assistant/message').map((event) => event.data.message.content.at(-1).text),
+    ['a2', 'a3'],
+    'the late answer is preserved before the later exchange',
+  );
+  assert.deepEqual(
+    plan.events.slice(0, 5).map((event) => event.type),
+    ['turn/start', 'step/start', 'assistant/message', 'step/end', 'turn/end'],
+    'the legacy answer is a continuation turn with no duplicate question',
+  );
+}
+
+// ── trimIncompleteTail: never seed a question that has no answer ───────────
+{
+  const messages = [
+    ...exchange(1, 'q1', 'a1'),
+    messagesUser(3, 'q2'),
+    messagesUser(4, 'q3'),
+  ];
+  assert.deepEqual(trimIncompleteTail(messages).map((message) => message.message_id), [1, 2]);
+  assert.deepEqual(trimIncompleteTail([messagesUser(9, 'only')]), []);
+  assert.deepEqual(trimIncompleteTail(null), []);
+
+  // A complete tail is left alone.
+  const complete = [...exchange(1, 'q', 'a')];
+  assert.equal(trimIncompleteTail(complete).length, 2);
 }
 
 console.log('append.test.mjs: all assertions passed');

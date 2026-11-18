@@ -33,7 +33,7 @@ import {
   StateStore,
   stateFile,
 } from './src/store.js';
-import { appendConversationTurns, attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, undoImports, WORKSPACE_TITLE } from './src/sync.js';
+import { appendConversationTurns, attachSessions, buildSeedEvents, createSeededSession, ensureWorkspace, lastMessageId, mintSessionId, nextSyncDelayMs, planTitlePush, resolveSyncWindowStart, selectImportBatch, trimIncompleteTail, undoImports, WORKSPACE_TITLE } from './src/sync.js';
 import { readJsonBody, readRawBody, sendJson } from './src/http.js';
 import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -711,7 +711,11 @@ export async function apply(ctx, config = {}) {
             report.failed++;
             continue;
           }
-          const seed = buildSeedEvents(history.messages, {
+          // Import only complete turns. A trailing question with no answer is
+          // picked up by the first append after the answer lands; seeding it
+          // here would close a turn the answer could never join.
+          const importable = trimIncompleteTail(history.messages);
+          const seed = buildSeedEvents(importable, {
             title: summary.title,
             provider: PROVIDER,
             model: MODELS[0].id,
@@ -748,11 +752,11 @@ export async function apply(ctx, config = {}) {
             chatSessionId: summary.id,
             dshSessionId,
             updatedAt: summary.updatedAt,
-            messageCount: history.messages.length,
+            messageCount: importable.length,
           });
           store.setBinding(dshSessionId, {
             chatSessionId: summary.id,
-            parentMessageId: lastMessageId(history.messages),
+            parentMessageId: lastMessageId(importable),
             seeded: true,
             // Provenance: this one was pulled FROM the web, so undo may delete it.
             origin: 'imported',
