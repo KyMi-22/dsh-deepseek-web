@@ -875,7 +875,17 @@ export async function attachSessions(workspace, sessionIds, warn) {
     }
     return result;
   }
+  let existing = new Set();
+  try {
+    if (Array.isArray(workspace.sessionIds)) existing = new Set(workspace.sessionIds.map(String));
+  } catch {
+    /* a workspace without the projection falls back to attach calls */
+  }
   for (const sessionId of sessionIds) {
+    if (existing.has(String(sessionId))) {
+      result.attached += 1;
+      continue;
+    }
     try {
       await workspace.attachSession(sessionId);
       result.attached += 1;

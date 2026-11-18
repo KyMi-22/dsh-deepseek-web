@@ -452,7 +452,30 @@ assert.equal(
   assert.ok(!api.calls.completions[0].prompt.includes('verbatim read-only'), 'the handle text is not forwarded');
 }
 
-// ── a file-only projected turn gets a filename fallback prompt ─────────────
+// ── the no-readable-path handle form is detected too ─────────────────────
+{
+  const handle = '[File "报告.pdf" (123 bytes, sha256:abcdef12) was uploaded, but the current execution environment cannot access a readable path.]';
+  const raw = {
+    id: 'm1',
+    role: 'user',
+    content: [{ type: 'file', attachment: { attachmentId: 'att-no-path', name: '报告.pdf', bytes: 4 } }],
+    source: { kind: 'user' },
+  };
+  const { adapter, api } = makeAdapter([ANSWER('收到')], {
+    recoverUserMessage: () => raw,
+    readFileBytes: async () => new Uint8Array([1]),
+  });
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: handle }], source: { kind: 'user' } }],
+    sessionId: 'sess-projected-no-path',
+  })) { /* drain */ }
+  assert.equal(api.calls.completions[0].prompt, '请查看附件：报告.pdf');
+  assert.deepEqual(api.calls.completions[0].refFileIds, ['doc-1']);
+  assert.ok(!api.calls.completions[0].prompt.includes('cannot access a readable path'));
+}
+
+
 {
   const handle = String.raw`[File "报告.pdf" (123 bytes, sha256:abcdef12): verbatim read-only copy saved at "C:\Users\me\.dsh\attachments\报告.pdf". Read that path with your file tools when its contents are needed.]`;
   const raw = {
@@ -1140,6 +1163,29 @@ assert.equal(
       assert.equal(walkerRejects(chunk), false, `failure chunk ${JSON.stringify(chunk).slice(0, 120)} is lossless JSON`);
     }
   }
+}
+
+// ── a remote failure status or empty reply is not a successful stop ──────
+{
+  const failed = makeAdapter([{ kind: 'status', status: 'FAILED' }]);
+  const failedChunks = [];
+  for await (const chunk of failed.adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: [userMessage('m1', '问题')], sessionId: 'sess-remote-fail',
+  })) failedChunks.push(chunk);
+  const failedFinish = failedChunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(failedFinish?.reason?.kind, 'error');
+  assert.equal(failedFinish?.reason?.failure?.code, 'REMOTE_FAILED');
+
+  const empty = makeAdapter([]);
+  const emptyChunks = [];
+  for await (const chunk of empty.adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: [userMessage('m1', '问题')], sessionId: 'sess-empty',
+  })) emptyChunks.push(chunk);
+  const emptyFinish = emptyChunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(emptyFinish?.reason?.kind, 'error');
+  assert.equal(emptyFinish?.reason?.failure?.code, 'EMPTY_RESPONSE');
 }
 
 console.log('adapter.test.mjs: all assertions passed');

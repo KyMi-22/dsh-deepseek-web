@@ -175,7 +175,7 @@ fn(sandbox.window, sandbox.document, sandbox.console, sandbox.fetch, URL, Date, 
 const exportsObj = sandbox.__exports;
 assert.ok(exportsObj, 'factory ran and produced exports');
 assert.equal(typeof exportsObj.apply, 'function', 'apply exported');
-assert.deepEqual(exportsObj.inject, ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight'], 'inject list');
+assert.deepEqual(exportsObj.inject, ['slots', 'locale'], 'only the settings/sidebar-independent services are required');
 
 // ── apply registers one settings page ──────────────────────────────────────
 exportsObj.apply(fakeCtx);

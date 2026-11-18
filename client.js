@@ -81,6 +81,7 @@ window.__ModuleLoader__.load({
         'connection.verifying': '检测中…',
         'connection.state': '状态',
         'connection.configured': '已配置',
+        'connection.invalid': '凭证已失效',
         'connection.missing': '未配置',
         'connection.stateFile': '数据文件',
         'connection.howTo': '如何获取 user token',
@@ -149,11 +150,13 @@ window.__ModuleLoader__.load({
         'error.persist': '状态写入失败：{message}',
         'error.undo': '撤销失败：{message}',
         'error.verify': '验证请求失败：{message}',
+        'error.muted': '账号目前处于受限/禁言状态（截止 {until}）',
         'error.verifyBad': '凭证无效：{message}',
         'ok.saved': 'token 已保存并验证通过{who}。',
         'ok.verified': '凭证有效：{who}',
         'ok.synced': '同步完成：共 {listed} 个对话，新导入 {imported} 个，已存在 {skipped} 个，已归组 {attached} 个',
         'ok.syncedFailed': '，失败 {failed} 个',
+        'ok.appendSummary': '；追加 {appended} 轮，等待 {busy}，跳过 {skipped}，失败 {failed}',
         'ok.undone': '已撤销：归档 {archived} 个会话，清理 {removed} 个会话文件。',
         'ok.undoneLocal': ' 其中 {local} 个是你在 DSH 内新建的对话，已归档并保留文件。',
         'ok.undoneUnknown': ' 另有 {unknown} 个无法确认来源（早期版本写入的记录），按保守策略保留了文件。',
@@ -167,6 +170,8 @@ window.__ModuleLoader__.load({
         'qa.hint': '在这里向 DeepSeek 网页版提问。面板打开时已把当前对话压缩成背景发给它；问答只留在这个面板里，不会写进当前对话。',
         'qa.placeholder': '问点什么…（Enter 发送，Shift+Enter 换行）',
         'qa.send': '发送',
+        'qa.stop': '停止',
+        'qa.stopped': '已停止生成',
         'qa.reset': '刷新背景',
         'qa.resetHint': '丢弃当前侧问线程，用当前对话的最新内容重新生成压缩背景。',
         'qa.noToken': '尚未配置 user token：到 设置 → DeepSeek 网页版 保存后再来。',
@@ -197,6 +202,7 @@ window.__ModuleLoader__.load({
         'connection.verifying': 'Checking…',
         'connection.state': 'Status',
         'connection.configured': 'Configured',
+        'connection.invalid': 'Credential expired',
         'connection.missing': 'Not configured',
         'connection.stateFile': 'Data file',
         'connection.howTo': 'How to get a user token',
@@ -265,11 +271,13 @@ window.__ModuleLoader__.load({
         'error.persist': 'Could not write state: {message}',
         'error.undo': 'Undo failed: {message}',
         'error.verify': 'Check request failed: {message}',
+        'error.muted': 'This account is currently restricted/muted (until {until})',
         'error.verifyBad': 'Token is not valid: {message}',
         'ok.saved': 'Token saved and verified{who}.',
         'ok.verified': 'Token is valid: {who}',
         'ok.synced': 'Synced {listed} conversations, imported {imported}, already present {skipped}, grouped {attached}',
         'ok.syncedFailed': ', {failed} failed',
+        'ok.appendSummary': '; appended {appended} turns, waiting {busy}, skipped {skipped}, failed {failed}',
         'ok.undone': 'Undone: archived {archived} sessions and cleaned {removed} session files.',
         'ok.undoneLocal': ' {local} of them were started in DSH; they are archived with their files kept.',
         'ok.undoneUnknown': ' {unknown} more predate provenance tracking and were kept on the safe side.',
@@ -283,6 +291,8 @@ window.__ModuleLoader__.load({
         'qa.hint': 'Ask the DeepSeek web model here. The panel seeds a throwaway web thread with a compressed digest of this conversation when it opens; the exchange stays in this panel and never enters the conversation.',
         'qa.placeholder': 'Ask anything… (Enter to send, Shift+Enter for newline)',
         'qa.send': 'Send',
+        'qa.stop': 'Stop',
+        'qa.stopped': 'Generation stopped',
         'qa.reset': 'Refresh context',
         'qa.resetHint': 'Drop the current side thread and reseed it with the latest digest of this conversation.',
         'qa.noToken': 'No user token yet: save one in Settings → DeepSeek Web first.',
@@ -568,17 +578,25 @@ window.__ModuleLoader__.load({
             setNotice({ kind: 'bad', text: t('error.syncReport', { message: report.error }) });
           } else {
             const tail = report.failed ? t('ok.syncedFailed', { failed: report.failed }) : '';
+            const appendTail = (report.appended || report.appendBusy || report.appendSkipped || report.appendFailed)
+              ? t('ok.appendSummary', {
+                  appended: report.appended || 0,
+                  busy: report.appendBusy || 0,
+                  skipped: report.appendSkipped || 0,
+                  failed: report.appendFailed || 0,
+                })
+              : '';
             const firstError = Array.isArray(report.errors) && report.errors.length > 0
               ? ` ${report.errors[0].error}`
               : '';
             setNotice({
-              kind: report.failed > 0 ? 'bad' : 'ok',
+              kind: report.failed > 0 || report.appendFailed > 0 ? 'bad' : 'ok',
               text: t('ok.synced', {
                 listed: report.listed,
                 imported: report.imported,
                 skipped: report.skipped,
                 attached: report.attached || 0,
-              }) + tail + firstError,
+              }) + tail + appendTail + firstError,
             });
           }
           await refresh();
@@ -726,7 +744,11 @@ window.__ModuleLoader__.load({
           if (body.ok) {
             const account = body.account || {};
             const who = account.name || account.id || '?';
-            setNotice({ kind: 'ok', text: t('ok.verified', { who: account.email ? `${who} · ${account.email}` : who }) });
+            if (body.chat?.isMuted === true) {
+              setNotice({ kind: 'bad', text: t('error.muted', { until: body.chat.muteUntil || '?' }) });
+            } else {
+              setNotice({ kind: 'ok', text: t('ok.verified', { who: account.email ? `${who} · ${account.email}` : who }) });
+            }
           } else {
             setNotice({ kind: 'bad', text: t('error.verifyBad', { message: body.detail || '?' }) });
           }
@@ -808,8 +830,8 @@ window.__ModuleLoader__.load({
           ]),
           h('div', { key: 'kv', style: styles.kv }, [
             h(Row, { key: 'state', name: t('connection.state') },
-              h('span', { style: status.hasToken ? styles.ok : styles.bad },
-                status.hasToken ? t('connection.configured') : t('connection.missing'))),
+              h('span', { style: status.hasToken && !status.tokenInvalid ? styles.ok : styles.bad },
+                status.tokenInvalid ? t('connection.invalid') : status.hasToken ? t('connection.configured') : t('connection.missing'))),
             h(Row, { key: 'file', name: t('connection.stateFile') }, String(status.stateFile ?? '')),
           ]),
           // Collapsed by default: the guide is only needed once.
@@ -1032,6 +1054,15 @@ window.__ModuleLoader__.load({
       const [attachments, setAttachments] = useState([]);
       const [uploading, setUploading] = useState(0);
       const fileInputRef = useRef(null);
+      /** Cancels the active panel question when the panel closes or Stop is pressed. */
+      const abortRef = useRef(null);
+      useEffect(() => () => {
+        try {
+          abortRef.current?.abort();
+        } catch {
+          /* already settled */
+        }
+      }, []);
       const t = useCallback(
         (key, values) => {
           const dictionary = dictionaries[localeId] ?? dictionaries.zh;
@@ -1159,10 +1190,13 @@ window.__ModuleLoader__.load({
         setLive({ answer: '', reasoning: '', prompt: typed, at: Date.now(), files: staged.map((item) => ({ name: item.name })) });
         setDraft('');
         setAttachments([]);
+        const controller = new AbortController();
+        abortRef.current = controller;
         try {
           const response = await fetch(`${API_PATH}/quick-ask/send`, {
             method: 'POST',
             credentials: 'same-origin',
+            signal: controller.signal,
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
               sessionId,
@@ -1204,11 +1238,17 @@ window.__ModuleLoader__.load({
             }
           }
         } catch (error) {
-          // The turn never left: put the staged files back so the user can
-          // retry without re-picking them.
+          // Put the question and staged files back so a failed or stopped turn
+          // does not make the user retype or re-pick them.
+          if (typed !== '') setDraft(typed);
           if (staged.length > 0) setAttachments(staged);
-          setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+          if (error?.name === 'AbortError') {
+            setNotice({ kind: 'bad', text: t('qa.stopped') });
+          } else {
+            setNotice({ kind: 'bad', text: t('qa.error', { message: String(error && error.message ? error.message : error) }) });
+          }
         } finally {
+          if (abortRef.current === controller) abortRef.current = null;
           setBusy(false);
           setLive(null);
           await refresh();
@@ -1415,6 +1455,16 @@ window.__ModuleLoader__.load({
                   ]
                 : null,
             ]),
+            busy && live !== null
+              ? h('button', {
+                  key: 'stop',
+                  className: 'dsh-qa-stop',
+                  type: 'button',
+                  title: t('qa.stop'),
+                  'aria-label': t('qa.stop'),
+                  onClick: () => abortRef.current?.abort(),
+                }, t('qa.stop'))
+              : null,
             h('button', {
               key: 'send',
               className: 'dsh-qa-send',
@@ -1526,6 +1576,7 @@ window.__ModuleLoader__.load({
       '.dsh-qa-modelrowname{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.dsh-qa-modelrowdesc{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#81858c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.dsh-qa-send{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;width:30px;height:30px;padding:0;border:none;border-radius:50%;background:var(--dsw-alias-button-primary-fill,#4176e6);color:var(--dsw-alias-label-primary-foreground,#fff);cursor:pointer;margin-left:auto}',
+      '.dsh-qa-stop{box-sizing:border-box;flex:none;height:26px;margin-left:auto;padding:0 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));background:transparent;color:var(--dsw-alias-label-secondary,#61666b);font-size:12px;font-family:inherit;cursor:pointer}',
       '.dsh-qa-send svg{width:16px;height:16px}',
       '.dsh-qa-send:hover:not(:disabled){opacity:.92}',
       '.dsh-qa-send:disabled{opacity:.4;cursor:default}',
@@ -1794,7 +1845,7 @@ window.__ModuleLoader__.load({
       return blocks;
     }
 
-    const inject = ['slots', 'locale', 'sidebarRightTabs', 'sidebarRight'];
+    const inject = ['slots', 'locale'];
 
     function apply(ctx) {
       // Register the dictionaries so the nav label and every string resolve

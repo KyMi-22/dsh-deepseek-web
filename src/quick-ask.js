@@ -288,12 +288,27 @@ export class QuickAsk {
         sessionTitle,
         exchanges: [],
       };
+      // Record the thread BEFORE the primer can fail. The ledger id is the
+      // import-exclusion fallback when the `SideBar：` rename has not landed
+      // yet, and a failed primer must not leave an untracked web conversation
+      // that a later sync could import.
+      this.store.state.quickAsk[sessionId] = thread;
+      await this.store.flush();
       // Seed the thread with the primer when there IS context. A session with
       // no readable log (blank session, missing persistence) starts bare; the
       // panel still works, it just has no background.
       let parentId = null;
       if (context !== '') {
-        parentId = await this.sendAndSettle(web.id, null, contextPrimer(context), false);
+        try {
+          parentId = await this.sendAndSettle(web.id, null, contextPrimer(context), false);
+        } catch (error) {
+          // Keep the ledger row (so the empty/partial thread is never imported)
+          // but do not claim a background was sent.
+          thread.contextSent = '';
+          thread.updatedAt = Date.now();
+          await this.store.flush().catch(() => {});
+          throw error;
+        }
       }
       thread.parentMessageId = parentId;
       // Tag the conversation BEFORE it can ever meet a sync pass. The web
@@ -308,7 +323,7 @@ export class QuickAsk {
         // a later settled exchange retries the rename below.
         this.warn(`deepseek-web: could not tag the quick-ask conversation: ${String(error)}`);
       }
-      this.store.state.quickAsk[sessionId] = thread;
+      thread.updatedAt = Date.now();
       await this.store.flush();
       return thread;
     })();
@@ -330,9 +345,20 @@ export class QuickAsk {
    * @returns {Promise<QuickAskThread>}
    */
   async refreshThread(sessionId) {
+    const previous = this.threadOf(sessionId);
     delete this.store.state.quickAsk[sessionId];
     await this.store.flush();
-    return this.ensureThread(sessionId);
+    try {
+      return await this.ensureThread(sessionId);
+    } catch (error) {
+      // A failed refresh must not throw away the transcript the user still
+      // has. The half-created web conversation is left on the web product.
+      if (previous !== undefined) {
+        this.store.state.quickAsk[sessionId] = previous;
+        await this.store.flush().catch(() => {});
+      }
+      throw error;
+    }
   }
 
   /**

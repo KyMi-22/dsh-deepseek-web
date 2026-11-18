@@ -406,11 +406,13 @@ export function isHarnessInjection(text) {
  */
 export function hasProjectedFileHandle(text) {
   if (typeof text !== 'string' || !text.includes('[File "')) return false;
-  // Match the stable header of every DSH file handle, not the trailing
-  // instruction sentence: the sentence is prose and may change. False
-  // positives (a human literally typing such a header) fail closed rather than
-  // risking a local path reaching the web product.
-  return /\[File "[^"]+" \(\d+ bytes, sha256:[0-9a-f]+\):/u.test(text);
+  // Match the stable header of every DSH file handle, in both forms: the
+  // path-bearing `):` form and the `) was uploaded, but ...` form used when the
+  // current execution environment cannot expose a readable path. Not the
+  // trailing prose: that is a sentence and may change. False positives (a
+  // human literally typing such a header) fail closed rather than risking a
+  // local path or a silent loss of attachment.
+  return /\[File "[^"]+" \(\d+ bytes, sha256:[0-9a-f]+\)(?:[: ]|$)/u.test(text);
 }
 
 /**
@@ -646,10 +648,17 @@ export class DeepSeekWebAdapter {
     const chatSessionId = binding?.chatSessionId;
     if (typeof chatSessionId !== 'string' || chatSessionId === '') return binding;
     const last = Number(binding.parentSyncedAt) || 0;
-    if (Date.now() - last < PARENT_STALE_MS) return binding;
+    // Imported sessions are checked on every turn: a stale parent can strand
+    // web-side turns that arrived moments ago, and there is no import ledger to
+    // repair that after the anchor moves.
+    if (binding.origin !== 'imported' && Date.now() - last < PARENT_STALE_MS) return binding;
     try {
       const history = await this.deps.api.getHistory(chatSessionId);
-      if (history === null) return binding;
+      if (history === null) {
+        return binding.origin === 'imported'
+          ? { ...binding, pendingImport: 'missing', parentSyncedAt: Date.now() }
+          : binding;
+      }
       const latest = lastMessageId(history.messages);
       const syncedAt = Date.now();
       if (latest !== null && latest !== binding.parentMessageId) {
@@ -687,7 +696,9 @@ export class DeepSeekWebAdapter {
       }
       return { ...binding, parentSyncedAt: syncedAt };
     } catch {
-      return binding;
+      return binding.origin === 'imported'
+        ? { ...binding, pendingImport: 'unverified', parentSyncedAt: Date.now() }
+        : binding;
     }
   }
 
@@ -817,6 +828,14 @@ export class DeepSeekWebAdapter {
             code: 'IMPORT_NO_ANCHOR',
             message: 'deepseek-web: 本会话没有可用的网页端锚点；请在设置页撤销导入后重新同步',
           },
+          missing: {
+            code: 'IMPORT_MISSING',
+            message: 'deepseek-web: 网页端对话已不存在或不可读；请在设置页撤销导入后重新同步',
+          },
+          unverified: {
+            code: 'IMPORT_UNVERIFIED',
+            message: 'deepseek-web: 暂时无法确认网页端最新状态，为避免丢消息已阻止发送；请稍后重试',
+          },
         }[binding.pendingImport] ?? {
           code: 'IMPORT_PENDING',
           message: 'deepseek-web: 网页端有尚未同步的内容；请先离开并重新打开本会话',
@@ -942,6 +961,8 @@ export class DeepSeekWebAdapter {
     let nextIndex = 0;
     let messageId = null;
     let reasoningClosed = false;
+    /** A terminal server-side status must not be reported as a successful empty/partial reply. */
+    let remoteFailure = null;
     /** Usage is emitted after both blocks close, so the assembler sees a settled transcript. */
     let pendingUsage = null;
 
@@ -957,6 +978,18 @@ export class DeepSeekWebAdapter {
       })) {
         if (event.kind === 'message') {
           messageId = event.messageId;
+          continue;
+        }
+        if (event.kind === 'status') {
+          const status = String(event.status ?? '');
+          if (/FAILED|ERROR|CANCEL|ABORT/u.test(status)) {
+            remoteFailure = new DeepSeekWebError(
+              `deepseek-web: the web product ended the reply with status ${status || 'unknown'}`,
+              'REMOTE_FAILED',
+              { submitted: true },
+            );
+            break;
+          }
           continue;
         }
         if (event.kind === 'fragment' && event.text !== '') {
@@ -1019,10 +1052,23 @@ export class DeepSeekWebAdapter {
       yield { type: 'usage', usage: pendingUsage };
     }
 
+    if (remoteFailure !== null) {
+      yield finishError(remoteFailure);
+      return;
+    }
+    if (textIndex < 0 && reasoningIndex < 0) {
+      yield finishError(new DeepSeekWebError(
+        'deepseek-web: the web product returned no visible text or reasoning',
+        'EMPTY_RESPONSE',
+        { submitted: true },
+      ));
+      return;
+    }
+
     if (sessionId !== undefined) {
       const wasSeeded = binding.seeded === true;
-      // Our own reply is now the tail of the web thread, so the parent is fresh.
-      this.deps.updateBinding(sessionId, { parentMessageId: messageId, parentSyncedAt: Date.now() });
+      // One binding write per turn: `bindSession` persists the complete record,
+      // so a separate parent patch would only queue a second full-state write.
       const next = { ...binding, seeded: true, parentMessageId: messageId ?? binding.parentMessageId, parentSyncedAt: Date.now() };
       this.deps.bindSession(sessionId, next);
       // The web product titles a conversation from its first exchange, which for

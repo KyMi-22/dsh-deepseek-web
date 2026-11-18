@@ -307,13 +307,15 @@ export async function apply(ctx, config = {}) {
     try {
       session = ctx.get('sessions')?.get?.(sessionId);
     } catch {
+      warn('deepseek-web: could not look up the live session while recovering a file attachment');
       return null;
     }
     if (typeof session?.deriveMessages !== 'function') return null;
     let messages;
     try {
       messages = session.deriveMessages();
-    } catch {
+    } catch (error) {
+      warn(`deepseek-web: could not recover the raw message for a file attachment: ${String(error)}`);
       return null;
     }
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -394,7 +396,12 @@ export async function apply(ctx, config = {}) {
   let undoQueue = Promise.resolve();
   function enqueueUndo(task) {
     pendingUndos += 1;
-    const run = undoQueue.then(task, task).finally(() => {
+    // Wait for any append already in flight before teardown starts. Appends
+    // that begin after this point see `pendingUndos` and refuse to start.
+    const run = undoQueue.then(
+      async () => { await appendQueue; return task(); },
+      async () => { await appendQueue; return task(); },
+    ).finally(() => {
       pendingUndos -= 1;
     });
     undoQueue = run.then(
@@ -943,6 +950,7 @@ export async function apply(ctx, config = {}) {
       const agent = payload?.agent ?? payload;
       const sessionId = agent?.id;
       if (sessionId === undefined || sessionId === null) return;
+      promptedMessages.delete(String(sessionId));
       const timer = setTimeout(() => {
         timers.delete(timer);
         if (stopped) return;
@@ -1134,6 +1142,7 @@ export async function apply(ctx, config = {}) {
                 conversationDir: directory,
                 stateFile: stateFile(),
                 hasToken: api.ready,
+                tokenInvalid: api.authRejected,
                 tokenTail: api.ready ? maskToken(api.token) : '',
                 tokenSource,
                 // Background bookkeeping writes (bindings, ledger rows) are

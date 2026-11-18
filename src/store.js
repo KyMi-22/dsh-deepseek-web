@@ -117,9 +117,13 @@ export function sessionDirFor(sessionId, cwd) {
 /** The web client accepts only a UUID v4 device id. */
 const DEVICE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
+/** State document schema. Bumped when a migration is needed. */
+export const STATE_VERSION = 1;
+
 /** Empty state with a stable random device id. */
 function emptyState() {
   return {
+    schemaVersion: STATE_VERSION,
     token: '',
     deviceId: randomUUID(),
     bindings: {},
@@ -148,24 +152,32 @@ export async function loadState() {
   try {
     parsed = JSON.parse(raw);
   } catch {
+    // A corrupt state file must not silently become an empty ledger: preserve
+    // it for manual recovery, then start with defaults and let the next write
+    // replace it. The token and binding ledger are the two expensive losses.
+    await rename(file, `${file}.corrupt-${Date.now()}`).catch(() => {});
     return emptyState();
   }
   const base = emptyState();
-  if (parsed === null || typeof parsed !== 'object') return base;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return base;
+  const objectMap = (value) => (value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {});
   return {
+    schemaVersion: Number(parsed.schemaVersion) || STATE_VERSION,
     token: typeof parsed.token === 'string' ? parsed.token : base.token,
     // Older builds used a `dsh-web-...` id. The web client treats a non-UUID
     // device id as an abnormal client, so migrate it once on load.
     deviceId: typeof parsed.deviceId === 'string' && DEVICE_ID_RE.test(parsed.deviceId) ? parsed.deviceId : base.deviceId,
-    bindings: parsed.bindings !== null && typeof parsed.bindings === 'object' ? parsed.bindings : {},
-    imported: parsed.imported !== null && typeof parsed.imported === 'object' ? parsed.imported : {},
+    bindings: objectMap(parsed.bindings),
+    imported: objectMap(parsed.imported),
     workspaceId: typeof parsed.workspaceId === 'string' ? parsed.workspaceId : null,
     lastSyncAt: Number(parsed.lastSyncAt) || 0,
     syncPausedUntil: Number(parsed.syncPausedUntil) || 0,
     lastSyncError: typeof parsed.lastSyncError === 'string' ? parsed.lastSyncError : null,
     lastWorkspaceError: typeof parsed.lastWorkspaceError === 'string' ? parsed.lastWorkspaceError : null,
-    lastReport: parsed.lastReport !== null && typeof parsed.lastReport === 'object' ? parsed.lastReport : null,
-    quickAsk: parsed.quickAsk !== null && typeof parsed.quickAsk === 'object' ? parsed.quickAsk : {},
+    lastReport: parsed.lastReport !== null && typeof parsed.lastReport === 'object' && !Array.isArray(parsed.lastReport)
+      ? parsed.lastReport
+      : null,
+    quickAsk: objectMap(parsed.quickAsk),
   };
 }
 
