@@ -183,14 +183,17 @@ export async function apply(ctx, config = {}) {
     return raw;
   })();
 
-  const api = new DeepSeekWebApi({
-    token: resolvedToken,
-    deviceId: store.state.deviceId,
+  const apiOptions = {
     baseUrl,
     locale: typeof config.locale === 'string' && config.locale.trim() !== '' ? config.locale.trim() : undefined,
     deviceModel: typeof config.deviceModel === 'string' ? config.deviceModel : undefined,
     hif: config.hif !== false,
     requestGapMs: Number.isFinite(Number(config.requestGapMs)) ? Number(config.requestGapMs) : undefined,
+  };
+  const api = new DeepSeekWebApi({
+    ...apiOptions,
+    token: resolvedToken,
+    deviceId: store.state.deviceId,
   });
 
   // ── adapter ───────────────────────────────────────────────────────────────
@@ -1190,13 +1193,9 @@ export async function apply(ctx, config = {}) {
               // later request fails, and would overwrite a working token with a
               // broken one.
               const probe = new DeepSeekWebApi({
+                ...apiOptions,
                 token,
                 deviceId: store.state.deviceId,
-                baseUrl,
-                locale: typeof config.locale === 'string' && config.locale.trim() !== '' ? config.locale.trim() : undefined,
-                deviceModel: typeof config.deviceModel === 'string' ? config.deviceModel : undefined,
-                hif: config.hif !== false,
-                requestGapMs: Number.isFinite(Number(config.requestGapMs)) ? Number(config.requestGapMs) : undefined,
               });
               let account = null;
               try {

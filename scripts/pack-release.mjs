@@ -50,15 +50,14 @@ const expectedName = `${manifest.name}-${manifest.version}.tgz`;
 if (typeof packed?.filename !== 'string' || basename(packed.filename) !== expectedName) {
   throw new Error(`npm pack produced ${String(packed?.filename)}, expected ${expectedName}`);
 }
-const output = expectedName;
-const tarball = join(dist, output);
+const tarball = join(dist, expectedName);
 const hash = createHash('sha256');
 for await (const chunk of createReadStream(tarball)) hash.update(chunk);
 const digest = hash.digest('hex');
 const checksum = `${tarball}.sha256`;
-await writeFile(checksum, `${digest}  ${output}\n`, 'utf8');
+await writeFile(checksum, `${digest}  ${expectedName}\n`, 'utf8');
 
-console.log(`packed ${output}`);
+console.log(`packed ${expectedName}`);
 console.log(`sha256 ${digest}`);
 console.log(`artifact ${tarball}`);
 console.log(`checksum ${checksum}`);

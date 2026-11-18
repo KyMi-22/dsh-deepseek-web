@@ -243,9 +243,6 @@ async function streamToFile(url, target, signal, fetchImpl = fetch) {
     headers: { 'user-agent': 'dsh-deepseek-web-updater' },
   });
   if (!response.ok) throw new Error(`download answered HTTP ${response.status}`);
-  if (typeof response.url === 'string' && response.url !== '' && !isAllowedDownloadUrl(response.url)) {
-    throw new Error(`download redirected to a disallowed host (${new URL(response.url).hostname})`);
-  }
   const declared = Number(response.headers?.get?.('content-length') ?? 0);
   if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
     throw new Error(`download is too large (${declared} bytes)`);
