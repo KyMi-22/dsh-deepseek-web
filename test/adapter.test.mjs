@@ -1186,6 +1186,11 @@ assert.equal(
   const emptyFinish = emptyChunks.find((chunk) => chunk.type === 'finish');
   assert.equal(emptyFinish?.reason?.kind, 'error');
   assert.equal(emptyFinish?.reason?.failure?.code, 'EMPTY_RESPONSE');
+  assert.equal(
+    empty.adapter.providerRetryPolicy().retryableCodes.includes('EMPTY_RESPONSE'),
+    false,
+    'a submitted empty reply is not auto-retried into an empty success',
+  );
 }
 
 console.log('adapter.test.mjs: all assertions passed');

@@ -238,7 +238,9 @@ function exchange(id, text, reply, reasoning = '') {
     ...META,
   });
   assert.equal(result.ok, true);
-  assert.equal(result.reason, 'no-new-messages');
+  assert.equal(result.reason, 'blocked', 'an unanswered question is a blocked scan, not a clean no-op');
+  assert.equal(result.blocked, true);
+  assert.equal(result.blockedAt, 3);
   assert.equal(result.appended, 0);
   assert.equal(result.nextMessageId, 2);
   assert.equal(persistence.calls.appended.length, 0, 'no half turn reaches the log');
@@ -458,6 +460,42 @@ function exchange(id, text, reply, reasoning = '') {
   assert.equal(planAppend(messages, { afterMessageId: 3, ...META }).turns, 0);
   messages[3].status = 'FINISHED';
   assert.equal(planAppend(messages, { afterMessageId: 3, ...META }).turns, 1);
+}
+
+// ── a partial answer in the middle blocks later complete exchanges ────────
+{
+  const messages = [
+    ...exchange(1, 'q1', 'a1'),
+    messagesUser(3, 'q2'),
+    {
+      message_id: 4,
+      parent_id: 3,
+      role: 'ASSISTANT',
+      status: 'TIMEOUT',
+      inserted_at: 1792592804,
+      fragments: [],
+    },
+    ...exchange(5, 'q3', 'a3'),
+  ];
+  const plan = planAppend(messages, { afterMessageId: 2, ...META });
+  assert.equal(plan.turns, 0);
+  assert.equal(plan.blocked, true);
+  assert.equal(plan.blockedAt, 4, 'the scan reports where it stopped instead of pretending the tail was clean');
+  assert.equal(plan.nextMessageId, 2, 'the anchor must not move past the blocked reply');
+
+  const persistence = fakePersistence([...storedTail()]);
+  const result = await appendConversationTurns({
+    persistence,
+    sessionId: 'sess-blocked',
+    messages,
+    afterMessageId: 2,
+    ...META,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, 'blocked');
+  assert.equal(result.blocked, true);
+  assert.equal(result.blockedAt, 4);
+  assert.equal(persistence.calls.appended.length, 0, 'no partial or later turn is written');
 }
 
 console.log('append.test.mjs: all assertions passed');

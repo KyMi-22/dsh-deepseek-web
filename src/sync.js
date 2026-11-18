@@ -497,6 +497,8 @@ function logTailState(events) {
  *   events: Array<object>,
  *   nextMessageId: number | null,
  *   turns: number,
+ *   blocked: boolean,
+ *   blockedAt: number | null,
  * }}
  */
 export function planAppend(messages, options = {}) {
@@ -516,6 +518,8 @@ export function planAppend(messages, options = {}) {
   let turn = startTurn;
   /** The last web message id accounted for by the plan. */
   let nextMessageId = anchor;
+  /** The first message that stopped the scan, or null when the tail was consumed. */
+  let blockedAt = null;
 
   const push = (type, time, data, surfaceOp) => {
     /** @type {Record<string, unknown>} */
@@ -559,10 +563,16 @@ export function planAppend(messages, options = {}) {
     // turn, so record it as a continuation turn instead of dropping it.
     if (index === anchorIndex + 1 && anchorIsQuestion
       && String(message.role ?? '').toUpperCase() === 'ASSISTANT') {
-      if (!isCompleteAssistant(message)) break;
+      if (!isCompleteAssistant(message)) {
+        blockedAt = Number(message.message_id);
+        break;
+      }
       const reasoning = fragmentText(message, THINK);
       const reply = fragmentText(message, RESPONSE);
-      if (reasoning === '' && reply === '') break;
+      if (reasoning === '' && reply === '') {
+        blockedAt = Number(message.message_id);
+        break;
+      }
       pushAnswerOnlyTurn(message, reasoning, reply);
       continue;
     }
@@ -572,12 +582,24 @@ export function planAppend(messages, options = {}) {
     if (text === '') continue;
 
     const answer = messages[index + 1];
-    if (answer === null || answer === undefined || typeof answer !== 'object') break;
-    if (String(answer.role ?? '').toUpperCase() !== 'ASSISTANT') break;
-    if (!isCompleteAssistant(answer)) break;
+    if (answer === null || answer === undefined || typeof answer !== 'object') {
+      blockedAt = Number(message.message_id);
+      break;
+    }
+    if (String(answer.role ?? '').toUpperCase() !== 'ASSISTANT') {
+      blockedAt = Number(message.message_id);
+      break;
+    }
+    if (!isCompleteAssistant(answer)) {
+      blockedAt = Number(answer.message_id);
+      break;
+    }
     const reasoning = fragmentText(answer, THINK);
     const reply = fragmentText(answer, RESPONSE);
-    if (reasoning === '' && reply === '') break;
+    if (reasoning === '' && reply === '') {
+      blockedAt = Number(answer.message_id);
+      break;
+    }
 
     const askedAt = toMillis(message.inserted_at);
     const answeredAt = toMillis(answer.inserted_at);
@@ -614,7 +636,7 @@ export function planAppend(messages, options = {}) {
     index += 1;
   }
 
-  return { ok: true, reason: null, events, nextMessageId, turns: turn - startTurn };
+  return { ok: true, reason: null, events, nextMessageId, turns: turn - startTurn, blocked: blockedAt !== null, blockedAt };
 }
 
 /**
@@ -742,11 +764,13 @@ export async function appendConversationTurns(options) {
     if (events.length === 0) {
       return {
         ok: true,
-        reason: 'no-new-messages',
+        reason: plan.blocked ? 'blocked' : 'no-new-messages',
         appended: 0,
         nextMessageId: Number.isFinite(Number(afterMessageId)) ? Number(afterMessageId) : null,
         events,
         error: null,
+        blocked: plan.blocked,
+        blockedAt: plan.blockedAt,
       };
     }
 
@@ -766,6 +790,8 @@ export async function appendConversationTurns(options) {
         nextMessageId: Number.isFinite(Number(afterMessageId)) ? Number(afterMessageId) : null,
         events,
         error: null,
+        blocked: plan.blocked,
+        blockedAt: plan.blockedAt,
       };
     }
     return {
@@ -775,6 +801,8 @@ export async function appendConversationTurns(options) {
       nextMessageId: plan.nextMessageId,
       events,
       error: null,
+      blocked: plan.blocked,
+      blockedAt: plan.blockedAt,
     };
   } catch (error) {
     warn?.(`deepseek-web: appending to session ${sessionId} failed: ${String(error)}`);

@@ -62,6 +62,11 @@ jobs:
             gh release upload "$TAG" dist/*.tgz dist/*.tgz.sha256
           fi
           gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$ASSET"
+          DIGEST="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq ".assets[] | select(.name == \"${ASSET}\") | .digest")"
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "release asset ${ASSET} has no GitHub sha256 digest; self-update requires one" >&2
+            exit 1
+          fi
           if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
             gh release edit "$TAG" --draft=false
           fi

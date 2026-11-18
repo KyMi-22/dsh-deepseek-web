@@ -406,13 +406,11 @@ export function isHarnessInjection(text) {
  */
 export function hasProjectedFileHandle(text) {
   if (typeof text !== 'string' || !text.includes('[File "')) return false;
-  // Match the stable header of every DSH file handle, in both forms: the
-  // path-bearing `):` form and the `) was uploaded, but ...` form used when the
-  // current execution environment cannot expose a readable path. Not the
-  // trailing prose: that is a sentence and may change. False positives (a
-  // human literally typing such a header) fail closed rather than risking a
-  // local path or a silent loss of attachment.
-  return /\[File "[^"]+" \(\d+ bytes, sha256:[0-9a-f]+\)(?:[: ]|$)/u.test(text);
+  // Match the stable pieces of every DSH file handle (name plus sha256 digest)
+  // without over-fitting size units or digest length. A false positive (a human
+  // literally typing such a header) fails closed; a format drift must not turn
+  // into a local-path leak.
+  return text.includes('[File "') && text.includes('sha256:');
 }
 
 /**
@@ -560,7 +558,7 @@ export class DeepSeekWebAdapter {
     return Object.freeze({
       mode: 'normal',
       maxRetries: 1,
-      retryableCodes: Object.freeze(['TRANSPORT', 'TIMEOUT', 'EMPTY_RESPONSE', 'POW_UNSOLVED']),
+      retryableCodes: Object.freeze(['TRANSPORT', 'TIMEOUT', 'POW_UNSOLVED']),
       initialDelayMs: 800,
       maxDelayMs: 6000,
       jitterRatio: 0.2,

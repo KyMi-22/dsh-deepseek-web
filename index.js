@@ -577,6 +577,15 @@ export async function apply(ctx, config = {}) {
       return { status: 'skipped', appended: 0, reason: result.reason };
     }
 
+    if (result.blocked === true && result.appended === 0) {
+      // A partial/failed reply sits before the tail. Do not advance the version
+      // (that would hide it forever); report it so the settings page shows a
+      // real reason instead of silently "nothing new".
+      store.state.lastSyncError = `append blocked at web message ${result.blockedAt ?? '?'}; a re-import is required`;
+      warn(`deepseek-web: append to ${chatSessionId} is blocked at message ${result.blockedAt ?? '?'}`);
+      return { status: 'blocked', appended: 0, reason: 'blocked' };
+    }
+
     known.messageCount = history.messages.length;
     if (summary !== null) known.updatedAt = summary.updatedAt;
     else markSeen(known, history.messages);
@@ -834,6 +843,7 @@ export async function apply(ctx, config = {}) {
           if (outcome.status === 'appended') report.appended += outcome.appended;
           else if (outcome.status === 'busy') report.appendBusy += 1;
           else if (outcome.status === 'failed') report.appendFailed += 1;
+          else if (outcome.status === 'blocked') report.appendSkipped += 1;
           else if (outcome.status === 'skipped') report.appendSkipped += 1;
           else if (outcome.status === 'missing') {
             await dropOrphan(chatSessionId, known);

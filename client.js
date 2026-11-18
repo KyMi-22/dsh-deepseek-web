@@ -1879,7 +1879,7 @@ window.__ModuleLoader__.load({
             return dictionary['qa.tab.title'];
           },
         }), 'dsh-deepseek-web: quick-ask tab type');
-        ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+        scope.slots.inject('sidebar.right.pane.tab', () => scope.slots.register({
           name: 'sidebar.right.pane.tab',
           key: QA_TAB_ID,
           locale: NS,
@@ -1887,7 +1887,7 @@ window.__ModuleLoader__.load({
 
         // The entry: a small persistent button next to the header's
         // more-actions button, opening (and revealing) the panel tab.
-        ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+        scope.slots.inject('conversation.session.header.utilities', () => scope.slots.register({
           name: 'conversation.session.header.utilities',
           id: 'deepseek-web-quick-ask',
           order: 10,
