@@ -212,6 +212,23 @@ function documentFileName(name, mediaType) {
 }
 
 /**
+ * The text a file-only or image-only turn sends.
+ *
+ * The web completion endpoint requires a non-empty prompt, and an attachment
+ * without a caption is still a question. Naming the files keeps the request
+ * self-describing without leaking a local path.
+ *
+ * @param {ReadonlyArray<{ name?: string, mediaType?: string }>} refs
+ */
+function attachmentPrompt(refs) {
+  const names = refs.map((ref) => {
+    if (typeof ref?.name === 'string' && ref.name !== '') return ref.name;
+    return typeof ref?.mediaType === 'string' && ref.mediaType.startsWith('image/') ? '图片' : '附件';
+  });
+  return `请查看附件：${names.join('、')}`;
+}
+
+/**
  * Every distinct document reference in one message list, in message order.
  *
  * A file block carries a `FileAttachmentRef` (`attachmentId`, `name`, digest
@@ -373,22 +390,51 @@ export function isHarnessInjection(text) {
 }
 
 /**
- * The newest user message a human actually typed.
+ * Whether one message content list carries an attachment block.
+ *
+ * A user can send only an image (no text); that message is still a real prompt
+ * and must not be skipped as though it were empty.
+ *
+ * @param {unknown} content
+ */
+function hasAttachmentBlock(content) {
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => block?.type === 'image' || block?.type === 'file');
+}
+
+/**
+ * The newest human message, even when it carries only an attachment.
  *
  * @param {ReadonlyArray<object>} messages
- * @returns {{ id: string | null, text: string } | null}
+ * @returns {{ id: string | null, text: string, message: object } | null}
  */
-export function newestRealUser(messages) {
+export function newestHumanMessage(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
     if (message?.role !== 'user') continue;
     if (!isHumanMessage(message)) continue;
     const text = blocksToText(message.content);
-    if (text === '') continue;
-    if (isHarnessInjection(text)) continue;
-    return { id: message.id ?? null, text };
+    if (text !== '' && isHarnessInjection(text)) continue;
+    if (text === '' && !hasAttachmentBlock(message.content)) continue;
+    return { id: message.id ?? null, text, message };
   }
   return null;
+}
+
+/**
+ * The newest user message a human actually typed, with its flattened text.
+ *
+ * Kept as a text-only view for callers that need a prompt or a title. The
+ * adapter itself uses {@link newestHumanMessage} so an image-only turn is not
+ * mistaken for a repeat of the previous question.
+ *
+ * @param {ReadonlyArray<object>} messages
+ * @returns {{ id: string | null, text: string } | null}
+ */
+export function newestRealUser(messages) {
+  const newest = newestHumanMessage(messages);
+  if (newest === null || newest.text === '') return null;
+  return { id: newest.id, text: newest.text };
 }
 
 /**
@@ -605,9 +651,9 @@ export class DeepSeekWebAdapter {
     // its own history, so re-sending the transcript would duplicate it and drag
     // harness internals into the user's chats. An imported conversation already
     // holds its history on the web side.
-    const newest = newestRealUser(messages);
-    const prompt = newest?.text ?? '';
-    if (newest === null || prompt === '') {
+    const newest = newestHumanMessage(messages);
+    let prompt = newest?.text ?? '';
+    if (newest === null) {
       yield { type: 'finish', reason: { kind: 'stop' } };
       return;
     }
@@ -651,13 +697,17 @@ export class DeepSeekWebAdapter {
       binding = await this.refreshParent(binding);
     }
 
-    // Upload the turn's images, if any, before the completion POST. The web
+    // Upload this turn's images, if any, before the completion POST. The web
     // endpoint takes images as `ref_file_ids` — ids from a prior upload — so
     // nothing model-visible happens until the completion call itself. Every
     // failure here is therefore `submitted: false`: the turn may retry whole.
+    //
+    // Only the newest human message is scanned: DSH passes the complete
+    // conversation history on every call, and re-uploading every historical
+    // image would attach old pictures to each new question.
     /** @type {string[]} */
     let refFileIds = [];
-    const refs = imageRefs(messages);
+    const refs = imageRefs([newest.message]);
     if (refs.length > 0) {
       const readImage = this.deps.readImage;
       if (typeof readImage !== 'function') {
@@ -696,7 +746,8 @@ export class DeepSeekWebAdapter {
     // Documents ride the same upload path with the `file` model type. Their
     // bytes come verbatim out of the attachment store; the prompt keeps the
     // `[文件]` placeholder so a file-only turn still has a non-empty prompt.
-    const documents = fileRefs(messages);
+    // As with images, only the current message is uploaded.
+    const documents = fileRefs([newest.message]);
     if (documents.length > 0) {
       const readFileBytes = this.deps.readFileBytes;
       if (typeof readFileBytes !== 'function') {
@@ -732,6 +783,16 @@ export class DeepSeekWebAdapter {
         yield finishError(error);
         return;
       }
+    }
+
+    // An attachment-only turn still needs a non-empty prompt. The names are
+    // taken from the references, never from a local path.
+    if (prompt.trim() === '' && (refs.length > 0 || documents.length > 0)) {
+      prompt = attachmentPrompt([...refs, ...documents]);
+    }
+    if (prompt.trim() === '') {
+      yield { type: 'finish', reason: { kind: 'stop' } };
+      return;
     }
 
     let reasoningIndex = -1;

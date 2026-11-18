@@ -275,7 +275,48 @@ assert.equal(
   assert.equal(ends.length, 1, 'one text block closed');
 }
 
-// ── the upload filename always carries the extension the endpoint checks ──
+// ── an image-only turn is a real prompt, not a repeat of the last text ─────
+{
+  const { adapter, api } = makeAdapter([ANSWER('图片收到')], {
+    readImage: async (ref) => ({ ref, data: new Uint8Array([1]) }),
+  });
+  const image = {
+    id: 'm1',
+    role: 'user',
+    content: [{ type: 'image', attachment: { attachmentId: 'att-only', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } }],
+    source: { kind: 'user' },
+  };
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat', messages: [image], sessionId: 'sess-image-only',
+  })) { /* drain */ }
+  assert.equal(api.calls.completions.length, 1, 'the image-only turn reaches the web');
+  assert.equal(api.calls.completions[0].prompt, '请查看附件：图片', 'the fallback names the attachment, not the previous question');
+  assert.deepEqual(api.calls.completions[0].refFileIds, ['file-1'], 'the image id rides on the completion');
+  assert.equal(api.calls.uploads.length, 1);
+}
+
+// ── only the newest message's images are uploaded ─────────────────────────
+{
+  const { adapter, api } = makeAdapter([ANSWER('好')], {
+    readImage: async (ref) => ({ ref, data: new Uint8Array([1]) }),
+  });
+  const messages = [
+    {
+      id: 'old', role: 'user', source: { kind: 'user' },
+      content: [{ type: 'text', text: '旧图' }, { type: 'image', attachment: { attachmentId: 'att-old', mediaType: 'image/png', bytes: 1, width: 1, height: 1 } }],
+    },
+    { id: 'old-answer', role: 'assistant', content: [{ type: 'text', text: '收到' }] },
+    userMessage('new', '新问题'),
+  ];
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat', messages, sessionId: 'sess-history-image',
+  })) { /* drain */ }
+  assert.equal(api.calls.completions[0].prompt, '新问题');
+  assert.deepEqual(api.calls.completions[0].refFileIds, [], 'the historical image is not re-attached');
+  assert.equal(api.calls.uploads, undefined, 'no historical image is uploaded');
+}
+
+
 {
   // The endpoint type-checks by filename EXTENSION, so a display name without
   // one — or with one that disagrees with the declared media type — must be
