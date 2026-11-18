@@ -1870,7 +1870,7 @@ window.__ModuleLoader__.load({
         injectQuickAskStyles();
         const QA_TAB_ID = 'dsh-deepseek-web/quick-ask';
         const QA_TAB_KIND = 'deepseek-web-quick-ask';
-        ctx.effect(() => sidebarRightTabs.register({
+        scope.effect(() => sidebarRightTabs.register({
           id: QA_TAB_ID,
           kind: QA_TAB_KIND,
           title: () => {
