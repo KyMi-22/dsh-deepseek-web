@@ -120,6 +120,9 @@ function makeAdapter(events, options = {}) {
   if (options.readFileBytes !== undefined) {
     adapter.deps.readFileBytes = options.readFileBytes;
   }
+  if (options.recoverUserMessage !== undefined) {
+    adapter.deps.recoverUserMessage = options.recoverUserMessage;
+  }
   return { adapter, bindings, api, sent };
 }
 
@@ -402,7 +405,97 @@ assert.equal(
   assert.ok(chunks.some((chunk) => chunk.type === 'text-delta'), 'the reply streamed');
 }
 
-// ── a document upload failure is not retried as if it were submitted ──────
+// ── a host-projected file handle never reaches the web prompt ─────────────
+{
+  const handle = String.raw`[File "报告.pdf" (123 bytes, sha256:abcdef12): verbatim read-only copy saved at "C:\Users\me\.dsh\attachments\报告.pdf". Read that path with your file tools when its contents are needed.]`;
+  const raw = {
+    id: 'm1',
+    role: 'user',
+    content: [
+      { type: 'text', text: '看这份报告' },
+      { type: 'file', attachment: { attachmentId: 'att-doc', name: '报告.pdf', bytes: 4 } },
+    ],
+    source: { kind: 'user' },
+  };
+  const { adapter, api } = makeAdapter([ANSWER('收到')], {
+    recoverUserMessage: () => raw,
+    readFileBytes: async () => new Uint8Array([1, 2, 3, 4]),
+  });
+  const messages = [{ id: 'm1', role: 'user', content: [{ type: 'text', text: handle }], source: { kind: 'user' } }];
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat', messages, sessionId: 'sess-projected',
+  })) { /* drain */ }
+  assert.equal(api.calls.completions.length, 1, 'the recovered turn reaches the web');
+  assert.equal(api.calls.completions[0].prompt, '看这份报告', 'the caption replaces the projected handle');
+  assert.deepEqual(api.calls.completions[0].refFileIds, ['doc-1'], 'the recovered file id rides on the completion');
+  assert.equal(api.calls.fileUploads.length, 1);
+  assert.ok(!api.calls.completions[0].prompt.includes('C:\\'), 'no local path is forwarded');
+  assert.ok(!api.calls.completions[0].prompt.includes('verbatim read-only'), 'the handle text is not forwarded');
+}
+
+// ── a file-only projected turn gets a filename fallback prompt ─────────────
+{
+  const handle = String.raw`[File "报告.pdf" (123 bytes, sha256:abcdef12): verbatim read-only copy saved at "C:\Users\me\.dsh\attachments\报告.pdf". Read that path with your file tools when its contents are needed.]`;
+  const raw = {
+    id: 'm1',
+    role: 'user',
+    content: [{ type: 'file', attachment: { attachmentId: 'att-doc', name: '报告.pdf', bytes: 4 } }],
+    source: { kind: 'user' },
+  };
+  const { adapter, api } = makeAdapter([ANSWER('收到')], {
+    recoverUserMessage: () => raw,
+    readFileBytes: async () => new Uint8Array([1]),
+  });
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: handle }], source: { kind: 'user' } }],
+    sessionId: 'sess-projected-only',
+  })) { /* drain */ }
+  assert.equal(api.calls.completions[0].prompt, '请查看附件：报告.pdf');
+}
+
+// ── when recovery is impossible, fail closed instead of leaking the path ──
+{
+  const handle = String.raw`[File "报告.pdf" (123 bytes, sha256:abcdef12): verbatim read-only copy saved at "C:\Users\me\.dsh\attachments\报告.pdf". Read that path with your file tools when its contents are needed.]`;
+  const { adapter, api, sent } = makeAdapter([ANSWER('收到')], {
+    recoverUserMessage: () => null,
+  });
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat',
+    messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: handle }], source: { kind: 'user' } }],
+    sessionId: 'sess-projected-fail',
+  })) chunks.push(chunk);
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(api.calls.completions.length, 0, 'nothing is sent when the file cannot be recovered');
+  assert.equal(finish?.reason?.kind, 'error');
+  assert.equal(finish?.reason?.failure?.code, 'FILE_RECOVERY');
+  assert.ok(!String(finish?.reason?.failure?.message).includes('C:\\'), 'the error does not echo the local path');
+  assert.equal(sent.get('sess-projected-fail')?.has('m1') ?? false, false, 'the message can be retried');
+}
+
+// ── only the newest message's files are uploaded ──────────────────────────
+{
+  const { adapter, api } = makeAdapter([ANSWER('好')], {
+    readFileBytes: async () => { throw new Error('historical file must not be read'); },
+  });
+  const messages = [
+    {
+      id: 'old', role: 'user', source: { kind: 'user' },
+      content: [{ type: 'text', text: '旧文件' }, { type: 'file', attachment: { attachmentId: 'old-doc', name: 'old.pdf', bytes: 1 } }],
+    },
+    { id: 'old-answer', role: 'assistant', content: [{ type: 'text', text: '收到' }] },
+    userMessage('new', '新问题'),
+  ];
+  for await (const _chunk of adapter.stream({
+    provider: 'deepseek-web', model: 'deepseek-web-chat', messages, sessionId: 'sess-history-doc',
+  })) { /* drain */ }
+  assert.equal(api.calls.completions[0].prompt, '新问题');
+  assert.deepEqual(api.calls.completions[0].refFileIds, [], 'the historical document is not re-attached');
+  assert.equal(api.calls.fileUploads, undefined);
+}
+
+
 {
   const { adapter, api, sent } = makeAdapter([ANSWER('收到')], {
     readFileBytes: async () => new Uint8Array([1]),
@@ -725,6 +818,51 @@ assert.equal(
 
   assert.equal(api.calls.histories, 1, 'the web history was re-read once');
   assert.equal(api.calls.completions[0].parentMessageId, 99, 'the prompt continues from the real tail');
+}
+
+// ── an imported session with unseen web turns is not allowed to jump ahead ─
+{
+  const api = fakeApi([ANSWER('ok')], {
+    historyMessages: [
+      { message_id: 41, role: 'ASSISTANT', status: 'FINISHED', fragments: [{ type: 'RESPONSE', content: '旧答案' }] },
+      { message_id: 42, role: 'USER', status: 'FINISHED', fragments: [{ type: 'REQUEST', content: '网页端新问题' }] },
+      { message_id: 43, role: 'ASSISTANT', status: 'FINISHED', fragments: [{ type: 'RESPONSE', content: '网页端新答案' }] },
+    ],
+  });
+  const bindings = new Map([
+    ['sess-imported-stale', {
+      chatSessionId: 'web-9', parentMessageId: 41, seeded: true, origin: 'imported', parentSyncedAt: 0,
+    }],
+  ]);
+  const sent = new Set();
+  const adapter = new DeepSeekWebAdapter({
+    api,
+    resolveBinding: (id) => bindings.get(id),
+    bindSession: (id, binding) => bindings.set(id, binding),
+    updateBinding: (id, patch) => bindings.set(id, { ...bindings.get(id), ...patch }),
+    noteSent: (_id, messageId) => {
+      if (sent.has(messageId)) return false;
+      sent.add(messageId);
+      return true;
+    },
+    forgetSent: (_id, messageId) => sent.delete(messageId),
+    warn: () => {},
+  });
+
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m1', '继续')],
+    sessionId: 'sess-imported-stale',
+  })) chunks.push(chunk);
+
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(api.calls.completions.length, 0, 'the prompt is blocked until the append runs');
+  assert.equal(finish?.reason?.kind, 'error');
+  assert.equal(finish?.reason?.failure?.code, 'IMPORT_PENDING');
+  assert.equal(bindings.get('sess-imported-stale').parentMessageId, 41, 'the parent is not advanced past the unseen turns');
+  assert.equal(sent.has('m1'), false, 'the blocked message can be retried');
 }
 
 // ── a fresh parent is not re-read ─────────────────────────────────────────

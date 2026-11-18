@@ -390,6 +390,42 @@ export function isHarnessInjection(text) {
 }
 
 /**
+ * Whether one text is the host's projected file handle rather than a human
+ * caption.
+ *
+ * DSH 0.2.x projects every `FileBlock` into deterministic text before an
+ * adapter is called. The text contains the local read-only path, so it must
+ * never be forwarded to the web product. It can still identify the original
+ * message, whose raw log entry carries the attachment reference.
+ *
+ * @param {string} text
+ */
+export function hasProjectedFileHandle(text) {
+  if (typeof text !== 'string' || !text.includes('[File "')) return false;
+  // Match the stable header of every DSH file handle, not the trailing
+  // instruction sentence: the sentence is prose and may change. False
+  // positives (a human literally typing such a header) fail closed rather than
+  // risking a local path reaching the web product.
+  return /\[File "[^"]+" \(\d+ bytes, sha256:[0-9a-f]+\):/u.test(text);
+}
+
+/**
+ * Extract the human caption and durable file references from a raw session
+ * message (the pre-projection form).
+ *
+ * @param {object | null | undefined} message
+ * @returns {{ text: string, files: Array<{ attachmentId: string, name: string }> }}
+ */
+export function projectUserMessage(message) {
+  const content = Array.isArray(message?.content) ? message.content : [];
+  const parts = [];
+  for (const block of content) {
+    if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text);
+  }
+  return { text: parts.join('\n').trim(), files: fileRefs([{ content }]) };
+}
+
+/**
  * Whether one message content list carries an attachment block.
  *
  * A user can send only an image (no text); that message is still a real prompt
@@ -500,6 +536,7 @@ export class DeepSeekWebAdapter {
    *   updateBinding: (sessionId: string, patch: { parentMessageId?: number | null }) => void,
    *   noteSent: (sessionId: string, messageId: string) => boolean,
    *   onExchange?: (sessionId: string, chatSessionId: string, userText: string, assistantText: string, reasoning: string) => void,
+   *   recoverUserMessage?: (sessionId: string, messageId: string) => object | null,
    *   warn?: (message: string) => void,
    * }} dependencies
    */
@@ -612,7 +649,14 @@ export class DeepSeekWebAdapter {
       const latest = lastMessageId(history.messages);
       const syncedAt = Date.now();
       if (latest !== null && latest !== binding.parentMessageId) {
-        // Branch moved on without us; continue from the real tail.
+        // An imported session owns a DSH log that already contains its earlier
+        // turns. Appending cannot run while the session is live, and silently
+        // moving the parent past the unseen turns would lose them forever.
+        // Block this prompt; closing the session lets the append pass catch up.
+        if (binding.origin === 'imported') {
+          return { ...binding, pendingImport: true, parentSyncedAt: syncedAt };
+        }
+        // A local web conversation has no import ledger; continue from the tail.
         return { ...binding, parentMessageId: latest, parentSyncedAt: syncedAt };
       }
       return { ...binding, parentSyncedAt: syncedAt };
@@ -658,6 +702,34 @@ export class DeepSeekWebAdapter {
       return;
     }
 
+    // A host-projected FileBlock reaches us as text containing the local
+    // read-only path. Recover the raw message from the live session instead of
+    // forwarding that path; if recovery is impossible, fail closed.
+    /** @type {Array<{ attachmentId: string, name: string }>} */
+    let documents = fileRefs([newest.message]);
+    if (hasProjectedFileHandle(prompt)) {
+      let raw = null;
+      try {
+        raw = sessionId === undefined || newest.id === null
+          ? null
+          : this.deps.recoverUserMessage?.(sessionId, String(newest.id)) ?? null;
+      } catch (error) {
+        raw = null;
+      }
+      const recovered = raw === null ? null : projectUserMessage(raw);
+      if (recovered === null || recovered.files.length === 0) {
+        const error = new DeepSeekWebError(
+          'deepseek-web: 附件原文无法从当前会话恢复，已阻止发送；请改用快捷侧问面板上传该文件',
+          'FILE_RECOVERY',
+          { submitted: false },
+        );
+        yield finishError(error);
+        return;
+      }
+      prompt = recovered.text;
+      documents = recovered.files;
+    }
+
     // One turn may re-enter the adapter; only a genuinely new user message is a
     // new request. A repeat returns an empty stop so the loop is not re-prompted.
     if (sessionId !== undefined && newest.id !== null) {
@@ -695,6 +767,19 @@ export class DeepSeekWebAdapter {
       }
     } else {
       binding = await this.refreshParent(binding);
+      if (binding.pendingImport === true) {
+        // Nothing was sent. The answer/new turns must be appended after the
+        // session closes; sending now would make the web side's tail the new
+        // parent and strand those turns before this prompt.
+        const error = new DeepSeekWebError(
+          'deepseek-web: 网页端有尚未追加到本会话的新轮次；请先离开并重新打开本会话，等插件完成追加后再发送',
+          'IMPORT_PENDING',
+          { submitted: false },
+        );
+        this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
+        yield finishError(error);
+        return;
+      }
     }
 
     // Upload this turn's images, if any, before the completion POST. The web
@@ -744,10 +829,10 @@ export class DeepSeekWebAdapter {
     }
 
     // Documents ride the same upload path with the `file` model type. Their
-    // bytes come verbatim out of the attachment store; the prompt keeps the
-    // `[文件]` placeholder so a file-only turn still has a non-empty prompt.
-    // As with images, only the current message is uploaded.
-    const documents = fileRefs([newest.message]);
+    // bytes come verbatim out of the attachment store; the prompt keeps a
+    // filename fallback so a file-only turn still has a non-empty prompt.
+    // `documents` was resolved above, either from this message or from the raw
+    // session message when the host had projected the file into handle text.
     if (documents.length > 0) {
       const readFileBytes = this.deps.readFileBytes;
       if (typeof readFileBytes !== 'function') {

@@ -295,6 +295,32 @@ export async function apply(ctx, config = {}) {
     return Buffer.concat(chunks);
   };
 
+  // DSH 0.2.x projects every FileBlock into handle text before an adapter is
+  // invoked, so the adapter can no longer see the attachment reference in the
+  // request messages. Recover the raw message from the live session (which
+  // still carries the FileBlock) when a turn needs to upload a document.
+  adapter.deps.recoverUserMessage = (sessionId, messageId) => {
+    let session;
+    try {
+      session = ctx.get('sessions')?.get?.(sessionId);
+    } catch {
+      return null;
+    }
+    if (typeof session?.deriveMessages !== 'function') return null;
+    let messages;
+    try {
+      messages = session.deriveMessages();
+    } catch {
+      return null;
+    }
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (String(message?.id) !== String(messageId)) continue;
+      return message.role === 'user' ? message : null;
+    }
+    return null;
+  };
+
   // Both registrations are fiber-owned: their handles unwind with this plugin.
   ctx.llm.registerAdapter([PROVIDER], adapter);
   ctx.llm.registerConfigurableProviders([
