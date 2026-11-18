@@ -381,7 +381,7 @@ function exchange(id, text, reply, reasoning = '') {
   );
 }
 
-// ── trimIncompleteTail: never seed a question that has no answer ───────────
+// ── trimIncompleteTail: never seed a question that has no settled answer ───
 {
   const messages = [
     ...exchange(1, 'q1', 'a1'),
@@ -391,10 +391,42 @@ function exchange(id, text, reply, reasoning = '') {
   assert.deepEqual(trimIncompleteTail(messages).map((message) => message.message_id), [1, 2]);
   assert.deepEqual(trimIncompleteTail([messagesUser(9, 'only')]), []);
   assert.deepEqual(trimIncompleteTail(null), []);
+  assert.deepEqual(trimIncompleteTail([]), []);
 
-  // A complete tail is left alone.
+  const wip = {
+    message_id: 4,
+    role: 'ASSISTANT',
+    status: 'WIP',
+    inserted_at: 1792592804,
+    fragments: [{ type: 'RESPONSE', content: '还在生成' }],
+  };
+  assert.deepEqual(trimIncompleteTail([...exchange(1, 'q1', 'a1'), messagesUser(3, 'q2'), wip]).map((m) => m.message_id), [1, 2]);
+
+  const filtered = {
+    message_id: 4,
+    role: 'ASSISTANT',
+    status: 'CONTENT_FILTER',
+    inserted_at: 1792592804,
+    fragments: [],
+  };
+  assert.deepEqual(trimIncompleteTail([...exchange(1, 'q1', 'a1'), messagesUser(3, 'q2'), filtered]).map((m) => m.message_id), [1, 2]);
+
+  const thinkOnly = {
+    message_id: 4,
+    role: 'ASSISTANT',
+    status: 'FINISHED',
+    inserted_at: 1792592804,
+    fragments: [{ type: 'THINK', content: '只想了一半' }],
+  };
+  assert.deepEqual(trimIncompleteTail([...exchange(1, 'q1', 'a1'), messagesUser(3, 'q2'), thinkOnly]).map((m) => m.message_id), [1, 2, 3, 4]);
+
+  const incomplete = { ...wip, status: 'INCOMPLETE' };
+  assert.equal(trimIncompleteTail([messagesUser(1, 'q'), incomplete]).length, 0);
+
+  // A complete tail is left alone, including a finished reasoning-only answer.
   const complete = [...exchange(1, 'q', 'a')];
   assert.equal(trimIncompleteTail(complete).length, 2);
+  assert.equal(trimIncompleteTail([messagesUser(1, 'q'), thinkOnly]).length, 2);
 }
 
 console.log('append.test.mjs: all assertions passed');

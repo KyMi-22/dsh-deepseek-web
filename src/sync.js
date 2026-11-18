@@ -219,15 +219,34 @@ function userTextOf(message) {
 }
 
 /**
- * Drop a trailing question that never got an answer.
+ * Whether one web assistant message is a settled answer.
+ *
+ * The history endpoint carries a `status` (`FINISHED`, `WIP`, `INCOMPLETE`,
+ * `TIMEOUT`, `CONTENT_FILTER`, `CONTEXT_LENGTH_EXCEEDED`). Only a finished
+ * message is safe to seed: a partial answer can still grow under the same
+ * message id, which an append cannot repair. An absent status is accepted for
+ * hand-written/legacy payloads and tests; a present non-FINISHED status is not.
+ *
+ * @param {object | null | undefined} message
+ */
+export function isCompleteAssistant(message) {
+  if (message === null || typeof message !== 'object') return false;
+  if (String(message.role ?? '').toUpperCase() !== 'ASSISTANT') return false;
+  const status = typeof message.status === 'string' ? message.status.toUpperCase() : '';
+  if (status !== '' && status !== 'FINISHED') return false;
+  return fragmentText(message, RESPONSE) !== '' || fragmentText(message, THINK) !== '';
+}
+
+/**
+ * Drop a trailing question that never got a settled answer.
  *
  * A web conversation can be imported while the product is still generating:
- * the history then ends in one or more USER messages with no ASSISTANT reply.
- * Seeding those questions is unsafe, because the later answer cannot be
- * appended into the already-closed turn, and the anchor would point at the
- * question itself. Trimming them makes the import a snapshot of the last
- * complete exchange; the next sync appends the question and its answer as one
- * complete turn.
+ * the history then ends in one or more USER messages with no ASSISTANT reply,
+ * or in an ASSISTANT whose status is still `WIP` (or otherwise not `FINISHED`).
+ * Seeding either is unsafe, because the later answer cannot be appended into
+ * the already-closed turn, and the anchor would point at the incomplete tail.
+ * Trimming to the last complete exchange makes the import a snapshot; the next
+ * sync appends the completed turn as a whole.
  *
  * @param {ReadonlyArray<object>} messages
  * @returns {Array<object>}
@@ -236,7 +255,8 @@ export function trimIncompleteTail(messages) {
   const kept = Array.isArray(messages) ? messages.slice() : [];
   while (kept.length > 0) {
     const last = kept[kept.length - 1];
-    if (String(last?.role ?? '').toUpperCase() !== 'USER') break;
+    const role = String(last?.role ?? '').toUpperCase();
+    if (role === 'ASSISTANT' && isCompleteAssistant(last)) break;
     kept.pop();
   }
   return kept;
@@ -379,10 +399,7 @@ export function buildSeedEvents(messages, meta) {
       const reasoning = fragmentText(message, THINK);
       const answer = fragmentText(message, RESPONSE);
       if (reasoning === '' && answer === '') continue;
-      /** @type {Array<object>} */
-      const content = [];
-      if (reasoning !== '') content.push({ type: 'reasoning', text: reasoning });
-      if (answer !== '') content.push({ type: 'text', text: answer });
+      const content = assistantContent(reasoning, answer);
       if (!turnOpen) openTurn(time);
       push('assistant/message', time, {
         turn,
