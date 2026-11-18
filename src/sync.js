@@ -559,6 +559,7 @@ export function planAppend(messages, options = {}) {
     // turn, so record it as a continuation turn instead of dropping it.
     if (index === anchorIndex + 1 && anchorIsQuestion
       && String(message.role ?? '').toUpperCase() === 'ASSISTANT') {
+      if (!isCompleteAssistant(message)) break;
       const reasoning = fragmentText(message, THINK);
       const reply = fragmentText(message, RESPONSE);
       if (reasoning === '' && reply === '') break;
@@ -573,6 +574,7 @@ export function planAppend(messages, options = {}) {
     const answer = messages[index + 1];
     if (answer === null || answer === undefined || typeof answer !== 'object') break;
     if (String(answer.role ?? '').toUpperCase() !== 'ASSISTANT') break;
+    if (!isCompleteAssistant(answer)) break;
     const reasoning = fragmentText(answer, THINK);
     const reply = fragmentText(answer, RESPONSE);
     if (reasoning === '' && reply === '') break;

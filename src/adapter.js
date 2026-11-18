@@ -33,7 +33,7 @@
 'use strict';
 
 import { DeepSeekWebError } from './api.js';
-import { lastMessageId } from './sync.js';
+import { lastMessageId, planAppend } from './sync.js';
 
 /**
  * How long a recorded parent message stays trusted before it is re-read.
@@ -652,9 +652,17 @@ export class DeepSeekWebAdapter {
         // An imported session owns a DSH log that already contains its earlier
         // turns. Appending cannot run while the session is live, and silently
         // moving the parent past the unseen turns would lose them forever.
-        // Block this prompt; closing the session lets the append pass catch up.
+        // Only settled, appendable turns may be described as "wait for the
+        // append"; an unfinished question/reply needs a different instruction
+        // because no append can make progress on it.
         if (binding.origin === 'imported') {
-          return { ...binding, pendingImport: true, parentSyncedAt: syncedAt };
+          const planned = planAppend(history.messages, {
+            afterMessageId: binding.parentMessageId,
+          });
+          const pendingImport = planned.ok && planned.turns > 0
+            ? 'appendable'
+            : planned.reason === 'anchor-missing' ? 'anchor-missing' : 'unfinished';
+          return { ...binding, pendingImport, parentSyncedAt: syncedAt };
         }
         // A local web conversation has no import ledger; continue from the tail.
         return { ...binding, parentMessageId: latest, parentSyncedAt: syncedAt };
@@ -767,15 +775,27 @@ export class DeepSeekWebAdapter {
       }
     } else {
       binding = await this.refreshParent(binding);
-      if (binding.pendingImport === true) {
-        // Nothing was sent. The answer/new turns must be appended after the
-        // session closes; sending now would make the web side's tail the new
-        // parent and strand those turns before this prompt.
-        const error = new DeepSeekWebError(
-          'deepseek-web: 网页端有尚未追加到本会话的新轮次；请先离开并重新打开本会话，等插件完成追加后再发送',
-          'IMPORT_PENDING',
-          { submitted: false },
-        );
+      if (binding.pendingImport !== undefined) {
+        // Nothing was sent. The web side is ahead of this imported session, and
+        // only a close-time append can bring it back in sync.
+        const pending = {
+          appendable: {
+            code: 'IMPORT_PENDING',
+            message: 'deepseek-web: 网页端有尚未追加到本会话的新轮次；请先离开并重新打开本会话，等插件完成追加后再发送',
+          },
+          unfinished: {
+            code: 'IMPORT_UNFINISHED',
+            message: 'deepseek-web: 网页端还有未完成的提问或回复；请先在网页端等待其完成，再离开并重新打开本会话',
+          },
+          'anchor-missing': {
+            code: 'IMPORT_ANCHOR_MISSING',
+            message: 'deepseek-web: 网页端历史已变化，找不到上次同步的位置；请在设置页撤销导入后重新同步',
+          },
+        }[binding.pendingImport] ?? {
+          code: 'IMPORT_PENDING',
+          message: 'deepseek-web: 网页端有尚未同步的内容；请先离开并重新打开本会话',
+        };
+        const error = new DeepSeekWebError(pending.message, pending.code, { submitted: false });
         this.deps.forgetSent?.(sessionId, newest.id === null ? '' : String(newest.id));
         yield finishError(error);
         return;
