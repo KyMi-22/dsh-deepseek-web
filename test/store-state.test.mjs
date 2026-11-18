@@ -6,10 +6,10 @@
  */
 
 import assert from 'node:assert';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadState, stateFile } from '../src/store.js';
+import { loadState, StateStore, stateFile } from '../src/store.js';
 
 const previous = process.env.DSH_HOME;
 const home = await mkdtemp(join(tmpdir(), 'dsw-state-'));
@@ -36,7 +36,12 @@ try {
   assert.match(migrated.deviceId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u, 'the device id migrates to UUID v4');
   assert.deepEqual(migrated.quickAsk, {}, 'a null map becomes an empty map');
   assert.equal(migrated.lastReport, null);
-  assert.ok((await readFile(stateFile(), 'utf8')).includes('dsh-web-legacy'), 'loading does not rewrite the file');
+
+  const store = await StateStore.open();
+  await store.flush();
+  const firstId = store.state.deviceId;
+  const reopened = await StateStore.open();
+  assert.equal(reopened.state.deviceId, firstId, 'the UUID migration is persisted, not regenerated on every launch');
 } finally {
   if (previous === undefined) delete process.env.DSH_HOME;
   else process.env.DSH_HOME = previous;

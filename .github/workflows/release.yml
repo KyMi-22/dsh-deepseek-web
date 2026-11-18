@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
@@ -48,5 +50,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
-          gh release upload "$TAG" dist/*.tgz dist/*.tgz.sha256 --clobber
+          ASSET="$(basename dist/*.tgz)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A rerun for an existing release. Upload first; verification below
+            # still fails the job if the expected asset is not present.
+            gh release upload "$TAG" dist/*.tgz dist/*.tgz.sha256 --clobber
+          else
+            # Draft first: /releases/latest must never expose a version with no
+            # downloadable asset. Publish only after upload + verification.
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes
+            gh release upload "$TAG" dist/*.tgz dist/*.tgz.sha256
+          fi
+          gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$ASSET"
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
+            gh release edit "$TAG" --draft=false
+          fi

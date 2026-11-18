@@ -255,6 +255,7 @@ DSH 里打开 **设置 → DeepSeek 网页版**，把 token 粘进输入框，�
 | `hif` | `true` | 尝试获取网页端的短时效 HIF 风控 token；设 `false` 可关闭这两个额外请求 |
 | `requestGapMs` | `320` | 普通 API 请求之间的最小随机间隔；`0` 关闭节流 |
 | `locale` | 系统区域 | 发给网页端的 `x-client-locale`，例如 `zh_CN` / `en_US` |
+| `deviceModel` | 空 | 可选的 `x-device-model`；默认空字符串，和网页版默认设备模型一致 |
 | `token` | 空 | 可选的启动 token；**会写入 state.json**，一般建议用环境变量 |
 | `updateRepo` | `KyMi-22/dsh-deepseek-web` | 自更新查询的 GitHub 仓库（`owner/name`） |
 | `updateProxy` | 空 | 自更新的 HTTP 代理，例如 `http://127.0.0.1:7890` |

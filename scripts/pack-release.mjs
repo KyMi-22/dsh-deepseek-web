@@ -13,9 +13,10 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = resolve(import.meta.dirname, '..');
+const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const dist = join(root, 'dist');
 
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
@@ -23,28 +24,39 @@ if (typeof manifest.name !== 'string' || typeof manifest.version !== 'string') {
   throw new Error('package.json has no name/version');
 }
 if (/[\s/\\]/u.test(manifest.name)) throw new Error(`unsafe package name: ${manifest.name}`);
+if (!/^\d+\.\d+\.\d+$/u.test(manifest.version)) throw new Error(`unsafe package version: ${manifest.version}`);
 
 await mkdir(dist, { recursive: true });
-const npmCli = process.env.npm_execpath;
-const command = npmCli === undefined
-  ? (process.platform === 'win32' ? 'npm.cmd' : 'npm')
-  : process.execPath;
-const args = npmCli === undefined
-  ? ['pack', '--pack-destination', dist]
-  : [npmCli, 'pack', '--pack-destination', dist];
-const output = execFileSync(command, args, {
+if (process.env.npm_execpath === undefined && process.platform === 'win32') {
+  throw new Error('run this through `npm run release:pack` (Windows cannot spawn npm.cmd directly)');
+}
+const command = process.env.npm_execpath === undefined ? 'npm' : process.execPath;
+const args = process.env.npm_execpath === undefined
+  ? ['pack', '--json', '--pack-destination', dist]
+  : [process.env.npm_execpath, 'pack', '--json', '--pack-destination', dist];
+const raw = execFileSync(command, args, {
   cwd: root,
   encoding: 'utf8',
   stdio: ['ignore', 'pipe', 'inherit'],
 }).trim();
-if (output === '') throw new Error('npm pack returned no artifact name');
-
-const tarball = join(dist, output.split(/\r?\n/u).at(-1));
+let packed;
+try {
+  const parsed = JSON.parse(raw);
+  packed = Array.isArray(parsed) ? parsed[0] : parsed;
+} catch {
+  throw new Error(`npm pack did not return JSON: ${raw.slice(0, 200)}`);
+}
+const expectedName = `${manifest.name}-${manifest.version}.tgz`;
+if (typeof packed?.filename !== 'string' || basename(packed.filename) !== expectedName) {
+  throw new Error(`npm pack produced ${String(packed?.filename)}, expected ${expectedName}`);
+}
+const output = expectedName;
+const tarball = join(dist, output);
 const hash = createHash('sha256');
 for await (const chunk of createReadStream(tarball)) hash.update(chunk);
 const digest = hash.digest('hex');
 const checksum = `${tarball}.sha256`;
-await writeFile(checksum, `${digest}  ${output.split(/\r?\n/u).at(-1)}\n`, 'utf8');
+await writeFile(checksum, `${digest}  ${output}\n`, 'utf8');
 
 console.log(`packed ${output}`);
 console.log(`sha256 ${digest}`);

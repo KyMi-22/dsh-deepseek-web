@@ -79,3 +79,31 @@ jobs:
 
             console.log("manifest ok:", pkg.name, pkg.version);
           '
+
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Pack and verify the checksum
+        shell: bash
+        run: |
+          npm run release:pack
+          node -e '
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const path = require("node:path");
+            const tgz = fs.readdirSync("dist").find((name) => name.endsWith(".tgz"));
+            if (!tgz) throw new Error("no tgz was packed");
+            const hash = crypto.createHash("sha256").update(fs.readFileSync(path.join("dist", tgz))).digest("hex");
+            const side = fs.readFileSync(path.join("dist", `${tgz}.sha256`), "utf8").trim();
+            if (!side.startsWith(hash)) throw new Error("checksum sidecar does not match");
+            console.log("checksum ok:", tgz, hash);
+          '

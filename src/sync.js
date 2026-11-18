@@ -881,7 +881,10 @@ export async function attachSessions(workspace, sessionIds, warn) {
   } catch {
     /* a workspace without the projection falls back to attach calls */
   }
+  const seen = new Set();
   for (const sessionId of sessionIds) {
+    if (seen.has(String(sessionId))) continue;
+    seen.add(String(sessionId));
     if (existing.has(String(sessionId))) {
       result.attached += 1;
       continue;

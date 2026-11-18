@@ -138,6 +138,21 @@ function emptyState() {
   };
 }
 
+/** Whether the last `loadState` needed a migration that should be flushed. */
+let stateNeedsRewrite = false;
+
+/** Consume the one-shot migration flag after a store has been constructed. */
+export function takeStateRewriteFlag() {
+  const value = stateNeedsRewrite;
+  stateNeedsRewrite = false;
+  return value;
+}
+
+/** Whether one text is a UUID v4 accepted by the web client. */
+export function isDeviceId(value) {
+  return typeof value === 'string' && DEVICE_ID_RE.test(value);
+}
+
 /** Read the state document, repairing anything missing with defaults. */
 export async function loadState() {
   const file = stateFile();
@@ -155,18 +170,25 @@ export async function loadState() {
     // A corrupt state file must not silently become an empty ledger: preserve
     // it for manual recovery, then start with defaults and let the next write
     // replace it. The token and binding ledger are the two expensive losses.
-    await rename(file, `${file}.corrupt-${Date.now()}`).catch(() => {});
+    const backup = `${file}.corrupt-${Date.now()}`;
+    await rename(file, backup).then(() => chmod(backup, 0o600)).catch(() => {});
+    stateNeedsRewrite = true;
     return emptyState();
   }
   const base = emptyState();
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return base;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    stateNeedsRewrite = true;
+    return base;
+  }
   const objectMap = (value) => (value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {});
+  const deviceId = isDeviceId(parsed.deviceId) ? parsed.deviceId : base.deviceId;
+  if (deviceId !== parsed.deviceId || Number(parsed.schemaVersion) !== STATE_VERSION) stateNeedsRewrite = true;
   return {
-    schemaVersion: Number(parsed.schemaVersion) || STATE_VERSION,
+    schemaVersion: STATE_VERSION,
     token: typeof parsed.token === 'string' ? parsed.token : base.token,
     // Older builds used a `dsh-web-...` id. The web client treats a non-UUID
     // device id as an abnormal client, so migrate it once on load.
-    deviceId: typeof parsed.deviceId === 'string' && DEVICE_ID_RE.test(parsed.deviceId) ? parsed.deviceId : base.deviceId,
+    deviceId,
     bindings: objectMap(parsed.bindings),
     imported: objectMap(parsed.imported),
     workspaceId: typeof parsed.workspaceId === 'string' ? parsed.workspaceId : null,
@@ -272,7 +294,9 @@ export class StateStore {
   }
 
   static async open() {
-    return new StateStore(await loadState());
+    const store = new StateStore(await loadState());
+    if (takeStateRewriteFlag()) store.flushSoon();
+    return store;
   }
 
   /** Current token. */

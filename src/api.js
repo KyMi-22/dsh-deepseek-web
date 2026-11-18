@@ -36,8 +36,9 @@ const UPLOAD_PATH = '/api/v0/file/upload_file';
  * The web product now exposes a client version and reads two short-lived HIF
  * tokens (`x-hif-leim` / `x-hif-dliq`) on normal API traffic. Sending an old
  * version string, no User-Agent, or a non-UUID device id is a strong
- * "this is not the browser" signal, so the client keeps these values current
- * and overridable through the plugin config.
+ * "this is not the browser" signal, so the client keeps these values current.
+ * `locale` and `deviceModel` are configurable; the version/bundle/UA constants
+ * follow the supported web client.
  */
 const CLIENT_VERSION = '2.8.0';
 const CLIENT_BUNDLE_ID = 'com.deepseek.chat';
@@ -252,16 +253,21 @@ export class DeepSeekWebApi {
     // HIF is a browser-compatibility signal. Tests and callers that inject a
     // transport opt out unless they explicitly ask for it.
     this.hifEnabled = options.hif === true || (options.hif !== false && options.fetchImpl === undefined);
-    /** @type {{ leim: string, dliq: string, expiresAt: number, retryAt: number, pending: Promise<void> | null }} */
-    this.hif = { leim: '', dliq: '', expiresAt: 0, retryAt: 0, pending: null };
+    /** @type {{ leim: string, dliq: string, leimAt: number, dliqAt: number, leimRetryAt: number, dliqRetryAt: number, pending: Promise<void> | null }} */
+    this.hif = { leim: '', dliq: '', leimAt: 0, dliqAt: 0, leimRetryAt: 0, dliqRetryAt: 0, pending: null };
     this.requestGapMs = Number.isFinite(options.requestGapMs) ? Math.max(0, Number(options.requestGapMs)) : MIN_REQUEST_GAP_MS;
     this.nextRequestAt = 0;
     this.rateLimitSeconds = 0;
+    /** Set after a 401/403 so the settings page can say "expired", not "configured". */
+    this.authRejected = false;
   }
 
   /** @param {{ token?: string, deviceId?: string, deviceModel?: string, locale?: string, baseUrl?: string }} next */
   configure(next) {
-    if (next.token !== undefined) this.token = next.token.trim();
+    if (next.token !== undefined) {
+      this.token = next.token.trim();
+      this.authRejected = false;
+    }
     if (next.deviceId !== undefined) this.deviceId = next.deviceId;
     if (next.deviceModel !== undefined) this.deviceModel = next.deviceModel;
     if (next.locale !== undefined) this.locale = next.locale;
@@ -317,13 +323,14 @@ export class DeepSeekWebApi {
   async ensureHif() {
     if (!this.hifEnabled) return;
     const now = Date.now();
-    if (this.hif.expiresAt > now && (this.hif.leim !== '' || this.hif.dliq !== '')) return;
-    if (this.hif.retryAt > now) return;
+    const due = Object.keys(HIF_ENDPOINTS).filter((key) => (
+      this.hif[`${key}At`] <= now && this.hif[`${key}RetryAt`] <= now
+    ));
+    if (due.length === 0) return;
     if (this.hif.pending !== null) return this.hif.pending;
     const refresh = (async () => {
-      const entries = Object.entries(HIF_ENDPOINTS);
-      const results = await Promise.allSettled(entries.map(async ([key, url]) => {
-        const response = await this.fetchImpl(url, {
+      const results = await Promise.allSettled(due.map(async (key) => {
+        const response = await this.fetchImpl(HIF_ENDPOINTS[key], {
           headers: this.browserHeaders(),
           signal: withDeadline(undefined, 8_000),
         });
@@ -336,22 +343,20 @@ export class DeepSeekWebApi {
         return { key, value, ttl: Math.min(ttl, HIF_MAX_TTL_MS) };
       }));
       let refreshed = false;
-      let shortestTtl = HIF_MAX_TTL_MS;
-      results.forEach((result) => {
-        if (result.status !== 'fulfilled') return;
-        refreshed = true;
-        shortestTtl = Math.min(shortestTtl, result.value.ttl);
-        this.hif[result.value.key] = result.value.value;
+      results.forEach((result, index) => {
+        const key = due[index];
+        if (result.status === 'fulfilled') {
+          refreshed = true;
+          this.hif[key] = result.value.value;
+          this.hif[`${key}At`] = Date.now() + result.value.ttl;
+          this.hif[`${key}RetryAt`] = 0;
+        } else {
+          this.hif[`${key}RetryAt`] = Date.now() + HIF_RETRY_MS;
+        }
       });
-      if (refreshed) {
-        this.hif.expiresAt = Date.now() + shortestTtl;
-        this.hif.retryAt = 0;
-      } else {
-        this.hif.retryAt = Date.now() + HIF_RETRY_MS;
-        warnOnce('deepseek-web: HIF risk-control tokens are unavailable; continuing without them');
-      }
+      if (!refreshed) warnOnce('deepseek-web: HIF risk-control tokens are unavailable; continuing without them');
     })().catch(() => {
-      this.hif.retryAt = Date.now() + HIF_RETRY_MS;
+      for (const key of due) this.hif[`${key}RetryAt`] = Date.now() + HIF_RETRY_MS;
     }).finally(() => {
       this.hif.pending = null;
     });
@@ -383,7 +388,7 @@ export class DeepSeekWebApi {
 
   /** Read pacing headers from one response. */
   noteRateHeaders(response) {
-    const raw = response.headers?.get?.('x-fetch-after-sec') ?? response.headers?.get?.('retry-after');
+    const raw = response.headers?.get?.('x-fetch-after-sec') || response.headers?.get?.('retry-after');
     const seconds = Number(raw);
     if (!Number.isFinite(seconds) || seconds <= 0) return;
     this.rateLimitSeconds = Math.max(this.rateLimitSeconds, seconds);
@@ -431,18 +436,11 @@ export class DeepSeekWebApi {
     this.noteRateHeaders(response);
     const challenge = this.challengeFailure(response);
     if (challenge !== null) throw challenge;
-    const text = await response.text();
-    let json;
-    try {
-      json = text === '' ? {} : JSON.parse(text);
-    } catch (error) {
-      throw new DeepSeekWebError(
-        `deepseek-web: ${path} returned non-JSON (HTTP ${response.status})`,
-        response.status === 401 || response.status === 403 ? 'UNAUTHORIZED' : 'TRANSPORT',
-        { status: response.status, cause: error },
-      );
-    }
+    // Status comes before body parsing: a WAF/nginx 429 or 403 page is often
+    // HTML, and parsing it as JSON would misclassify it as a retryable
+    // TRANSPORT failure.
     if (response.status === 401 || response.status === 403) {
+      this.authRejected = true;
       throw new DeepSeekWebError(`deepseek-web: ${path} rejected the token (HTTP ${response.status})`, 'UNAUTHORIZED', {
         status: response.status,
       });
@@ -454,12 +452,25 @@ export class DeepSeekWebApi {
         { status: 429, submitted: false },
       );
     }
+    const text = await response.text();
+    let json;
+    try {
+      json = text === '' ? {} : JSON.parse(text);
+    } catch (error) {
+      throw new DeepSeekWebError(
+        `deepseek-web: ${path} returned non-JSON (HTTP ${response.status})`,
+        'TRANSPORT',
+        { status: response.status, cause: error },
+      );
+    }
     if (!response.ok) {
       throw new DeepSeekWebError(`deepseek-web: ${path} failed (HTTP ${response.status})`, 'TRANSPORT', {
         status: response.status,
       });
     }
-    return unwrap(json, path);
+    const data = unwrap(json, path);
+    this.authRejected = false;
+    return data;
   }
 
   /** The signed-in account. Confirms the token before anything else is attempted. */
@@ -695,6 +706,7 @@ export class DeepSeekWebApi {
     const challenge = this.challengeFailure(response);
     if (challenge !== null) throw challenge;
     if (!response.ok) {
+      if (response.status === 401 || response.status === 403) this.authRejected = true;
       if (response.status === 429) {
         throw new DeepSeekWebError('deepseek-web: file upload was rate limited (HTTP 429)', 'RATE_LIMITED', {
           status: 429,
@@ -713,6 +725,7 @@ export class DeepSeekWebApi {
     } catch (error) {
       throw new DeepSeekWebError('deepseek-web: file upload returned non-JSON', 'MALFORMED', { cause: error });
     }
+    this.authRejected = false;
     if (json?.code !== 0 || json?.data?.biz_code !== 0) {
       throw new DeepSeekWebError(
         `deepseek-web: file upload rejected (${json?.data?.biz_msg || json?.msg || 'unknown'})`,
@@ -899,6 +912,7 @@ export class DeepSeekWebApi {
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
+      if (response.status === 401 || response.status === 403) this.authRejected = true;
       if (response.status === 429) {
         throw new DeepSeekWebError(
           `deepseek-web: completion was rate limited (HTTP 429); wait before retrying`,
@@ -916,9 +930,19 @@ export class DeepSeekWebApi {
         { status: response.status, submitted: true },
       );
     }
+    const contentType = String(response.headers?.get?.('content-type') ?? '');
+    if (contentType !== '' && !contentType.toLowerCase().includes('text/event-stream')) {
+      const text = await response.text().catch(() => '');
+      throw new DeepSeekWebError(
+        `deepseek-web: completion returned ${contentType}, not an SSE stream${text.includes('<html') ? ' (likely a challenge page)' : ''}`,
+        text.includes('<html') || /captcha|challenge|verify/i.test(text) ? 'CHALLENGE_REQUIRED' : 'TRANSPORT',
+        { status: response.status, submitted: false },
+      );
+    }
     if (response.body === null) {
       throw new DeepSeekWebError('deepseek-web: completion returned no body', 'EMPTY_RESPONSE', { submitted: true });
     }
+    this.authRejected = false;
 
     let currentPath = '';
     /**

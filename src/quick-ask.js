@@ -305,6 +305,7 @@ export class QuickAsk {
           // Keep the ledger row (so the empty/partial thread is never imported)
           // but do not claim a background was sent.
           thread.contextSent = '';
+          thread.primerFailed = true;
           thread.updatedAt = Date.now();
           await this.store.flush().catch(() => {});
           throw error;
@@ -352,8 +353,14 @@ export class QuickAsk {
       return await this.ensureThread(sessionId);
     } catch (error) {
       // A failed refresh must not throw away the transcript the user still
-      // has. The half-created web conversation is left on the web product.
-      if (previous !== undefined) {
+      // has. If ensureThread recorded a new row before failing, keep that row
+      // (and its import-exclusion id) rather than orphaning its web session;
+      // otherwise restore the previous thread.
+      const created = this.threadOf(sessionId);
+      if (created !== undefined && created !== previous) {
+        created.primerFailed = true;
+        await this.store.flush().catch(() => {});
+      } else if (previous !== undefined) {
         this.store.state.quickAsk[sessionId] = previous;
         await this.store.flush().catch(() => {});
       }
@@ -500,6 +507,12 @@ export class QuickAsk {
         // parent marker untouched so a retry does not fork the thread, and
         // report the failure to the panel.
         yield { kind: 'error', message: String(error?.message ?? error) };
+        return;
+      }
+      if (options.signal?.aborted === true) {
+        // `readSse` returns normally when a signal is already aborted; do not
+        // record a truncated answer or advance the parent in that case.
+        yield { kind: 'error', message: '已停止生成' };
         return;
       }
       thread.parentMessageId = parentId;

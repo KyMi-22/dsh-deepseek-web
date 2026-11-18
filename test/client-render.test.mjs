@@ -114,6 +114,12 @@ const fakeCtx = {
     register() { return () => {}; },
     bind() { return (key) => key; },
   },
+  /** Cordis-style optional service injection: run only when every name is present. */
+  inject(names, callback) {
+    if (!Array.isArray(names) || !names.every((name) => this[name] !== undefined)) return () => {};
+    const result = callback(this);
+    return typeof result === 'function' ? result : () => {};
+  },
   effect() { return () => {}; },
 };
 

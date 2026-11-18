@@ -1861,25 +1861,12 @@ window.__ModuleLoader__.load({
 
       // ── quick-ask panel ─────────────────────────────────────────────────────
       // Tab type + body through the public two-stage path (the same one
-      // document preview uses). Services beyond slots/locale are optional: a
-      // composition without the right sidebar leaves the entry button off
-      // instead of breaking the settings page.
-      const sidebarRight = (() => {
-        try {
-          return ctx.sidebarRight;
-        } catch {
-          return undefined;
-        }
-      })();
-      const sidebarRightTabs = (() => {
-        try {
-          return ctx.sidebarRightTabs;
-        } catch {
-          return undefined;
-        }
-      })();
-
-      if (sidebarRightTabs !== undefined && sidebarRight !== undefined) {
+      // document preview uses). The sidebar services are optional at the
+      // bundle level, but reading them without declaring them is an error in
+      // Cordis: `ctx.inject` waits for both and gives a scoped context.
+      ctx.inject(['sidebarRightTabs', 'sidebarRight'], (scope) => {
+        const sidebarRightTabs = scope.sidebarRightTabs;
+        const sidebarRight = scope.sidebarRight;
         injectQuickAskStyles();
         const QA_TAB_ID = 'dsh-deepseek-web/quick-ask';
         const QA_TAB_KIND = 'deepseek-web-quick-ask';
@@ -1921,7 +1908,7 @@ window.__ModuleLoader__.load({
             onClick: open,
           }, h(QuickAskIcon));
         }));
-      }
+      });
     }
 
     /** Locale lookup for components outside the settings page (no hook state). */

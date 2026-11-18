@@ -982,7 +982,7 @@ export class DeepSeekWebAdapter {
         }
         if (event.kind === 'status') {
           const status = String(event.status ?? '');
-          if (/FAILED|ERROR|CANCEL|ABORT/u.test(status)) {
+          if (/FAILED|ERROR|CANCEL|ABORT|TIMEOUT|INCOMPLETE|CONTENT_FILTER|CONTEXT_LENGTH_EXCEEDED/u.test(status)) {
             remoteFailure = new DeepSeekWebError(
               `deepseek-web: the web product ended the reply with status ${status || 'unknown'}`,
               'REMOTE_FAILED',

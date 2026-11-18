@@ -188,6 +188,7 @@ export async function apply(ctx, config = {}) {
     deviceId: store.state.deviceId,
     baseUrl,
     locale: typeof config.locale === 'string' && config.locale.trim() !== '' ? config.locale.trim() : undefined,
+    deviceModel: typeof config.deviceModel === 'string' ? config.deviceModel : undefined,
     hif: config.hif !== false,
     requestGapMs: Number.isFinite(Number(config.requestGapMs)) ? Number(config.requestGapMs) : undefined,
   });
@@ -1192,6 +1193,10 @@ export async function apply(ctx, config = {}) {
                 token,
                 deviceId: store.state.deviceId,
                 baseUrl,
+                locale: typeof config.locale === 'string' && config.locale.trim() !== '' ? config.locale.trim() : undefined,
+                deviceModel: typeof config.deviceModel === 'string' ? config.deviceModel : undefined,
+                hif: config.hif !== false,
+                requestGapMs: Number.isFinite(Number(config.requestGapMs)) ? Number(config.requestGapMs) : undefined,
               });
               let account = null;
               try {
@@ -1301,6 +1306,7 @@ export async function apply(ctx, config = {}) {
                   chat = await api.chatStatus();
                 } catch {
                   /* account status is diagnostic; a token check still succeeded */
+                  api.authRejected = false;
                 }
                 sendJson(res, 200, {
                   ok: true,

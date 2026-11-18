@@ -110,6 +110,47 @@ const DEVICE = '11111111-1111-4111-8111-111111111111';
   );
 }
 
+// ── a 429 is rate-limited even when the body is HTML ──────────────────────
+{
+  const api = new DeepSeekWebApi({
+    token: 'fake-token',
+    deviceId: DEVICE,
+    requestGapMs: 0,
+    hif: false,
+    fetchImpl: async () => reply(429, '<html>Too Many Requests</html>'),
+  });
+  await assert.rejects(
+    () => api.currentUser(),
+    (error) => {
+      assert.equal(error.code, 'RATE_LIMITED');
+      assert.equal(error.submitted, false);
+      return true;
+    },
+  );
+}
+
+// ── authRejected tracks 401 and is cleared by a new token ────────────────
+{
+  let authorized = false;
+  const api = new DeepSeekWebApi({
+    token: 'old',
+    deviceId: DEVICE,
+    requestGapMs: 0,
+    hif: false,
+    fetchImpl: async () => authorized
+      ? reply(200, { code: 0, data: { biz_code: 0, biz_data: {} } })
+      : reply(401, { code: 401001 }),
+  });
+  await assert.rejects(() => api.currentUser(), (error) => error.code === 'UNAUTHORIZED');
+  assert.equal(api.authRejected, true);
+  authorized = true;
+  await api.currentUser();
+  assert.equal(api.authRejected, false, 'a successful call clears the rejection');
+  api.authRejected = true;
+  api.configure({ token: 'new' });
+  assert.equal(api.authRejected, false, 'saving a new token clears the rejection');
+}
+
 // ── an explicit hif:false makes no HIF calls ──────────────────────────────
 {
   const calls = [];
