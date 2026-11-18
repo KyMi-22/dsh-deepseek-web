@@ -5,7 +5,11 @@
  */
 
 import assert from 'node:assert';
-import { compareVersions, latestRelease, parseVersion } from '../src/update.js';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { compareVersions, downloadRelease, latestRelease, parseVersion } from '../src/update.js';
 
 // ── versions ───────────────────────────────────────────────────────────────
 {
@@ -72,6 +76,81 @@ import { compareVersions, latestRelease, parseVersion } from '../src/update.js';
     () => latestRelease({ fetchImpl: async () => ({ ok: true, text: async () => '<html>' }) }),
     /not JSON/u,
   );
+}
+
+// ── downloadRelease: digest, size, host and path guards ───────────────────
+{
+  const dir = await mkdtemp(join(tmpdir(), 'dsw-update-'));
+  try {
+    const payload = Buffer.from('fake tgz bytes');
+    const digest = createHash('sha256').update(payload).digest('hex');
+    const asset = {
+      name: 'dsh-deepseek-web-0.6.1.tgz',
+      url: 'https://github.com/KyMi-22/dsh-deepseek-web/releases/download/v0.6.1/dsh-deepseek-web-0.6.1.tgz',
+      size: payload.length,
+      digest: `sha256:${digest}`,
+    };
+    const downloaded = await downloadRelease(asset, {
+      dir,
+      fetchImpl: async () => new Response(payload, {
+        status: 200,
+        headers: { 'content-length': String(payload.length) },
+      }),
+    });
+    assert.equal(downloaded.bytes, payload.length);
+    assert.equal(downloaded.sha256, digest);
+    assert.deepEqual(await readFile(downloaded.path), payload);
+
+    await assert.rejects(
+      () => downloadRelease({ ...asset, digest: '' }, {
+        dir,
+        fetchImpl: async () => new Response(payload, { status: 200 }),
+      }),
+      /no sha256 digest/u,
+      'an unsigned asset is refused',
+    );
+    await assert.rejects(
+      () => downloadRelease({ ...asset, name: '../../evil.tgz' }, { dir }),
+      /safe tgz basename|escape/u,
+      'a traversal-shaped asset name is refused',
+    );
+    await assert.rejects(
+      () => downloadRelease({ ...asset, url: 'https://evil.example/x.tgz' }, { dir }),
+      /allowed GitHub host/u,
+      'an arbitrary host is refused',
+    );
+    await assert.rejects(
+      () => downloadRelease({ ...asset, size: payload.length + 1 }, {
+        dir,
+        fetchImpl: async () => new Response(payload, { status: 200 }),
+      }),
+      /size mismatch/u,
+      'the declared size is checked',
+    );
+    await assert.rejects(
+      () => downloadRelease({ ...asset, digest: `sha256:${'0'.repeat(64)}` }, {
+        dir,
+        fetchImpl: async () => new Response(payload, { status: 200 }),
+      }),
+      /digest mismatch/u,
+      'the digest is checked',
+    );
+    await assert.rejects(
+      () => downloadRelease({ ...asset }, {
+        dir,
+        fetchImpl: async () => new Response(payload, {
+          status: 200,
+          headers: { 'content-length': '999999999' },
+        }),
+      }),
+      /too large/u,
+      'an oversized declared body is refused',
+    );
+    const leftovers = await stat(join(dir, `${asset.name}.part`)).catch(() => null);
+    assert.equal(leftovers, null, 'no .part file is left behind');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 console.log('update.test.mjs: all assertions passed');
