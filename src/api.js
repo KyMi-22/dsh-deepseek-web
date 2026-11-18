@@ -258,6 +258,8 @@ export class DeepSeekWebApi {
     this.requestGapMs = Number.isFinite(options.requestGapMs) ? Math.max(0, Number(options.requestGapMs)) : MIN_REQUEST_GAP_MS;
     this.nextRequestAt = 0;
     this.rateLimitSeconds = 0;
+    /** When a healthy `chat/status` response asked to be polled again. */
+    this.statusPollAfter = 0;
     /** Set after a 401/403 so the settings page can say "expired", not "configured". */
     this.authRejected = false;
   }
@@ -387,12 +389,19 @@ export class DeepSeekWebApi {
   }
 
   /** Read pacing headers from one response. */
-  noteRateHeaders(response) {
+  noteRateHeaders(response, path = '') {
     const raw = response.headers?.get?.('x-fetch-after-sec') || response.headers?.get?.('retry-after');
     const seconds = Number(raw);
     if (!Number.isFinite(seconds) || seconds <= 0) return;
-    this.rateLimitSeconds = Math.max(this.rateLimitSeconds, seconds);
-    this.nextRequestAt = Math.max(this.nextRequestAt, Date.now() + seconds * 1000);
+    const hard = response.status === 429 || response.status === 503;
+    if (path === '/api/v0/chat/status' && !hard) {
+      // On a healthy status response this is "poll again in N seconds", not a
+      // global rate limit. Honoring 120s here would block the next sync.
+      this.statusPollAfter = Date.now() + seconds * 1000;
+      return;
+    }
+    this.rateLimitSeconds = hard ? seconds : Math.min(seconds, 5);
+    this.nextRequestAt = Math.max(this.nextRequestAt, Date.now() + this.rateLimitSeconds * 1000);
   }
 
   /** Turn a WAF/captcha/challenge response into a typed, actionable failure. */
@@ -433,7 +442,7 @@ export class DeepSeekWebApi {
     };
     if (body !== undefined) init.body = JSON.stringify(body);
     const response = await this.fetchImpl(url.toString(), init);
-    this.noteRateHeaders(response);
+    this.noteRateHeaders(response, path);
     const challenge = this.challengeFailure(response);
     if (challenge !== null) throw challenge;
     // Status comes before body parsing: a WAF/nginx 429 or 403 page is often
@@ -702,7 +711,7 @@ export class DeepSeekWebApi {
     }
 
     const text = await response.text();
-    this.noteRateHeaders(response);
+    this.noteRateHeaders(response, UPLOAD_PATH);
     const challenge = this.challengeFailure(response);
     if (challenge !== null) throw challenge;
     if (!response.ok) {
@@ -906,7 +915,7 @@ export class DeepSeekWebApi {
       throw error;
     }
 
-    this.noteRateHeaders(response);
+    this.noteRateHeaders(response, COMPLETION_PATH);
     const challenge = this.challengeFailure(response);
     if (challenge !== null) throw challenge;
 
