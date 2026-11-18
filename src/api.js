@@ -19,6 +19,7 @@
  */
 'use strict';
 
+import { randomUUID } from 'node:crypto';
 import { solvePowOffThread } from './pow-async.js';
 import { powResponseHeader } from './pow.js';
 
@@ -28,6 +29,58 @@ export const DEFAULT_BASE_URL = 'https://chat.deepseek.com';
 const COMPLETION_PATH = '/api/v0/chat/completion';
 /** Endpoint images are uploaded to; the challenge is minted for this path separately. */
 const UPLOAD_PATH = '/api/v0/file/upload_file';
+
+/**
+ * Browser-shape constants.
+ *
+ * The web product now exposes a client version and reads two short-lived HIF
+ * tokens (`x-hif-leim` / `x-hif-dliq`) on normal API traffic. Sending an old
+ * version string, no User-Agent, or a non-UUID device id is a strong
+ * "this is not the browser" signal, so the client keeps these values current
+ * and overridable through the plugin config.
+ */
+const CLIENT_VERSION = '2.8.0';
+const CLIENT_BUNDLE_ID = 'com.deepseek.chat';
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+/** Small, jittered gap between ordinary API calls. */
+const MIN_REQUEST_GAP_MS = 320;
+/** HIF tokens are short-lived; never trust one longer than this. */
+const HIF_MAX_TTL_MS = 10 * 60_000;
+/** If a HIF refresh fails, retry after this long without blocking requests. */
+const HIF_RETRY_MS = 60_000;
+const HIF_ENDPOINTS = Object.freeze({
+  leim: 'https://hif-leim.deepseek.com/query',
+  dliq: 'https://hif-dliq.deepseek.com/query',
+});
+
+/** Sleep without an unref'd timer (the caller is waiting for it). */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/** Locale text the web client sends (`zh_CN`, not `zh-CN`). */
+function clientLocale() {
+  try {
+    const locale = Intl.DateTimeFormat().resolvedOptions().locale || 'en-US';
+    return locale.replace('-', '_');
+  } catch {
+    return 'en_US';
+  }
+}
+
+/** Normalize a configured locale to the web client's underscore form. */
+function normalizeLocale(value) {
+  return String(value).trim().replace('-', '_') || 'en_US';
+}
+
+/** Seconds east of UTC; the browser's `getTimezoneOffset` is the inverse. */
+function timezoneOffsetSeconds() {
+  try {
+    return -new Date().getTimezoneOffset() * 60;
+  } catch {
+    return 0;
+  }
+}
 
 /**
  * Request deadlines.
@@ -189,14 +242,29 @@ export class DeepSeekWebApi {
   constructor(options = {}) {
     this.token = (options.token ?? '').trim();
     this.baseUrl = normalizeBaseUrl(options.baseUrl);
-    this.deviceId = options.deviceId ?? 'dsh-deepseek-web';
+    this.deviceId = options.deviceId ?? randomUUID();
+    this.deviceModel = typeof options.deviceModel === 'string' ? options.deviceModel : '';
+    this.locale = typeof options.locale === 'string' && options.locale !== ''
+      ? normalizeLocale(options.locale)
+      : clientLocale();
+    this.userAgent = typeof options.userAgent === 'string' && options.userAgent !== '' ? options.userAgent : BROWSER_UA;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    // HIF is a browser-compatibility signal. Tests and callers that inject a
+    // transport opt out unless they explicitly ask for it.
+    this.hifEnabled = options.hif === true || (options.hif !== false && options.fetchImpl === undefined);
+    /** @type {{ leim: string, dliq: string, expiresAt: number, retryAt: number, pending: Promise<void> | null }} */
+    this.hif = { leim: '', dliq: '', expiresAt: 0, retryAt: 0, pending: null };
+    this.requestGapMs = Number.isFinite(options.requestGapMs) ? Math.max(0, Number(options.requestGapMs)) : MIN_REQUEST_GAP_MS;
+    this.nextRequestAt = 0;
+    this.rateLimitSeconds = 0;
   }
 
-  /** @param {{ token?: string, deviceId?: string, baseUrl?: string }} next */
+  /** @param {{ token?: string, deviceId?: string, deviceModel?: string, locale?: string, baseUrl?: string }} next */
   configure(next) {
     if (next.token !== undefined) this.token = next.token.trim();
     if (next.deviceId !== undefined) this.deviceId = next.deviceId;
+    if (next.deviceModel !== undefined) this.deviceModel = next.deviceModel;
+    if (next.locale !== undefined) this.locale = next.locale;
     if (next.baseUrl !== undefined) this.baseUrl = normalizeBaseUrl(next.baseUrl);
   }
 
@@ -205,21 +273,133 @@ export class DeepSeekWebApi {
     return this.token.length > 0;
   }
 
-  /** Headers common to every call. */
-  headers(extra = {}) {
+  /** Browser-like headers shared by API and HIF calls (no auth). */
+  browserHeaders() {
     return {
       Accept: 'application/json',
-      Authorization: `Bearer ${this.token}`,
-      'x-client-bundle-id': 'com.deepseek.chat-web-prod',
+      'User-Agent': this.userAgent,
+      'Accept-Language': `${this.locale.replace('_', '-')},${this.locale.startsWith('zh') ? 'zh;q=0.9,en;q=0.8' : 'en;q=0.9,zh;q=0.8'}`,
+      'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'x-client-bundle-id': CLIENT_BUNDLE_ID,
       'x-client-platform': 'web',
-      'x-client-version': '20241120',
-      'x-client-locale': 'en_US',
-      'x-client-timezone-offset': '0',
+      'x-client-version': CLIENT_VERSION,
+      'x-client-locale': this.locale,
+      'x-client-timezone-offset': String(timezoneOffsetSeconds()),
       'x-device-id': this.deviceId,
+      'x-device-model': this.deviceModel,
       Origin: this.baseUrl,
       Referer: `${this.baseUrl}/`,
+    };
+  }
+
+  /** Headers common to every authenticated call. */
+  headers(extra = {}) {
+    return {
+      ...this.browserHeaders(),
+      Authorization: `Bearer ${this.token}`,
+      ...(this.hif.leim !== '' ? { 'x-hif-leim': this.hif.leim } : {}),
+      ...(this.hif.dliq !== '' ? { 'x-hif-dliq': this.hif.dliq } : {}),
       ...extra,
     };
+  }
+
+  /**
+   * Refresh the short-lived HIF tokens if they are due.
+   *
+   * The query endpoints are unauthenticated and return a token plus an
+   * `x-hif-ttl` header. They are risk-control signals, not user data; failure is
+   * non-fatal and must never block a request. One endpoint being unreachable
+   * keeps the other token; the DNS for `hif-dliq` is intermittent on some
+   * networks, so both are attempted independently.
+   */
+  async ensureHif() {
+    if (!this.hifEnabled) return;
+    const now = Date.now();
+    if (this.hif.expiresAt > now && (this.hif.leim !== '' || this.hif.dliq !== '')) return;
+    if (this.hif.retryAt > now) return;
+    if (this.hif.pending !== null) return this.hif.pending;
+    const refresh = (async () => {
+      const entries = Object.entries(HIF_ENDPOINTS);
+      const results = await Promise.allSettled(entries.map(async ([key, url]) => {
+        const response = await this.fetchImpl(url, {
+          headers: this.browserHeaders(),
+          signal: withDeadline(undefined, 8_000),
+        });
+        if (!response.ok) throw new Error(`${key} HIF answered HTTP ${response.status}`);
+        const json = await response.json();
+        const value = json?.data?.biz_data?.value;
+        if (typeof value !== 'string' || value === '') throw new Error(`${key} HIF returned no value`);
+        const ttlSeconds = Number(response.headers?.get?.('x-hif-ttl') ?? 0);
+        const ttl = Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? ttlSeconds * 1000 : HIF_MAX_TTL_MS;
+        return { key, value, ttl: Math.min(ttl, HIF_MAX_TTL_MS) };
+      }));
+      let refreshed = false;
+      let shortestTtl = HIF_MAX_TTL_MS;
+      results.forEach((result) => {
+        if (result.status !== 'fulfilled') return;
+        refreshed = true;
+        shortestTtl = Math.min(shortestTtl, result.value.ttl);
+        this.hif[result.value.key] = result.value.value;
+      });
+      if (refreshed) {
+        this.hif.expiresAt = Date.now() + shortestTtl;
+        this.hif.retryAt = 0;
+      } else {
+        this.hif.retryAt = Date.now() + HIF_RETRY_MS;
+        warnOnce('deepseek-web: HIF risk-control tokens are unavailable; continuing without them');
+      }
+    })().catch(() => {
+      this.hif.retryAt = Date.now() + HIF_RETRY_MS;
+    }).finally(() => {
+      this.hif.pending = null;
+    });
+    this.hif.pending = refresh;
+    return refresh;
+  }
+
+  /**
+   * Respect server pacing hints and keep a small gap between ordinary calls.
+   *
+   * A burst of list/history requests from one process is a machine signature.
+   * `x-fetch-after-sec` / `retry-after` are honored; a large wait becomes a
+   * typed RATE_LIMITED error instead of an unbounded silent wait.
+   */
+  async reserveRequest() {
+    const now = Date.now();
+    if (this.rateLimitSeconds > 0 && this.nextRequestAt > now && this.rateLimitSeconds > 10) {
+      throw new DeepSeekWebError(
+        `deepseek-web: the web product asked for a ${this.rateLimitSeconds}s pause; try again later`,
+        'RATE_LIMITED',
+        { status: 429, submitted: false },
+      );
+    }
+    if (this.nextRequestAt <= now) this.rateLimitSeconds = 0;
+    const start = Math.max(now, this.nextRequestAt);
+    this.nextRequestAt = start + this.requestGapMs + Math.floor(Math.random() * 80);
+    if (start > now) await sleep(start - now);
+  }
+
+  /** Read pacing headers from one response. */
+  noteRateHeaders(response) {
+    const raw = response.headers?.get?.('x-fetch-after-sec') ?? response.headers?.get?.('retry-after');
+    const seconds = Number(raw);
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    this.rateLimitSeconds = Math.max(this.rateLimitSeconds, seconds);
+    this.nextRequestAt = Math.max(this.nextRequestAt, Date.now() + seconds * 1000);
+  }
+
+  /** Turn a WAF/captcha/challenge response into a typed, actionable failure. */
+  challengeFailure(response) {
+    const waf = response.headers?.get?.('x-amzn-waf-action');
+    const mitigated = response.headers?.get?.('cf-mitigated');
+    if (waf !== 'captcha' && waf !== 'challenge' && mitigated !== 'challenge') return null;
+    return new DeepSeekWebError(
+      'deepseek-web: 网页端要求人机验证（captcha/challenge）。请用浏览器打开 chat.deepseek.com 完成验证后重试；插件不会自动绕过验证',
+      'CHALLENGE_REQUIRED',
+      { status: response.status, submitted: false },
+    );
   }
 
   /**
@@ -232,6 +412,8 @@ export class DeepSeekWebApi {
       throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL');
     }
     const { method = 'GET', query, body, signal } = options;
+    await this.ensureHif();
+    await this.reserveRequest();
     const url = new URL(path, this.baseUrl);
     if (query !== undefined) {
       for (const [key, value] of Object.entries(query)) {
@@ -246,6 +428,9 @@ export class DeepSeekWebApi {
     };
     if (body !== undefined) init.body = JSON.stringify(body);
     const response = await this.fetchImpl(url.toString(), init);
+    this.noteRateHeaders(response);
+    const challenge = this.challengeFailure(response);
+    if (challenge !== null) throw challenge;
     const text = await response.text();
     let json;
     try {
@@ -262,6 +447,13 @@ export class DeepSeekWebApi {
         status: response.status,
       });
     }
+    if (response.status === 429) {
+      throw new DeepSeekWebError(
+        `deepseek-web: ${path} was rate limited (HTTP 429); wait before retrying`,
+        'RATE_LIMITED',
+        { status: 429, submitted: false },
+      );
+    }
     if (!response.ok) {
       throw new DeepSeekWebError(`deepseek-web: ${path} failed (HTTP ${response.status})`, 'TRANSPORT', {
         status: response.status,
@@ -273,6 +465,23 @@ export class DeepSeekWebApi {
   /** The signed-in account. Confirms the token before anything else is attempted. */
   currentUser() {
     return this.request('/api/v0/users/current');
+  }
+
+  /**
+   * Read-only account/chat status: mute state and the server's pacing hint.
+   *
+   * Used by the manual credential check, so the settings page can distinguish
+   * "token invalid" from "account muted / temporarily restricted".
+   *
+   * @returns {Promise<{ isMuted: boolean, muteUntil: string | null, message: string | null }>}
+   */
+  async chatStatus() {
+    const data = await this.request('/api/v0/chat/status');
+    return {
+      isMuted: Number(data?.is_muted) > 0,
+      muteUntil: typeof data?.mute_until === 'string' ? data.mute_until : null,
+      message: typeof data?.msg === 'string' ? data.msg : null,
+    };
   }
 
   /**
@@ -450,6 +659,8 @@ export class DeepSeekWebApi {
     if (!this.ready) {
       throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL', { submitted: false });
     }
+    await this.ensureHif();
+    await this.reserveRequest();
     const { bytes, mediaType, fileName, modelType = 'file', thinking = false, signal } = request;
 
     const powHeader = await this.solveChallenge(UPLOAD_PATH, { signal }).catch((error) => {
@@ -480,7 +691,16 @@ export class DeepSeekWebApi {
     }
 
     const text = await response.text();
+    this.noteRateHeaders(response);
+    const challenge = this.challengeFailure(response);
+    if (challenge !== null) throw challenge;
     if (!response.ok) {
+      if (response.status === 429) {
+        throw new DeepSeekWebError('deepseek-web: file upload was rate limited (HTTP 429)', 'RATE_LIMITED', {
+          status: 429,
+          submitted: false,
+        });
+      }
       throw new DeepSeekWebError(
         `deepseek-web: file upload failed (HTTP ${response.status})`,
         response.status === 401 || response.status === 403 ? 'UNAUTHORIZED' : 'TRANSPORT',
@@ -619,6 +839,7 @@ export class DeepSeekWebApi {
     if (!this.ready) {
       throw new DeepSeekWebError('deepseek-web: no token configured', 'MISSING_CREDENTIAL', { submitted: false });
     }
+    await this.ensureHif();
     const { chatSessionId, prompt, parentMessageId = null, thinking = false, search = false, signal } = request;
     // Everything up to the POST can fail without the model ever seeing the prompt,
     // so those errors are marked `submitted: false` and the adapter may retry.
@@ -646,6 +867,8 @@ export class DeepSeekWebApi {
       preempt: false,
     };
 
+    await this.reserveRequest();
+
     let response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}${COMPLETION_PATH}`, {
@@ -670,8 +893,19 @@ export class DeepSeekWebApi {
       throw error;
     }
 
+    this.noteRateHeaders(response);
+    const challenge = this.challengeFailure(response);
+    if (challenge !== null) throw challenge;
+
     if (!response.ok) {
       const text = await response.text().catch(() => '');
+      if (response.status === 429) {
+        throw new DeepSeekWebError(
+          `deepseek-web: completion was rate limited (HTTP 429); wait before retrying`,
+          'RATE_LIMITED',
+          { status: 429, submitted: false },
+        );
+      }
       let code = 'TRANSPORT';
       if (text.includes('MISSING_HEADER')) code = 'POW_REQUIRED';
       else if (response.status === 401 || response.status === 403) code = 'UNAUTHORIZED';

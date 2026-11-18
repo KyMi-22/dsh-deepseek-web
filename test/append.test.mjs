@@ -429,6 +429,37 @@ function exchange(id, text, reply, reasoning = '') {
   assert.equal(trimIncompleteTail([messagesUser(1, 'q'), thinkOnly]).length, 2);
 }
 
+// ── a WIP answer is not appended; wait for it to settle ───────────────────
+{
+  const messages = [
+    ...exchange(1, 'q1', 'a1'),
+    messagesUser(3, 'q2'),
+    {
+      message_id: 4,
+      parent_id: 3,
+      role: 'ASSISTANT',
+      status: 'WIP',
+      inserted_at: 1792592804,
+      fragments: [{ type: 'RESPONSE', content: '半截回答' }],
+    },
+  ];
+  const waiting = planAppend(messages, { afterMessageId: 2, ...META });
+  assert.equal(waiting.turns, 0, 'an in-progress answer must not be written as complete');
+  assert.equal(waiting.nextMessageId, 2, 'the anchor waits behind the unfinished turn');
+
+  messages[3].status = 'FINISHED';
+  const settled = planAppend(messages, { afterMessageId: 2, ...META });
+  assert.equal(settled.turns, 1, 'the settled answer is appended once');
+  assert.equal(settled.nextMessageId, 4);
+  assert.equal(settled.events.filter((event) => event.type === 'assistant/message')[0].data.message.content[0].text, '半截回答');
+
+  // Legacy anchor on the question follows the same rule.
+  messages[3].status = 'WIP';
+  assert.equal(planAppend(messages, { afterMessageId: 3, ...META }).turns, 0);
+  messages[3].status = 'FINISHED';
+  assert.equal(planAppend(messages, { afterMessageId: 3, ...META }).turns, 1);
+}
+
 console.log('append.test.mjs: all assertions passed');
 
 // ── helpers ───────────────────────────────────────────────────────────────

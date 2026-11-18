@@ -865,6 +865,41 @@ assert.equal(
   assert.equal(sent.has('m1'), false, 'the blocked message can be retried');
 }
 
+// ── an unfinished web tail gets a different, actionable block ─────────────
+{
+  const api = fakeApi([ANSWER('ok')], {
+    historyMessages: [
+      { message_id: 41, role: 'ASSISTANT', status: 'FINISHED', fragments: [{ type: 'RESPONSE', content: '旧答案' }] },
+      { message_id: 42, role: 'USER', status: 'FINISHED', fragments: [{ type: 'REQUEST', content: '网页端新问题' }] },
+    ],
+  });
+  const bindings = new Map([
+    ['sess-imported-unfinished', {
+      chatSessionId: 'web-9', parentMessageId: 41, seeded: true, origin: 'imported', parentSyncedAt: 0,
+    }],
+  ]);
+  const adapter = new DeepSeekWebAdapter({
+    api,
+    resolveBinding: (id) => bindings.get(id),
+    bindSession: (id, binding) => bindings.set(id, binding),
+    updateBinding: (id, patch) => bindings.set(id, { ...bindings.get(id), ...patch }),
+    noteSent: () => true,
+    warn: () => {},
+  });
+  const chunks = [];
+  for await (const chunk of adapter.stream({
+    provider: 'deepseek-web',
+    model: 'deepseek-web-chat',
+    messages: [userMessage('m1', '继续')],
+    sessionId: 'sess-imported-unfinished',
+  })) chunks.push(chunk);
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(api.calls.completions.length, 0);
+  assert.equal(finish?.reason?.failure?.code, 'IMPORT_UNFINISHED');
+  assert.ok(String(finish?.reason?.failure?.message).includes('未完成'));
+  assert.equal(bindings.get('sess-imported-unfinished').parentMessageId, 41);
+}
+
 // ── a fresh parent is not re-read ─────────────────────────────────────────
 {
   // Inside a continuous exchange our own reply advanced the id moments ago; paying

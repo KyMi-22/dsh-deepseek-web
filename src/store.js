@@ -12,6 +12,7 @@
 'use strict';
 
 import { chmod, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 
@@ -113,11 +114,14 @@ export function sessionDirFor(sessionId, cwd) {
  *   quick-ask side threads, keyed by the DSH session id they serve
  */
 
+/** The web client accepts only a UUID v4 device id. */
+const DEVICE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
 /** Empty state with a stable random device id. */
 function emptyState() {
   return {
     token: '',
-    deviceId: `dsh-web-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`,
+    deviceId: randomUUID(),
     bindings: {},
     imported: {},
     workspaceId: null,
@@ -150,7 +154,9 @@ export async function loadState() {
   if (parsed === null || typeof parsed !== 'object') return base;
   return {
     token: typeof parsed.token === 'string' ? parsed.token : base.token,
-    deviceId: typeof parsed.deviceId === 'string' && parsed.deviceId !== '' ? parsed.deviceId : base.deviceId,
+    // Older builds used a `dsh-web-...` id. The web client treats a non-UUID
+    // device id as an abnormal client, so migrate it once on load.
+    deviceId: typeof parsed.deviceId === 'string' && DEVICE_ID_RE.test(parsed.deviceId) ? parsed.deviceId : base.deviceId,
     bindings: parsed.bindings !== null && typeof parsed.bindings === 'object' ? parsed.bindings : {},
     imported: parsed.imported !== null && typeof parsed.imported === 'object' ? parsed.imported : {},
     workspaceId: typeof parsed.workspaceId === 'string' ? parsed.workspaceId : null,

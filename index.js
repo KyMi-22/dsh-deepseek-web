@@ -187,6 +187,9 @@ export async function apply(ctx, config = {}) {
     token: resolvedToken,
     deviceId: store.state.deviceId,
     baseUrl,
+    locale: typeof config.locale === 'string' && config.locale.trim() !== '' ? config.locale.trim() : undefined,
+    hif: config.hif !== false,
+    requestGapMs: Number.isFinite(Number(config.requestGapMs)) ? Number(config.requestGapMs) : undefined,
   });
 
   // ── adapter ───────────────────────────────────────────────────────────────
@@ -1284,7 +1287,17 @@ export async function apply(ctx, config = {}) {
             if (req.method === 'POST' && route === '/verify') {
               try {
                 const me = await api.currentUser();
-                sendJson(res, 200, { ok: true, account: { id: me.id, name: me.id_profile?.name ?? '', email: me.email ?? '' } });
+                let chat = null;
+                try {
+                  chat = await api.chatStatus();
+                } catch {
+                  /* account status is diagnostic; a token check still succeeded */
+                }
+                sendJson(res, 200, {
+                  ok: true,
+                  account: { id: me.id, name: me.id_profile?.name ?? '', email: me.email ?? '' },
+                  chat,
+                });
               } catch (error) {
                 sendJson(res, 200, { ok: false, detail: String(error?.message ?? error) });
               }
