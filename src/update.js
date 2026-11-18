@@ -18,7 +18,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 
@@ -95,6 +95,38 @@ function deadlineSignal(ms) {
   }
 }
 
+/** Read a Fetch response body with a hard byte cap, including decompressed bytes. */
+async function readCappedText(response, maxBytes, label) {
+  const declared = Number(response.headers?.get?.('content-length') ?? 0);
+  if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`${label} is unexpectedly large`);
+  if (response.body === null || response.body === undefined || typeof response.body.getReader !== 'function') {
+    const text = await response.text();
+    if (Buffer.byteLength(text) > maxBytes) throw new Error(`${label} is unexpectedly large`);
+    return text;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw new Error(`${label} is unexpectedly large`);
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
 /** One JSON GET. With a proxy it goes through curl, which honors `-x` per call. */
 async function getText(url, options = {}) {
   const { proxy = '', signal } = options;
@@ -118,9 +150,7 @@ async function getText(url, options = {}) {
     signal: signal === undefined ? deadlineSignal(HTTP_TIMEOUT_MS) : signal,
   });
   if (!response.ok) throw new Error(`GitHub API answered HTTP ${response.status}`);
-  const text = await response.text();
-  if (Buffer.byteLength(text) > MAX_METADATA_BYTES) throw new Error('release metadata is unexpectedly large');
-  return text;
+  return await readCappedText(response, MAX_METADATA_BYTES, 'release metadata');
 }
 
 /**
@@ -131,7 +161,10 @@ async function getText(url, options = {}) {
  */
 export async function latestRelease(options = {}) {
   const repo = options.repo ?? DEFAULT_RELEASE_REPO;
-  if (typeof repo !== 'string' || !REPO_RE.test(repo)) throw new Error('update repo must be an owner/name pair');
+  if (typeof repo !== 'string' || !REPO_RE.test(repo)
+    || repo.split('/').some((part) => part === '.' || part === '..')) {
+    throw new Error('update repo must be an owner/name pair without dot segments');
+  }
   const text = await getText(`https://api.github.com/repos/${repo}/releases/latest`, options);
   let json;
   try {
@@ -182,11 +215,31 @@ function isAllowedDownloadUrl(value) {
   return url.protocol === 'https:' && ALLOWED_DOWNLOAD_HOSTS.has(url.hostname.toLowerCase());
 }
 
+/** Follow a small number of redirects, validating every hop before contacting it. */
+async function fetchAllowedRedirects(fetchImpl, url, init) {
+  let current = url;
+  for (let hop = 0; hop <= 5; hop++) {
+    const response = await fetchImpl(current, { ...init, redirect: 'manual' });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers?.get?.('location');
+      if (typeof location !== 'string' || location === '') throw new Error('download redirected without a Location header');
+      const next = new URL(location, current).toString();
+      if (!isAllowedDownloadUrl(next)) throw new Error(`download redirected to a disallowed host (${new URL(next).hostname})`);
+      current = next;
+      continue;
+    }
+    if (typeof response.url === 'string' && response.url !== '' && !isAllowedDownloadUrl(response.url)) {
+      throw new Error(`download redirected to a disallowed host (${new URL(response.url).hostname})`);
+    }
+    return response;
+  }
+  throw new Error('download exceeded the redirect limit');
+}
+
 /** Stream one URL to a file with fetch; returns the sha256 of what was written. */
 async function streamToFile(url, target, signal, fetchImpl = fetch) {
-  const response = await fetchImpl(url, {
+  const response = await fetchAllowedRedirects(fetchImpl, url, {
     signal,
-    redirect: 'follow',
     headers: { 'user-agent': 'dsh-deepseek-web-updater' },
   });
   if (!response.ok) throw new Error(`download answered HTTP ${response.status}`);
@@ -226,7 +279,7 @@ async function streamToFile(url, target, signal, fetchImpl = fetch) {
 
 /** Download one URL with curl, which accepts a proxy per invocation. */
 async function curlToFile(url, target, proxy) {
-  await run('curl', [
+  const { stdout } = await run('curl', [
     '-fsSL',
     '--proto', '=https',
     '--max-redirs', '5',
@@ -237,8 +290,13 @@ async function curlToFile(url, target, proxy) {
     '-x', proxy,
     '-H', 'User-Agent: dsh-deepseek-web-updater',
     '-o', target,
+    '-w', '%{url_effective}',
     url,
   ], { windowsHide: true, timeout: DOWNLOAD_TIMEOUT_MS + 30_000 });
+  const effective = typeof stdout === 'string' ? stdout.trim() : '';
+  if (effective !== '' && !isAllowedDownloadUrl(effective)) {
+    throw new Error(`download redirected to a disallowed host (${new URL(effective).hostname})`);
+  }
   return await sha256Of(target);
 }
 
@@ -253,12 +311,12 @@ function digestHex(digest) {
  * Download one release asset into `dir` and verify it.
  *
  * Writes to a `.part` file first: a failed or truncated transfer must never
- * leave something that looks installable at the final path. The digest the
- * release carries is checked after the transfer; a missing digest is allowed
- * (older releases), a mismatching one is fatal.
+ * leave something that looks installable at the final path. A SHA-256 digest is
+ * mandatory; the asset name, URL host and target path are validated before any
+ * bytes are fetched, and the declared/actual size must stay within the cap.
  *
  * @param {{ name: string, url: string, size?: number, digest?: string } | null} asset
- * @param {{ dir: string, proxy?: string, signal?: AbortSignal }} options
+ * @param {{ dir: string, proxy?: string, signal?: AbortSignal, fetchImpl?: typeof fetch }} options
  * @returns {Promise<{ path: string, bytes: number, sha256: string }>}
  */
 export async function downloadRelease(asset, options) {
@@ -269,12 +327,20 @@ export async function downloadRelease(asset, options) {
   if (typeof asset.name !== 'string' || !ASSET_RE.test(asset.name)) {
     throw new Error('the release asset name is not a safe tgz basename');
   }
+  const expected = digestHex(asset.digest ?? '');
+  if (expected === '') {
+    throw new Error('the release asset carries no sha256 digest; refusing to install an unverified package');
+  }
+  if (Number.isFinite(asset.size) && asset.size > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`the release asset is larger than the ${MAX_DOWNLOAD_BYTES}-byte cap`);
+  }
   const dir = options.dir;
   await mkdir(dir, { recursive: true });
   const name = asset.name;
   const target = join(dir, name);
   const resolvedDir = resolve(dir);
-  if (resolve(target) !== join(resolvedDir, name) || !resolve(target).startsWith(`${resolvedDir}${sep}`)) {
+  const rel = relative(resolvedDir, resolve(target));
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
     throw new Error('the release asset would escape the download directory');
   }
   const partial = `${target}.part`;
@@ -283,14 +349,13 @@ export async function downloadRelease(asset, options) {
     const sha256 = proxy !== ''
       ? await curlToFile(asset.url, partial, proxy)
       : await streamToFile(asset.url, partial, options.signal, options.fetchImpl);
-    const expected = digestHex(asset.digest ?? '');
-    if (expected === '') {
-      throw new Error('the release asset carries no sha256 digest; refusing to install an unverified package');
-    }
     if (expected !== sha256) {
       throw new Error(`download digest mismatch (expected ${expected}, got ${sha256})`);
     }
     const info = await stat(partial);
+    if (info.size > MAX_DOWNLOAD_BYTES) {
+      throw new Error(`download exceeded the ${MAX_DOWNLOAD_BYTES}-byte cap`);
+    }
     if (Number.isFinite(asset.size) && asset.size > 0 && info.size !== asset.size) {
       throw new Error(`download size mismatch (expected ${asset.size} bytes, got ${info.size})`);
     }
