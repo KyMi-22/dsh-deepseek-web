@@ -51,22 +51,35 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           ASSET="$(basename dist/*.tgz)"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            # A rerun for an existing release. Upload first; verification below
-            # still fails the job if the expected asset is not present.
-            gh release upload "$TAG" dist/*.tgz dist/*.tgz.sha256 --clobber
-          else
-            # Draft first: /releases/latest must never expose a version with no
-            # downloadable asset. Publish only after upload + verification.
-            gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes
-            gh release upload "$TAG" dist/*.tgz dist/*.tgz.sha256
+          REPO="${GITHUB_REPOSITORY}"
+
+          # gh release upload resolves a release through /releases/tags/<tag>,
+          # which returns 404 for drafts. Use the releases API for a draft and
+          # only publish after all assets and their digests are verified.
+          RELEASE_ID="$(gh api "repos/${REPO}/releases?per_page=100" --jq ".[] | select(.tag_name == \"${TAG}\") | .id" | head -n1)"
+          if [ -z "$RELEASE_ID" ]; then
+            RELEASE_ID="$(gh api -X POST "repos/${REPO}/releases" \
+              -f tag_name="$TAG" -f name="$TAG" \
+              -F draft=true -F generate_release_notes=true --jq .id)"
           fi
-          gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$ASSET"
-          DIGEST="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq ".assets[] | select(.name == \"${ASSET}\") | .digest")"
+          IS_DRAFT="$(gh api "repos/${REPO}/releases/${RELEASE_ID}" --jq .draft)"
+          if [ "$IS_DRAFT" = "true" ]; then
+            for FILE in dist/*.tgz dist/*.tgz.sha256; do
+              NAME="$(basename "$FILE")"
+              EXISTING="$(gh api "repos/${REPO}/releases/${RELEASE_ID}/assets" --jq ".[] | select(.name == \"${NAME}\") | .id" | head -n1)"
+              if [ -n "$EXISTING" ]; then gh api -X DELETE "repos/${REPO}/releases/assets/${EXISTING}" >/dev/null; fi
+              gh api -X POST "repos/${REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
+                -H "Content-Type: application/octet-stream" --input "$FILE" >/dev/null
+            done
+          else
+            gh release upload "$TAG" dist/*.tgz dist/*.tgz.sha256 --clobber
+          fi
+
+          DIGEST="$(gh api "repos/${REPO}/releases/${RELEASE_ID}" --jq ".assets[] | select(.name == \"${ASSET}\") | .digest")"
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
             echo "release asset ${ASSET} has no GitHub sha256 digest; self-update requires one" >&2
             exit 1
           fi
-          if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
-            gh release edit "$TAG" --draft=false
+          if [ "$IS_DRAFT" = "true" ]; then
+            gh api -X PATCH "repos/${REPO}/releases/${RELEASE_ID}" -F draft=false >/dev/null
           fi
